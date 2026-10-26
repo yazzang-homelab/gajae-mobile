@@ -67,18 +67,15 @@ jobs:
         working-directory: ios
         run: |
           mkdir -p "$RUNNER_TEMP/out"
-          # simctl recordVideo gives black frames on hosted runners; screenshots render, so sample those.
+          # simctl recordVideo gives black frames on hosted runners; the UI test writes screenshots instead.
           mkdir -p "$RUNNER_TEMP/out/frames"
-          ( while :; do xcrun simctl io "${{ steps.sim.outputs.udid }}" screenshot --type=jpeg \
-              "$RUNNER_TEMP/out/frames/$(python3 -c 'import time;print(f"{time.time():.3f}")').jpg" >/dev/null 2>&1; done ) &
-          REC=$!
+          export TEST_RUNNER_GJCM_SHOTS="$RUNNER_TEMP/out/frames"
           sleep 3
           set +e
           xcodebuild -project GjcMobile.xcodeproj -scheme GjcMobile -destination "id=${{ steps.sim.outputs.udid }}" \
             -derivedDataPath "$RUNNER_TEMP/dd" -resultBundlePath "$RUNNER_TEMP/out/flow.xcresult" \
             -only-testing:GjcMobileUITests/DemoFlowUITests/testDemoFlow test-without-building > "$RUNNER_TEMP/out/test.log" 2>&1
           STATUS=$?
-          kill "$REC"; wait "$REC" 2>/dev/null
           xcrun simctl io "${{ steps.sim.outputs.udid }}" screenshot "$RUNNER_TEMP/out/final.png"
           cp "$RUNNER_TEMP/demo.log" "$RUNNER_TEMP/out/"
           grep -E 'error|failed|passed|SPRINGBOARD' "$RUNNER_TEMP/out/test.log" | head -40

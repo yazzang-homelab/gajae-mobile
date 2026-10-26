@@ -25,11 +25,15 @@ final class DemoFlowUITests: XCTestCase {
         XCTAssertTrue(composer.waitForExistence(timeout: 30), "chat composer after pairing")
         pause(2)
         composer.tap()
-        composer.typeText("Run the test suite and fix any failures")
+        for word in "Run the test suite and fix any failures".split(separator: " ", omittingEmptySubsequences: false).enumerated() {
+            composer.typeText(word.offset == 0 ? String(word.element) : " " + word.element)
+            pause(0.2)
+        }
         pause(1)
         app.buttons["보내기"].tap()
 
         let allow = app.buttons["Allow once"]
+        pause(3)
         XCTAssertTrue(allow.waitForExistence(timeout: 30), "approval card")
         pause(4)
 
@@ -123,7 +127,20 @@ final class DemoFlowUITests: XCTestCase {
         return nil
     }
 
+    /// Waits while filming: with GJCM_SHOTS set (TEST_RUNNER_GJCM_SHOTS in xcodebuild's environment) every pause
+    /// writes screenshots named by capture time into that directory, about four per second.
     private func pause(_ seconds: Double) {
-        Thread.sleep(forTimeInterval: seconds)
+        let end = Date().addingTimeInterval(seconds)
+        guard let dir = ProcessInfo.processInfo.environment["GJCM_SHOTS"] else {
+            Thread.sleep(forTimeInterval: seconds)
+            return
+        }
+        while Date() < end {
+            let started = Date()
+            let name = String(format: "%.3f.png", started.timeIntervalSince1970)
+            try? XCUIScreen.main.screenshot().pngRepresentation.write(to: URL(fileURLWithPath: dir).appendingPathComponent(name))
+            let left = 0.25 - Date().timeIntervalSince(started)
+            if left > 0 { Thread.sleep(forTimeInterval: min(left, end.timeIntervalSinceNow)) }
+        }
     }
 }

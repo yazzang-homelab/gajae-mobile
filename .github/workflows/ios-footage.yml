@@ -67,7 +67,10 @@ jobs:
         working-directory: ios
         run: |
           mkdir -p "$RUNNER_TEMP/out"
-          xcrun simctl io "${{ steps.sim.outputs.udid }}" recordVideo --codec h264 --force "$RUNNER_TEMP/out/ios-flow.mp4" &
+          # simctl recordVideo gives black frames on hosted runners; screenshots render, so sample those.
+          mkdir -p "$RUNNER_TEMP/out/frames"
+          ( while :; do xcrun simctl io "${{ steps.sim.outputs.udid }}" screenshot --type=jpeg \
+              "$RUNNER_TEMP/out/frames/$(python3 -c 'import time;print(f"{time.time():.3f}")').jpg" >/dev/null 2>&1; done ) &
           REC=$!
           sleep 3
           set +e
@@ -75,7 +78,7 @@ jobs:
             -derivedDataPath "$RUNNER_TEMP/dd" -resultBundlePath "$RUNNER_TEMP/out/flow.xcresult" \
             -only-testing:GjcMobileUITests/DemoFlowUITests/testDemoFlow test-without-building > "$RUNNER_TEMP/out/test.log" 2>&1
           STATUS=$?
-          kill -INT "$REC"; wait "$REC"
+          kill "$REC"; wait "$REC" 2>/dev/null
           xcrun simctl io "${{ steps.sim.outputs.udid }}" screenshot "$RUNNER_TEMP/out/final.png"
           cp "$RUNNER_TEMP/demo.log" "$RUNNER_TEMP/out/"
           grep -E 'error|failed|passed|SPRINGBOARD' "$RUNNER_TEMP/out/test.log" | head -40

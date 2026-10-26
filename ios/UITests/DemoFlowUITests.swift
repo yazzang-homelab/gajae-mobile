@@ -114,9 +114,10 @@ final class DemoFlowUITests: XCTestCase {
             .matching(NSPredicate(format: "label CONTAINS '응답 대기' OR label CONTAINS '가재코드 상태'")).firstMatch
     }
 
+    /// Springboard pads some labels with a leading space (" Add Widget"), so match by suffix.
     private func first(_ query: XCUIElementQuery, labels: [String]) -> XCUIElement? {
         for label in labels {
-            let element = query[label]
+            let element = query.matching(NSPredicate(format: "label ENDSWITH %@", label)).firstMatch
             if element.waitForExistence(timeout: 2) { return element }
         }
         return nil

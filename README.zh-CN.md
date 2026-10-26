@@ -8,15 +8,15 @@
 
 gajae-mobile 是 [Gajae Code（`gjc`）](https://github.com/Yeachan-Heo/gajae-code) 的 iOS 与 Android 原生伴侣应用。Gajae Code 是运行在你自己电脑上的编程智能体。你可以在手机上发起任务、批准智能体要执行的命令、介入正在进行的回合，并在主屏幕上直接看到哪个会话在等你回复。智能体、会话和模型登录信息都留在电脑上，手机只通过端到端加密的通道进行远程操作。
 
-<!-- media:reel -->
+<p align="center"><a href="docs/media/reel.mp4"><img src="docs/media/reel.webp" width="720" alt="基于真实录屏制作的 24 秒视频：配对、批准请求、主屏幕小组件、深层链接与回答"></a><br><sub>基于应用真实运行录屏制作。<a href="docs/media/reel.mp4">带声音的 MP4</a></sub></p>
 
 <p align="center">
+  <img src="docs/media/empty.png" width="200" alt="空状态：扫码配对或试用演示主机">
   <img src="docs/media/approve.png" width="200" alt="批准卡片：执行命令前智能体先询问">
   <img src="docs/media/answer.png" width="200" alt="带计划和工具结果的流式回答">
   <img src="docs/media/widget.png" width="200" alt="主屏幕小组件：一个会话在等待你的回复">
-  <img src="docs/media/sessions.png" width="200" alt="侧边栏中的主机与会话">
 </p>
-<p align="center"><sub>Android 应用连接脚本化演示主机时的真实截图。</sub></p>
+<p align="center"><sub>iOS 应用（模拟器）连接脚本化演示主机时的真实截图。</sub></p>
 
 ## 功能
 

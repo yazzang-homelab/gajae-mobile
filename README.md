@@ -8,15 +8,15 @@
 
 gajae-mobile is a native iOS and Android companion for [Gajae Code (`gjc`)](https://github.com/Yeachan-Heo/gajae-code), the coding agent that runs on your own computer. Start work, approve the commands the agent wants to run, steer a running turn, and see from your home screen which session is waiting for you. The agent, its sessions and your model logins never leave the computer; the phone is a remote control over an end-to-end encrypted channel.
 
-<!-- media:reel -->
+<p align="center"><a href="docs/media/reel.mp4"><img src="docs/media/reel.webp" width="720" alt="24-second film built from a real recording: pairing, an approval request, the home-screen widget, the deep link and the answer"></a><br><sub>Built from a real screen recording of the app. <a href="docs/media/reel.mp4">MP4 with sound</a></sub></p>
 
 <p align="center">
+  <img src="docs/media/empty.png" width="200" alt="Empty state: pair by QR code or try the demo host">
   <img src="docs/media/approve.png" width="200" alt="Approval card: the agent asks before running a command">
   <img src="docs/media/answer.png" width="200" alt="Streamed answer with plan and tool result">
   <img src="docs/media/widget.png" width="200" alt="Home-screen widget: one session waiting for your answer">
-  <img src="docs/media/sessions.png" width="200" alt="Hosts and sessions in the sidebar">
 </p>
-<p align="center"><sub>Real screenshots of the Android app talking to the scripted demo host.</sub></p>
+<p align="center"><sub>Real screenshots of the iOS app (Simulator) talking to the scripted demo host.</sub></p>
 
 ## Features
 

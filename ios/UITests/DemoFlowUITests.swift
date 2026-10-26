@@ -25,8 +25,10 @@ final class DemoFlowUITests: XCTestCase {
         XCTAssertTrue(composer.waitForExistence(timeout: 30), "chat composer after pairing")
         pause(2)
         composer.tap()
-        for word in "Run the test suite and fix any failures".split(separator: " ", omittingEmptySubsequences: false).enumerated() {
-            composer.typeText(word.offset == 0 ? String(word.element) : " " + word.element)
+        // The placeholder query stops matching once text is in the field, so type into whatever has focus.
+        for (index, word) in "Run the test suite and fix any failures".split(separator: " ").enumerated() {
+            app.typeText(index == 0 ? String(word) : " " + word)
+            dismissKeyboardTip()
             pause(0.2)
         }
         pause(1)
@@ -48,6 +50,12 @@ final class DemoFlowUITests: XCTestCase {
 
         XCUIDevice.shared.press(.home)
         pause(5)
+    }
+
+    /// The first keyboard use shows a one-time slide-to-type tip that covers the keyboard.
+    private func dismissKeyboardTip() {
+        let tip = app.buttons["Continue"]
+        if tip.exists { tip.tap() }
     }
 
     private func allowNotificationsIfAsked() {

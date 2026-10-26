@@ -11,12 +11,12 @@ gajae-mobile은 내 컴퓨터에서 돌아가는 코딩 에이전트 [가재코�
 <p align="center"><a href="docs/media/reel.mp4"><img src="docs/media/reel.webp" width="720" alt="실제 화면 녹화로 만든 24초 영상: 페어링, 승인 요청, 홈 화면 위젯, 딥링크, 답변"></a><br><sub>앱 실제 구동 화면을 녹화해 만든 영상입니다. <a href="docs/media/reel.mp4">소리 있는 MP4</a></sub></p>
 
 <p align="center">
+  <img src="docs/media/empty.png" width="200" alt="빈 화면: QR 코드로 페어링하거나 데모 호스트로 체험">
   <img src="docs/media/approve.png" width="200" alt="승인 카드: 명령 실행 전에 에이전트가 묻습니다">
   <img src="docs/media/answer.png" width="200" alt="계획·도구 결과와 함께 스트리밍되는 답변">
   <img src="docs/media/widget.png" width="200" alt="홈 화면 위젯: 응답을 기다리는 세션 1개">
-  <img src="docs/media/sessions.png" width="200" alt="사이드바의 호스트와 세션">
 </p>
-<p align="center"><sub>정해진 응답만 내는 데모 호스트에 연결한 Android 앱의 실제 화면입니다.</sub></p>
+<p align="center"><sub>정해진 응답만 내는 데모 호스트에 연결한 iOS 앱(Simulator)의 실제 화면입니다.</sub></p>
 
 ## 기능
 

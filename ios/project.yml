@@ -20,8 +20,11 @@ packages:
 targets:
   GjcMobile:
     type: application
-    # A shared scheme in the generated project: Xcode Cloud only builds shared schemes.
-    scheme: {}
+    # A shared scheme in the generated project: Xcode Cloud only builds shared schemes. The UI test drives the
+    # demo-host flow that .github/workflows/ios-footage.yml records.
+    scheme:
+      testTargets:
+        - GjcMobileUITests
     platform: iOS
     sources:
       - path: App
@@ -95,3 +98,15 @@ targets:
       path: Widget/GjcWidget.entitlements
       properties:
         com.apple.security.application-groups: [group.dev.gajae.gjcmobile]
+  GjcMobileUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources:
+      - path: UITests
+    dependencies:
+      - target: GjcMobile
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.gajae.gjcmobile.uitests
+        GENERATE_INFOPLIST_FILE: YES
+        TEST_TARGET_NAME: GjcMobile

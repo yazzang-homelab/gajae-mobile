@@ -1,0 +1,89 @@
+name: ios-footage
+
+# Manual: records the real iOS app in the Simulator driving a local scripted demo host (bridge/demo), for the README
+# film and screenshots. The UI test ios/UITests/DemoFlowUITests.swift does the tapping; this job only records.
+on:
+  push:
+    branches: ["footage/**"]
+  workflow_dispatch:
+    inputs:
+      device:
+        description: Simulator device name
+        default: iPhone 16 Pro
+
+jobs:
+  record:
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select latest Xcode
+        run: |
+          sudo xcode-select -s "$(ls -d /Applications/Xcode_*.app | sort -V | tail -1)"
+          xcodebuild -version
+
+      - uses: oven-sh/setup-bun@v2
+
+      - name: Start demo host
+        working-directory: bridge
+        run: |
+          bun install --frozen-lockfile
+          DEMO="$RUNNER_TEMP/demo"
+          mkdir -p "$DEMO/home" "$DEMO/agent" "$DEMO/demo-project"
+          GJCM_HOME="$DEMO/home" GJC_CODING_AGENT_DIR="$DEMO/agent" GJCM_DEMO_AGENT_DIR="$DEMO/agent" GJCM_HOST_NAME="Gajae Demo" \
+            nohup bun src/cli.ts serve --host 127.0.0.1 --port 7798 --cwd "$DEMO/demo-project" \
+            --gjc "bun demo/demo-agent.ts" --demo-endpoint ws://127.0.0.1:7798/ws > "$RUNNER_TEMP/demo.log" 2>&1 &
+          for i in $(seq 1 30); do curl -sf http://127.0.0.1:7798/offer >/dev/null && break; sleep 1; done
+          curl -sf http://127.0.0.1:7798/offer
+
+      - name: Boot Simulator
+        id: sim
+        run: |
+          UDID="$(xcrun simctl list devices available -j | python3 -c '
+          import json, sys
+          name = sys.argv[1]
+          devices = [d for runtime, ds in json.load(sys.stdin)["devices"].items() if "iOS" in runtime for d in ds if d["name"] == name]
+          print(devices[-1]["udid"])' "${{ inputs.device || 'iPhone 16 Pro' }}")"
+          xcrun simctl boot "$UDID"
+          xcrun simctl bootstatus "$UDID" -b
+          xcrun simctl ui "$UDID" appearance dark
+          xcrun simctl status_bar "$UDID" override --time 9:41 --dataNetwork wifi --wifiBars 3 --cellularBars 4 --batteryState charged --batteryLevel 100
+          echo "udid=$UDID" >> "$GITHUB_OUTPUT"
+
+      - name: Build for testing
+        working-directory: ios
+        run: |
+          set -o pipefail
+          brew install xcodegen
+          xcodegen generate
+          xcodebuild -project GjcMobile.xcodeproj -scheme GjcMobile -configuration Debug \
+            -destination "id=${{ steps.sim.outputs.udid }}" -derivedDataPath "$RUNNER_TEMP/dd" \
+            GJCM_DEMO_OFFER_URL=http://127.0.0.1:7798/offer CODE_SIGN_IDENTITY=- CODE_SIGN_STYLE=Manual DEVELOPMENT_TEAM= \
+            build-for-testing | tee "$RUNNER_TEMP/build.log" | grep -E 'error:|TEST BUILD (SUCCEEDED|FAILED)' || true
+          grep -q 'TEST BUILD SUCCEEDED' "$RUNNER_TEMP/build.log"
+
+      - name: Record the demo flow
+        working-directory: ios
+        run: |
+          mkdir -p "$RUNNER_TEMP/out"
+          # simctl recordVideo gives black frames on hosted runners; the UI test writes screenshots instead.
+          mkdir -p "$RUNNER_TEMP/out/frames"
+          export TEST_RUNNER_GJCM_SHOTS="$RUNNER_TEMP/out/frames"
+          sleep 3
+          set +e
+          xcodebuild -project GjcMobile.xcodeproj -scheme GjcMobile -destination "id=${{ steps.sim.outputs.udid }}" \
+            -derivedDataPath "$RUNNER_TEMP/dd" -resultBundlePath "$RUNNER_TEMP/out/flow.xcresult" \
+            -only-testing:GjcMobileUITests/DemoFlowUITests/testDemoFlow test-without-building > "$RUNNER_TEMP/out/test.log" 2>&1
+          STATUS=$?
+          xcrun simctl io "${{ steps.sim.outputs.udid }}" screenshot "$RUNNER_TEMP/out/final.png"
+          cp "$RUNNER_TEMP/demo.log" "$RUNNER_TEMP/out/"
+          grep -E 'error|failed|passed|SPRINGBOARD' "$RUNNER_TEMP/out/test.log" | head -40
+          exit $STATUS
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ios-footage
+          path: ${{ runner.temp }}/out
+          retention-days: 14

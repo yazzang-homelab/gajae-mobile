@@ -1,0 +1,24 @@
+{
+  "name": "gjcm-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Host bridge that exposes gjc --mode=acp to the Gajae Code mobile apps over an end-to-end encrypted WebSocket",
+  "bin": {
+    "gjcm-bridge": "src/cli.ts"
+  },
+  "scripts": {
+    "serve": "bun src/cli.ts serve",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "qrcode": "^1.5.4"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "@types/qrcode": "^1.5.5",
+    "typescript": "^5.9.0"
+  },
+  "license": "AGPL-3.0-only"
+}

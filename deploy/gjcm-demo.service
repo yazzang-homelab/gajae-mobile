@@ -1,0 +1,25 @@
+# Example unit for the scripted review demo host (App Store / Google Play review). It needs a public HTTPS
+# path to 127.0.0.1:7797 (reverse proxy or Tailscale Funnel); put that URL in --demo-endpoint and set the
+# build variable GJCM_DEMO_OFFER_URL to <that base>/offer.
+[Unit]
+Description=gjcm-demo — scripted review demo host for the Gajae Code mobile apps
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=gajae
+Environment=PATH=/home/gajae/.bun/bin:/usr/local/bin:/usr/bin:/bin
+# Its own state and agent dir: the demo never sees the real bridge's devices, gjc login or sessions.
+Environment=GJCM_HOME=/var/lib/gjcm-demo/home
+Environment=GJC_CODING_AGENT_DIR=/var/lib/gjcm-demo/agent
+Environment=GJCM_DEMO_AGENT_DIR=/var/lib/gjcm-demo/agent
+Environment="GJCM_HOST_NAME=가재코드 데모"
+WorkingDirectory=/opt/gajae-mobile/bridge
+# Loopback only. The agent is bridge/demo/demo-agent.ts: scripted replies, no shell, no model provider.
+ExecStart=/home/gajae/.bun/bin/bun src/cli.ts serve --host 127.0.0.1 --port 7797 --cwd /var/lib/gjcm-demo/workspace/demo-project --gjc "bun demo/demo-agent.ts" --demo-endpoint wss://demo.example.com/gjcm-demo/ws
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

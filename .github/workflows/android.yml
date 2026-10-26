@@ -1,0 +1,62 @@
+name: android
+
+# Every push: unit tests + debug APK. Pushes to `playstore` (or a manual run): signed release AAB + APK
+# with the upload key (repo secrets ANDROID_KEYSTORE_BASE64 / ANDROID_KEYSTORE_PASSWORD / ANDROID_KEY_ALIAS).
+# The review demo host URL comes from the repo variable GJCM_DEMO_OFFER_URL (unset: no demo button).
+# No `paths` filter: GitHub evaluates it against the default branch for a newly pushed branch, so pushing
+# `playstore` with no Android diff silently skipped the release lane (2026-10-23).
+on:
+  push:
+    branches: ["**"]
+  workflow_dispatch:
+
+concurrency:
+  group: android-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: android
+    env:
+      # Store builds use run_number*1000 like the App Store lane, so they always outrank sideloaded ones.
+      VERSION_CODE: ${{ github.run_number }}000
+      GJCM_DEMO_OFFER_URL: ${{ vars.GJCM_DEMO_OFFER_URL }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Unit tests + debug APK
+        run: ./gradlew --no-daemon :app:testDebugUnitTest :app:assembleDebug -PversionCode=$VERSION_CODE
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gjc-mobile-debug-apk
+          path: android/app/build/outputs/apk/debug/*.apk
+      - name: Signed release AAB + APK
+        if: github.ref == 'refs/heads/playstore' || github.event_name == 'workflow_dispatch'
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+        run: |
+          echo "$ANDROID_KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/upload.jks"
+          ./gradlew --no-daemon :app:bundleRelease :app:assembleRelease -PversionCode=$VERSION_CODE \
+            -Pandroid.injected.signing.store.file="$RUNNER_TEMP/upload.jks" \
+            -Pandroid.injected.signing.store.password="$ANDROID_KEYSTORE_PASSWORD" \
+            -Pandroid.injected.signing.key.alias="$ANDROID_KEY_ALIAS" \
+            -Pandroid.injected.signing.key.password="$ANDROID_KEYSTORE_PASSWORD"
+          rm -f "$RUNNER_TEMP/upload.jks"
+          APKSIGNER=$(ls -d "$ANDROID_HOME"/build-tools/*/ | sort -V | tail -1)apksigner
+          "$APKSIGNER" verify --print-certs app/build/outputs/apk/release/*.apk | grep SHA-256
+      - uses: actions/upload-artifact@v4
+        if: github.ref == 'refs/heads/playstore' || github.event_name == 'workflow_dispatch'
+        with:
+          name: gjc-mobile-release
+          path: |
+            android/app/build/outputs/bundle/release/*.aab
+            android/app/build/outputs/apk/release/*.apk

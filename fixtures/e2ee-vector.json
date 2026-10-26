@@ -1,0 +1,18 @@
+{
+  "hostPrivate": "R0CuY0ewFywBJU_1W65a_1GZ9ERuf21kPUAYWz9HUUU",
+  "hostPublic": "kK4oOSMvRxzaZQsqDZ10b8G1kIU_G-f8x0z4EfkEDV0",
+  "devicePrivate": "JjpNvkFIj7hyFLADIznbufDI2hTBbfzxMIS_PCVS7KU",
+  "clientEphPrivate": "m_VpX8xT3z34NLyeJ91W53iUNwFGDpbOlq7sCQ6i1g4",
+  "serverEphPublic": "zQN01JjW_PIBA652r8X_ekcVH94p_gtIGdJ6ubDYQ0U",
+  "clientNonce": "AQEBAQEBAQEBAQEBAQEBAQ",
+  "serverNonce": "AgICAgICAgICAgICAgICAg",
+  "c2s": "dG36YEjqJgmnHnbGQWmzT5ztPR8ht0oMIE9SWrRJgCU",
+  "s2c": "17wAO2xYIJly5sw0D-nSqotzuwscleCLY4bbRprk85U",
+  "plaintext": "{\"ev\":\"session.update\",\"p\":{\"sessionId\":\"s1\",\"seq\":1,\"update\":{\"sessionUpdate\":\"agent_message_chunk\",\"content\":{\"type\":\"text\",\"text\":\"가재 🦞\"}}}}",
+  "serverFrames": [
+    "AAAAAAAAAABrFNe_QedIyKR0gIWSiidQGrNGfqXUkweF14rsxIswPjUp2T8g4WrNiBNNc4C4DdGDcDqWTETIk_oOe3FvCUGVY7V1CjI6Oq8yGZ8-hj0w5b_QKE21GI8I9arIzsPgNUIi3Rn15UK_W2CBMjEz0u7MeGIxyhHytZm9WHWOpZVr9ayg20qtNk0ahN9FGQMj0CuWCicCDOfJDYjsaPgNtnN8X8wNVd8J",
+    "AAAAAAAAAAEbSyKv2puxHYfIAZrD4SqPkp0"
+  ],
+  "pairingSecret": "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc",
+  "pairingProof": "tof3GoJBtvQi4ynfG_yczK3MM_nlmNkup1QsDZpVe0E"
+}

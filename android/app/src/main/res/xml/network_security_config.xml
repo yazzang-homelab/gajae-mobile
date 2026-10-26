@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Bridges on a LAN or tailnet speak ws:// (the payload is end-to-end encrypted by gjcm-e2ee-v1). -->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true" />
+</network-security-config>

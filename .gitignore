@@ -1,0 +1,14 @@
+node_modules/
+.build/
+DerivedData/
+*.xcuserstate
+*.xcodeproj/
+/logs/
+/.zsign_cache/
+/.gjc/
+__pycache__/
+local.properties
+build/
+.gradle/
+/ios/App/Info.plist
+/ios/Widget/Info.plist

@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="widget_description">질문·승인 대기와 작업 중인 세션. 15분마다 확인합니다.</string>
+</resources>

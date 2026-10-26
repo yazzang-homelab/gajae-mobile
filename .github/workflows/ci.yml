@@ -1,0 +1,102 @@
+name: ci
+
+on:
+  push:
+    branches: ["**"]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  bridge:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: bridge
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install --frozen-lockfile
+      - run: bun x tsc --noEmit
+      - run: bun test
+
+  ios:
+    runs-on: macos-15
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select latest Xcode
+        run: |
+          XC=$(ls -d /Applications/Xcode_*.app | grep -v beta | sort -V | tail -1)
+          sudo xcode-select -s "$XC"
+          xcodebuild -version
+          swift --version
+
+      - uses: oven-sh/setup-bun@v2
+
+      - name: Bridge deps (for the live bridge test)
+        working-directory: bridge
+        run: bun install --frozen-lockfile
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ios/Core/.build
+            ~/Library/Developer/Xcode/DerivedData/**/SourcePackages
+          key: spm-${{ runner.os }}-${{ hashFiles('ios/Core/Package.resolved') }}
+
+      - name: Core tests (E2EE vector, transcript, live bridge)
+        working-directory: ios/Core
+        env:
+          GJCM_BRIDGE_DIR: ${{ github.workspace }}/bridge
+        run: swift test
+
+      - name: Generate Xcode project
+        working-directory: ios
+        run: |
+          brew install xcodegen
+          xcodegen generate
+
+      - name: Simulator build
+        working-directory: ios
+        run: |
+          set -o pipefail
+          xcodebuild -project GjcMobile.xcodeproj -scheme GjcMobile -configuration Debug \
+            -destination 'generic/platform=iOS Simulator' \
+            -derivedDataPath "$RUNNER_TEMP/dd-sim" \
+            CODE_SIGNING_ALLOWED=NO build | tee "$RUNNER_TEMP/sim.log" | grep -E 'error:|warning: .*GjcMobile|BUILD (SUCCEEDED|FAILED)' || true
+          grep -q 'BUILD SUCCEEDED' "$RUNNER_TEMP/sim.log"
+
+      - name: Unsigned device build
+        working-directory: ios
+        env:
+          GJCM_DEMO_OFFER_URL: ${{ vars.GJCM_DEMO_OFFER_URL }}
+        run: |
+          set -o pipefail
+          xcodebuild -project GjcMobile.xcodeproj -scheme GjcMobile -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath "$RUNNER_TEMP/dd-dev" \
+            CURRENT_PROJECT_VERSION="${{ github.run_number }}" GJCM_DEMO_OFFER_URL="$GJCM_DEMO_OFFER_URL" \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build | tee "$RUNNER_TEMP/dev.log" | grep -E 'error:|BUILD (SUCCEEDED|FAILED)' || true
+          grep -q 'BUILD SUCCEEDED' "$RUNNER_TEMP/dev.log"
+          APP="$RUNNER_TEMP/dd-dev/Build/Products/Release-iphoneos/GjcMobile.app"
+          test -d "$APP"
+          mkdir -p "$RUNNER_TEMP/out"
+          (cd "$(dirname "$APP")" && ditto -c -k --keepParent GjcMobile.app "$RUNNER_TEMP/out/GjcMobile-unsigned-device.zip")
+          printf '{"commit":"%s","build":"%s"}\n' "$GITHUB_SHA" "${{ github.run_number }}" > "$RUNNER_TEMP/out/build-info.json"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gjc-mobile-unsigned-device
+          path: ${{ runner.temp }}/out/
+          retention-days: 14
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: xcodebuild-logs
+          path: ${{ runner.temp }}/*.log
+          retention-days: 7

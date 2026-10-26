@@ -1,0 +1,104 @@
+name: appstore
+
+# App Store / TestFlight build, signed in the cloud with the App Store Connect API key (Xcode automatic
+# signing creates or reuses the distribution certificate and profile; no .p12 lives in this repo).
+# upload=false: archive + export only, to prove signing. upload=true: also send the build to App Store
+# Connect, which needs the app record for dev.gajae.gjcmobile to exist (created once in the ASC web UI).
+# Pushing to the `appstore` branch runs the export-only path (workflow_dispatch needs the file on the default branch).
+on:
+  push:
+    branches: [appstore]
+  workflow_dispatch:
+    inputs:
+      upload:
+        description: Upload to App Store Connect (TestFlight)
+        type: boolean
+        default: false
+
+jobs:
+  archive:
+    runs-on: macos-15
+    timeout-minutes: 40
+    env:
+      TEAM_ID: 6Z6SXY7BTZ
+      # Above every OTA build number (ci run_number), so a store build never collides with a sideloaded one.
+      BUILD_NUMBER: ${{ github.run_number }}000
+      GJCM_DEMO_OFFER_URL: ${{ vars.GJCM_DEMO_OFFER_URL }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select latest Xcode
+        run: |
+          XC=$(ls -d /Applications/Xcode_*.app | grep -v beta | sort -V | tail -1)
+          sudo xcode-select -s "$XC"
+          xcodebuild -version
+
+      - name: App Store Connect API key
+        env:
+          ASC_API_KEY_BASE64: ${{ secrets.ASC_API_KEY_BASE64 }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/asc"
+          echo "$ASC_API_KEY_BASE64" | base64 --decode > "$RUNNER_TEMP/asc/AuthKey_$ASC_KEY_ID.p8"
+
+      - name: Generate Xcode project
+        working-directory: ios
+        run: |
+          brew install xcodegen
+          xcodegen generate
+
+      - name: Archive
+        working-directory: ios
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+        run: |
+          set -o pipefail
+          xcodebuild -project GjcMobile.xcodeproj -scheme GjcMobile -configuration Release \
+            -destination 'generic/platform=iOS' -archivePath "$RUNNER_TEMP/GjcMobile.xcarchive" \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$RUNNER_TEMP/asc/AuthKey_$ASC_KEY_ID.p8" \
+            -authenticationKeyID "$ASC_KEY_ID" -authenticationKeyIssuerID "$ASC_ISSUER_ID" \
+            DEVELOPMENT_TEAM="$TEAM_ID" CODE_SIGN_STYLE=Automatic CURRENT_PROJECT_VERSION="$BUILD_NUMBER" GJCM_DEMO_OFFER_URL="$GJCM_DEMO_OFFER_URL" \
+            archive | tee "$RUNNER_TEMP/archive.log" | grep -E 'error:|ARCHIVE (SUCCEEDED|FAILED)' || true
+          grep -q 'ARCHIVE SUCCEEDED' "$RUNNER_TEMP/archive.log"
+
+      - name: Export (and upload)
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          DESTINATION: ${{ inputs.upload && 'upload' || 'export' }}
+        run: |
+          set -o pipefail
+          cat > "$RUNNER_TEMP/export.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>method</key><string>app-store-connect</string>
+            <key>destination</key><string>$DESTINATION</string>
+            <key>teamID</key><string>$TEAM_ID</string>
+            <key>signingStyle</key><string>automatic</string>
+            <key>uploadSymbols</key><true/>
+            <key>manageAppVersionAndBuildNumber</key><false/>
+          </dict></plist>
+          PLIST
+          xcodebuild -exportArchive -archivePath "$RUNNER_TEMP/GjcMobile.xcarchive" \
+            -exportOptionsPlist "$RUNNER_TEMP/export.plist" -exportPath "$RUNNER_TEMP/export" \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$RUNNER_TEMP/asc/AuthKey_$ASC_KEY_ID.p8" \
+            -authenticationKeyID "$ASC_KEY_ID" -authenticationKeyIssuerID "$ASC_ISSUER_ID" \
+            | tee "$RUNNER_TEMP/export.log" | grep -E 'error:|EXPORT (SUCCEEDED|FAILED)|Upload' || true
+          grep -q 'EXPORT SUCCEEDED' "$RUNNER_TEMP/export.log"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gjc-mobile-appstore
+          path: ${{ runner.temp }}/export/
+          retention-days: 14
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: appstore-logs
+          path: ${{ runner.temp }}/*.log
+          retention-days: 7

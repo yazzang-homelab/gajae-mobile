@@ -1,0 +1,22 @@
+# Example unit: adjust User, paths and --cwd for your host, then
+#   sudo cp deploy/gjcm-bridge.service /etc/systemd/system/ && sudo systemctl enable --now gjcm-bridge
+[Unit]
+Description=gjcm-bridge — gjc --mode=acp bridge for the Gajae Code mobile apps
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=gajae
+Environment=PATH=/home/gajae/.local/bin:/home/gajae/.bun/bin:/usr/local/bin:/usr/bin:/bin
+# Resuming a saved session spawns a gjc session host; on a loaded host that can take longer than gjc's default
+# ACP readiness timeout. Honored by gjc builds that support it; 60s is the broker maximum.
+Environment=GJC_ACP_SESSION_READINESS_TIMEOUT_MS=60000
+WorkingDirectory=/opt/gajae-mobile/bridge
+# On SIGHUP the bridge restarts its ACP process once no phone-started turn is running (e.g. after updating gjc).
+ExecStart=/home/gajae/.bun/bin/bun src/cli.ts serve --host 0.0.0.0 --port 7787 --cwd /home/gajae/projects --gjc "gjc --mode=acp"
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

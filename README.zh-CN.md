@@ -92,7 +92,7 @@ cd android && ./gradlew :app:testDebugUnitTest :app:assembleDebug   # Android
 cd ios/Core && swift test                                    # iOS 核心（macOS 或 Linux，Swift 6）
 ```
 
-iOS 应用由 CI（macOS）构建验证。欢迎先提 issue，再向 `main` 发起 PR，流程见 [AGENTS.md](AGENTS.md)。
+iOS 应用由 CI（macOS）构建验证。欢迎先提 issue，再向 `dev` 发起 PR，准入与提交规则见 [CONTRIBUTING.md](CONTRIBUTING.md)。
 
 ## 许可证
 

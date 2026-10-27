@@ -1,0 +1,29 @@
+name: 버그 · Bug report
+description: 앱이나 브리지가 예상과 다르게 동작합니다 · Something in the app or bridge does not work
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: 무슨 일이 있었나요 · What happened
+      description: 무엇을 했고, 무엇을 기대했고, 실제로 무엇이 일어났는지 · What you did, what you expected, what happened
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: 재현 순서 · Steps to reproduce
+      placeholder: "1. …\n2. …"
+  - type: input
+    id: version
+    attributes:
+      label: 버전 · Versions
+      description: 앱 버전, OS(iOS/Android 버전), gjc 버전, 브리지 커밋 · App version, OS, gjc version, bridge commit
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: 로그 · Logs
+      description: 브리지 출력 등. 토큰·페어링 코드·대화 내용은 지워 주세요 · Bridge output etc. Remove tokens, pairing codes and conversation content
+      render: text

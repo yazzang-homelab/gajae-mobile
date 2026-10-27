@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Gajae Code (gjc) 본체 문제 · Issues in gjc itself
+    url: https://github.com/Yeachan-Heo/gajae-code/issues
+    about: 에이전트 자체의 문제는 가재코드 저장소에 남겨 주세요 · Report agent issues to the Gajae Code repository

@@ -43,7 +43,7 @@ App Store Connect와 Play Console에 그대로 붙여 넣는 값입니다. 앱 U
 
 ### English
 
-- Subtitle: Your coding agent, on your phone
+- Subtitle (30 chars): Coding agent, on your phone
 - Promotional text: Your agent asks. Your phone answers. Approve commands, steer running turns, and see waiting sessions on your home and lock screen.
 - Keywords: gajae,gjc,coding agent,AI,remote,approve,terminal,developer,widget,e2ee
 - Description:

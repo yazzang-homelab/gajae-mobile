@@ -17,7 +17,7 @@
 | iOS OTA | `MARKETING_VERSION` (`ios/project.yml`) | `ci.yml`의 `run_number` |
 | App Store | 같음 | `appstore.yml`의 `run_number` + `000` |
 | Xcode Cloud | 같음 | Xcode Cloud가 매기는 `CI_BUILD_NUMBER`(App Store Connect의 Xcode Cloud 설정에서 다음 번호를 지정. 이미 올린 빌드보다 크게) |
-| Google Play | `-PversionName` (기본 `0.1.0`) | `android.yml`의 `run_number` + `000` |
+| Google Play | `-PversionName` (기본 `1.0.0`) | `android.yml`의 `run_number` + `000` |
 
 스토어 빌드 번호에 `000`을 붙이는 이유는 OTA로 설치한 빌드보다 항상 커서 충돌하지 않게 하기 위해서입니다.
 

@@ -12,7 +12,7 @@ settings:
     DEVELOPMENT_TEAM: 6Z6SXY7BTZ
     # Review demo host offer URL, from the build environment (xcodebuild GJCM_DEMO_OFFER_URL=…); empty hides the demo.
     GJCM_DEMO_OFFER_URL: ""
-    MARKETING_VERSION: "0.1.0"
+    MARKETING_VERSION: "1.0.0"
     CURRENT_PROJECT_VERSION: "1"
 packages:
   GjcMobileCore:

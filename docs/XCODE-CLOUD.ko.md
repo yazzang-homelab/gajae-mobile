@@ -70,7 +70,7 @@ Xcode → Settings(⌘,) → Accounts → `+` → Apple ID. 로그인 후 팀 �
 | 항목 | 값 |
 |---|---|
 | General | 이름 `PR`, 같은 프로젝트 |
-| Start Conditions | Pull Request Changes → Source: Any Branch, Target: `main` |
+| Start Conditions | Pull Request Changes → Source: Any Branch, Target: `dev` |
 | Actions | **Build – iOS**, Scheme `GjcMobile`, Platform: Any iOS Simulator Device |
 | Post-Actions | 없음 |
 

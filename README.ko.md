@@ -92,7 +92,7 @@ cd android && ./gradlew :app:testDebugUnitTest :app:assembleDebug   # Android
 cd ios/Core && swift test                                    # iOS 코어 (macOS 또는 Linux, Swift 6)
 ```
 
-iOS 앱 빌드는 CI(macOS)에서 확인합니다. 기여는 이슈를 열고 `main` 대상 PR로 보내 주세요. 자세한 흐름은 [AGENTS.md](AGENTS.md)에 있습니다.
+iOS 앱 빌드는 CI(macOS)에서 확인합니다. 기여는 이슈를 열고 `dev` 대상 PR로 보내 주세요. 자세한 흐름은 [AGENTS.md](AGENTS.md)에 있습니다.
 
 ## 라이선스
 

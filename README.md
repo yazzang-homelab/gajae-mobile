@@ -92,7 +92,7 @@ cd android && ./gradlew :app:testDebugUnitTest :app:assembleDebug   # Android
 cd ios/Core && swift test                                    # iOS core (macOS or Linux, Swift 6)
 ```
 
-CI builds the iOS app on macOS. Contributions go through an issue and a pull request against `main`; see [AGENTS.md](AGENTS.md).
+CI builds the iOS app on macOS. Contributions go through an issue and a pull request against `dev`; see [AGENTS.md](AGENTS.md).
 
 ## License
 

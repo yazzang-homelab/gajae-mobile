@@ -5,7 +5,7 @@ plugins {
 }
 
 val appVersionCode = (project.findProperty("versionCode") as String?)?.toInt() ?: 1
-val appVersionName = (project.findProperty("versionName") as String?) ?: "0.1.0"
+val appVersionName = (project.findProperty("versionName") as String?) ?: "1.0.0"
 
 android {
     namespace = "dev.gajae.gjcmobile"

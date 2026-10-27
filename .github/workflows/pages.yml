@@ -1,0 +1,36 @@
+name: pages
+
+# Support page and privacy policy for the store listings: https://yazzang-homelab.github.io/gajae-mobile/
+# privacy.html has one source, bridge/demo/privacy.html, which the demo host also serves at /privacy.
+on:
+  push:
+    branches: [main]
+    paths: [pages/**, bridge/demo/privacy.html, ios/App/Assets.xcassets/AppIcon.appiconset/AppIcon.png, .github/workflows/pages.yml]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Assemble site
+        run: |
+          mkdir -p _site
+          cp pages/* _site/
+          cp bridge/demo/privacy.html _site/privacy.html
+          cp ios/App/Assets.xcassets/AppIcon.appiconset/AppIcon.png _site/icon.png
+      - uses: actions/upload-pages-artifact@v3
+      - id: deployment
+        uses: actions/deploy-pages@v4

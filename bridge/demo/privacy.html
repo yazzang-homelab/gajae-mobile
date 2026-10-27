@@ -3,44 +3,93 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>가재코드 모바일 개인정보처리방침</title>
+<title>가재코드 모바일 개인정보처리방침 · Gajae Code mobile Privacy Policy</title>
 <style>
 body{font:16px/1.7 -apple-system,system-ui,sans-serif;max-width:720px;margin:2rem auto;padding:0 1.2rem;background:#14110f;color:#f3ead8}
-h1{font-size:1.5rem}h2{font-size:1.1rem;margin-top:2rem}a{color:#e4b45a}
+h1{font-size:1.5rem}h2{font-size:1.1rem;margin-top:2rem}a{color:#e4b45a}hr{border:0;border-top:1px solid #3a2420;margin:3rem 0}
 </style>
 </head>
 <body>
-<h1>가재코드 모바일 개인정보처리방침</h1>
-<p>시행일: 2026년 10월 24일</p>
+<p><a href="#ko">한국어</a> · <a href="#en">English</a></p>
 
-<p>가재코드 모바일(이하 "앱")은 사용자가 직접 운영하는 컴퓨터의 가재코드(gjc) 에이전트를 휴대전화에서 조작하기 위한 원격 제어 앱입니다. 앱 개발자는 별도의 서버를 운영하지 않으며, 사용자의 개인정보를 수집하거나 전송받지 않습니다.</p>
+<section id="ko" lang="ko">
+<h1>가재코드 모바일 개인정보처리방침</h1>
+<p>시행일: 2026년 10월 27일</p>
+<p>가재코드 모바일(이하 "앱")은 사용자가 직접 운영하는 컴퓨터의 가재코드(gjc) 에이전트를 휴대전화에서 조작하기 위한 원격 제어 앱입니다. 앱 개발자는 사용자 데이터를 받는 서버를 운영하지 않으며, 사용자의 개인정보를 수집하거나 전송받지 않습니다. 소스 코드는 <a href="https://github.com/yazzang-homelab/gajae-mobile">GitHub</a>에 공개되어 있습니다.</p>
 
 <h2>1. 수집하는 정보</h2>
-<p>앱 개발자는 어떠한 개인정보도 수집하지 않습니다. 회원가입, 광고, 분석 도구, 추적 기능이 없습니다.</p>
+<p>앱 개발자는 어떠한 개인정보도 수집하지 않습니다. 회원가입, 광고, 분석 도구, 추적 기능, 원격 푸시 서버가 없습니다.</p>
 
 <h2>2. 기기에 저장되는 정보</h2>
 <ul>
-<li>페어링한 호스트의 이름, 접속 주소, 공개키, 이 기기의 암호화 키: 기기의 보안 저장소(iOS 키체인, Android Keystore)에만 저장됩니다.</li>
-<li>화면 설정(추론 보기 등): 기기 내부 설정에만 저장됩니다.</li>
+<li>페어링한 호스트의 이름, 접속 주소, 공개키와 이 기기의 암호화 키: 기기의 보안 저장소(iOS 키체인, Android Keystore로 보호되는 저장소)에만 저장됩니다.</li>
+<li>세션 목록 캐시와 화면 설정: 앱 내부 저장소에만 저장됩니다.</li>
+<li>위젯 정보: 홈·잠금화면 위젯이 보여줄 호스트 이름, 세션 이름, 응답 대기·작업 중 세션 수와 마지막 확인 시각을 기기 안의 앱 전용 공간(iOS App Group, Android 앱 저장소)에 저장합니다. 질문·명령 내용과 대화 내용은 위젯용으로 저장하지 않으며, 잠금화면 위젯은 숫자만 표시합니다.</li>
 </ul>
 
 <h2>3. 전송되는 정보</h2>
 <p>대화 내용, 첨부한 사진과 파일은 사용자가 페어링한 호스트(사용자 본인의 컴퓨터)로만 전송됩니다. 전송 구간은 기기와 호스트 사이에서 종단 간 암호화(X25519 키 교환, AES-256-GCM)되며, 앱 개발자를 포함한 제3자는 내용을 볼 수 없습니다. 호스트에서 처리되는 데이터의 관리 책임은 호스트를 운영하는 사용자에게 있습니다.</p>
 
-<h2>4. 데모 호스트</h2>
+<h2>4. 알림과 백그라운드 갱신</h2>
+<p>알림은 기기 안에서 만드는 로컬 알림입니다. 위젯을 최신으로 유지하기 위해 앱은 운영체제가 허용하는 시점(Android 약 15분 간격, iOS 백그라운드 앱 새로 고침)에 페어링한 호스트에 잠깐 접속해 대기 중인 질문 수와 세션 상태만 받아옵니다. 이 접속도 같은 종단 간 암호화를 사용합니다.</p>
+
+<h2>5. 데모 호스트</h2>
 <p>"데모로 체험" 기능은 개발자가 운영하는 데모 호스트에 연결합니다. 데모 호스트는 정해진 응답만 돌려주고 명령을 실행하지 않습니다. 데모 대화는 기능 시연을 위해 데모 호스트에 일시 저장되며 최대 40개를 넘으면 오래된 순서로 삭제됩니다. 데모에는 개인정보를 입력하지 마십시오.</p>
 
-<h2>5. 권한</h2>
+<h2>6. 권한</h2>
 <ul>
 <li>카메라: 페어링 QR 코드를 읽을 때만 사용합니다. 영상은 저장하거나 전송하지 않습니다.</li>
 <li>사진·파일: 사용자가 첨부를 선택했을 때 선택한 항목만 호스트로 전송합니다.</li>
 <li>로컬 네트워크: 같은 네트워크의 호스트에 연결할 때 사용합니다.</li>
+<li>알림: 에이전트가 승인이나 답을 기다릴 때와 작업이 끝났을 때 알립니다.</li>
 </ul>
 
-<h2>6. 아동</h2>
+<h2>7. 아동</h2>
 <p>앱은 개발자용 도구이며 아동을 대상으로 하지 않습니다.</p>
 
-<h2>7. 문의</h2>
-<p>개인정보 관련 문의는 App Store 또는 Google Play 앱 정보에 표시된 개발자 연락처로 하십시오.</p>
+<h2>8. 문의</h2>
+<p>개인정보 관련 문의는 <a href="https://github.com/yazzang-homelab/gajae-mobile/issues">GitHub 이슈</a> 또는 스토어 앱 정보에 표시된 개발자 연락처로 하십시오.</p>
+</section>
+
+<hr>
+
+<section id="en" lang="en">
+<h1>Gajae Code mobile Privacy Policy</h1>
+<p>Effective: October 27, 2026</p>
+<p>Gajae Code mobile (the "app") is a remote control for the Gajae Code (gjc) agent running on a computer you operate yourself. The developer runs no server that receives your data and does not collect or receive any personal information. The source code is public on <a href="https://github.com/yazzang-homelab/gajae-mobile">GitHub</a>.</p>
+
+<h2>1. Information we collect</h2>
+<p>None. The app has no accounts, ads, analytics, tracking or remote push server.</p>
+
+<h2>2. Information stored on your device</h2>
+<ul>
+<li>Paired hosts' names, addresses and public keys, and this device's encryption keys: only in the device's secure storage (iOS Keychain, storage protected by the Android Keystore).</li>
+<li>A cache of the session list and display settings: only in the app's private storage.</li>
+<li>Widget data: host names, session names, the number of sessions waiting for you or working, and when they were last checked, stored in the app's private container on the device (iOS App Group, Android app storage) for the home and lock-screen widgets. Question text, command text and conversation content are never stored for the widget, and the lock-screen widget shows counts only.</li>
+</ul>
+
+<h2>3. Information sent</h2>
+<p>Messages and the photos and files you attach are sent only to the host you paired (your own computer). The connection between the device and the host is end-to-end encrypted (X25519 key agreement, AES-256-GCM); no third party, including the developer, can read it. The user who runs the host is responsible for the data processed there.</p>
+
+<h2>4. Notifications and background refresh</h2>
+<p>Notifications are created locally on the device. To keep the widget current, the app briefly connects to your paired hosts when the operating system allows it (about every 15 minutes on Android, iOS Background App Refresh) and fetches only the number of waiting questions and the session states, over the same end-to-end encryption.</p>
+
+<h2>5. Demo host</h2>
+<p>"Try the demo" connects to a demo host run by the developer. It returns scripted replies and executes nothing. Demo conversations are kept temporarily on the demo host to show the features, and the oldest are deleted once there are more than 40. Do not enter personal information in the demo.</p>
+
+<h2>6. Permissions</h2>
+<ul>
+<li>Camera: only to read the pairing QR code. Video is not stored or sent.</li>
+<li>Photos and files: only the items you choose to attach are sent to your host.</li>
+<li>Local network: to connect to a host on the same network.</li>
+<li>Notifications: to tell you when the agent waits for your approval or answer, and when work finishes.</li>
+</ul>
+
+<h2>7. Children</h2>
+<p>The app is a developer tool and is not directed at children.</p>
+
+<h2>8. Contact</h2>
+<p>Use <a href="https://github.com/yazzang-homelab/gajae-mobile/issues">GitHub issues</a> or the developer contact shown in the store listing.</p>
+</section>
 </body>
 </html>

@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Gajae Code mobile · 가재코드 모바일 — Support</title>
+<meta name="description" content="Gajae Code (gjc) on your phone: approve commands, steer turns, home and lock-screen widget.">
+<style>
+body{font:16px/1.7 -apple-system,system-ui,sans-serif;max-width:760px;margin:2rem auto;padding:0 1.2rem;background:#0a0707;color:#f3e6d0}
+h1{font-size:1.6rem;margin:.4rem 0}h2{font-size:1.1rem;margin-top:2rem;color:#e5482f}a{color:#d9a441}
+img.icon{width:88px;border-radius:20px}code{background:#1a1110;padding:.1rem .35rem;border-radius:4px}
+.muted{color:#a8968a}
+</style>
+</head>
+<body>
+<img class="icon" src="icon.png" alt="">
+<h1>Gajae Code mobile · 가재코드 모바일</h1>
+<p><b>Your agent asks. Your phone answers.</b> A companion app for <a href="https://github.com/Yeachan-Heo/gajae-code">Gajae Code (gjc)</a>, the coding agent that runs on your own computer: start work, approve the commands it wants to run, steer a running turn, and see on your home screen which session is waiting for you.</p>
+<p><a href="privacy.html">Privacy Policy · 개인정보처리방침</a> · <a href="https://github.com/yazzang-homelab/gajae-mobile">Source code (AGPL-3.0)</a></p>
+
+<h2>Getting started</h2>
+<ol>
+<li>On your computer, install <a href="https://bun.sh">Bun</a> and Gajae Code, then run the bridge from the repository: <code>cd bridge &amp;&amp; bun install &amp;&amp; bun src/cli.ts serve --gjc "gjc --mode=acp"</code></li>
+<li>Run <code>bun src/cli.ts pair</code> and scan the QR code with the app.</li>
+<li>No computer at hand? Tap <b>컴퓨터 없이 데모로 체험</b> (try the demo without a computer) on the first screen; the demo host returns scripted replies and runs nothing.</li>
+</ol>
+
+<h2>시작하기</h2>
+<ol>
+<li>컴퓨터에 Bun과 가재코드를 설치하고 저장소의 브리지를 실행합니다: <code>cd bridge &amp;&amp; bun install &amp;&amp; bun src/cli.ts serve --gjc "gjc --mode=acp"</code></li>
+<li><code>bun src/cli.ts pair</code>로 나온 QR 코드를 앱에서 스캔합니다.</li>
+<li>컴퓨터가 없으면 첫 화면의 <b>컴퓨터 없이 데모로 체험</b>을 누릅니다. 데모 호스트는 정해진 응답만 돌려주고 아무것도 실행하지 않습니다.</li>
+</ol>
+
+<h2>Help · 문의</h2>
+<p>Questions, bugs and feature requests: <a href="https://github.com/yazzang-homelab/gajae-mobile/issues">GitHub issues</a>. Lost a phone? Run <code>bun src/cli.ts revoke &lt;name&gt;</code> on the host to cut it off immediately.</p>
+<p>질문·버그·기능 요청은 <a href="https://github.com/yazzang-homelab/gajae-mobile/issues">GitHub 이슈</a>로 남겨 주세요. 휴대폰을 잃어버리면 호스트에서 <code>bun src/cli.ts revoke &lt;이름&gt;</code>으로 즉시 끊을 수 있습니다.</p>
+<p class="muted">The app interface is in Korean. Gajae Code mobile is open source under the GNU AGPL-3.0.</p>
+</body>
+</html>

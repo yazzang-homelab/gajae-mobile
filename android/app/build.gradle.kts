@@ -9,12 +9,12 @@ val appVersionName = (project.findProperty("versionName") as String?) ?: "1.0.0"
 
 android {
     namespace = "dev.gajae.gjcmobile"
-    compileSdk = 35
+    compileSdk = 36
 
     defaultConfig {
         applicationId = "dev.gajae.gjcmobile"
         minSdk = 26
-        targetSdk = 35
+        targetSdk = 36
         versionCode = appVersionCode
         versionName = appVersionName
         // The review demo host's offer URL comes from the build environment; empty hides the demo button.

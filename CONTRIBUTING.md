@@ -20,7 +20,13 @@ Nobody, human or bot, starts implementing an issue until all three checks pass, 
    - Read the head with `git ls-remote origin refs/heads/dev`.
    - Update with `git fetch origin 'refs/heads/dev:refs/remotes/origin/dev'`.
    - Do not use `git fetch origin dev`. It only updates `FETCH_HEAD` and leaves `origin/dev` stale.
-   - For a bug, point at the file and line on that head where it happens, or reproduce it. If it was already fixed, close the issue with a pointer to the fix.
+   - For a bug, reproduce it **in a clean state, as a first-time user would hit it**:
+     - Start every attempt from nothing: a new `HOME` and `TMPDIR` for the bridge (no pairing store, no keys), a new Gradle user home for Android builds, and a newly created emulator with wiped data for app behaviour. Never reuse your own working state.
+     - Use the dependencies a user gets from that commit (`bun install --frozen-lockfile`, that commit's Gradle build files). No network access during the reproduction.
+     - If the issue names a failing commit, check that commit too. Never call a bug "not reproduced" on a revision that lacks the commit it blames.
+     - A second, independent check tries to refute the result on the same commit. The result counts only when both agree.
+   - The outcomes are: reproduced in a clean state (passes), reproduced only with leftover state (held, and the state is named), not reproduced, already fixed (close with a pointer to the fixing commit), needs information (ask the reporter), or cannot be tested here.
+   - "Cannot be tested here" covers things like iOS-only UI. A maintainer reproduces it on a real device and records what they saw on the issue; that record replaces the sandbox result.
    - For a feature, verified means a maintainer has accepted the behaviour: the issue carries the `accepted` label.
 2. **Implementable.** The change is one defect, or one accepted feature, with a minimal fix.
    - If the fix needs a product decision, it is a proposal, not a fix. Discuss it in the issue first and do not write code. Examples: a new setting, a new threshold or policy, a new stored field, a changed meaning of something the user sees, or two equally valid behaviours.
@@ -78,7 +84,7 @@ The maintainer runs an issue and pull-request bot that applies these gates.
 
 **What it does on its own:**
 - triages new issues and adds a type label;
-- runs the intake checks;
+- runs the intake checks, including the clean-state reproduction and its independent check in an isolated sandbox with no network and no credentials;
 - retargets pull requests opened against `main` to `dev`;
 - implements an accepted issue in its own worktree from `origin/dev`;
 - runs the submission checks and an independent review.

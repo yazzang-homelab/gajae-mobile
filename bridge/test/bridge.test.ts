@@ -84,6 +84,23 @@ describe("pairing and authentication", () => {
 	});
 });
 
+describe("gjc ACP process failures", () => {
+	test("a gjc that dies before answering initialize reports its exit code and stderr", async () => {
+		const dying = [
+			process.execPath,
+			"-e",
+			"console.error('starting'); console.error('\\x1b[31mError: No models available.\\x1b[39m'); process.exit(3)",
+		];
+		const bridge = await startTestBridge(dying);
+		running.push(bridge);
+		const { client } = await bridge.pairedClient();
+		const failure = await client.request("host.info").catch(error => error);
+		expect(failure).toBeInstanceOf(BridgeClientError);
+		expect(failure.code).toBe(-32000);
+		expect(failure.message).toBe("gjc ACP process exited (code 3): starting | Error: No models available.");
+	});
+});
+
 describe("sessions over the bridge", () => {
 	test("new session, prompt with permission approval, streamed updates, turn end", async () => {
 		const bridge = await useBridge();

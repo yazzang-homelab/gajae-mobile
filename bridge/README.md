@@ -52,6 +52,10 @@ bun src/cli.ts revoke <id> # 기기 해제
 - BTW 사이드 질문([BTW.ko.md](../docs/BTW.ko.md))은 `turn.btw` ACP 제어를 넣은 gjc 빌드가 필요합니다. 공식 gjc 릴리스에는 아직 없습니다. 지원하지 않는 gjc는 `unknown_operation`으로 답하고, 브리지는 이를 `host_outdated`로 앱에 전달합니다.
 - `GJC_ACP_SESSION_READINESS_TIMEOUT_MS`(허용 범위 4000–60000ms, 그 밖은 22000으로 되돌아감)는 이를 지원하는 gjc 빌드에서만 적용됩니다. 지원하지 않는 빌드에서는 콜드 재개가 22초에서 실패할 수 있습니다.
 
+## 문제 해결
+
+**모든 요청이 약 70초 뒤 `gjc ACP process exited`로 실패(Windows).** gjc 세션 인덱스 잠금 `%USERPROFILE%\.gjc\agent\sdk\sessions\index.jsonl.lock`이 남아 gjc가 시작하지 못하는 gjc 본체 문제입니다([gajae-code#6008](https://github.com/Yeachan-Heo/gajae-code/issues/6008), 수정 이후에도 재발 보고됨). 브리지 로그의 같은 줄 뒤에 gjc가 남긴 오류가 함께 찍힙니다. 브리지와 gjc(터미널 TUI 포함)를 모두 끈 뒤 그 `index.jsonl.lock` 디렉터리를 다른 이름으로 옮기거나 지우고 브리지를 다시 띄웁니다. 세션 기록은 `index.jsonl`과 세션 파일에 그대로 남습니다. gjc가 하나라도 실행 중일 때는 지우지 않습니다.
+
 ## 심사용 데모 호스트
 
 `deploy/gjcm-demo.service`가 `demo/demo-agent.ts`(정해진 응답만 내는 ACP 대역, 명령 실행 없음)로 브리지를 하나 더 띄웁니다. 상태와 에이전트 디렉터리는 운영 브리지와 분리되고, 공개 HTTPS 경로(예: `https://demo.example.com/gjcm-demo`)로 노출합니다. `--demo-endpoint`를 주면 `GET /offer`가 그 주소용 30일 재사용 페어링 링크를, `GET /privacy`가 개인정보처리방침을 돌려줍니다. 앱의 "컴퓨터 없이 데모로 체험"은 빌드 때 `GJCM_DEMO_OFFER_URL`로 준 이 `/offer` 주소를 쓰며, 비어 있으면 버튼이 숨겨집니다.

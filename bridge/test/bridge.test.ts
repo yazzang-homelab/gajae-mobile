@@ -58,6 +58,16 @@ describe("pairing and authentication", () => {
 		});
 		await expect(forged).rejects.toMatchObject({ code: "pairing_invalid" });
 		expect(bridge.state.devices()).toHaveLength(1);
+		// A wrong proof does not burn the code: its owner can still pair with it, once.
+		const owner = await BridgeClient.connect(bridge.endpoint, BridgeClient.identityFromOffer(o2), {
+			pairing: { id: o2.pairingId, secret: o2.secret },
+		});
+		owner.close();
+		expect(bridge.state.devices()).toHaveLength(2);
+		const again = BridgeClient.connect(bridge.endpoint, BridgeClient.identityFromOffer(o2), {
+			pairing: { id: o2.pairingId, secret: o2.secret },
+		});
+		await expect(again).rejects.toMatchObject({ code: "pairing_invalid" });
 	});
 
 	test("unknown devices are refused and wrong host keys never get a response", async () => {

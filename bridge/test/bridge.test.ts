@@ -543,6 +543,69 @@ describe("sessions over the bridge", () => {
 		expect((await client.request("sdk.query", { sessionId: sid, op: "queue.messages.list" })).items.map((m: any) => m.text)).toEqual(["대기 중"]);
 	});
 
+	test("an ask waiting in a TUI turn reaches the phone from the transcript and settles with the terminal's answer", async () => {
+		const bridge = await useBridge();
+		const { client } = await bridge.pairedClient();
+		const sid = (await client.request("session.new", {})).sessionId;
+		// gjc sends a TUI turn's tool calls only to its own host; the transcript is where the ask shows up.
+		const dir = path.join(bridge.home, "agent", "sessions", "v2-fake");
+		fs.mkdirSync(dir, { recursive: true });
+		const file = path.join(dir, `2026-10-26T00-00-00-000Z_${sid}.jsonl`);
+		const record = (message: unknown) => `${JSON.stringify({ type: "message", message })}\n`;
+		const ask = { questions: [{ id: "ab", question: "A와 B 중 무엇?", options: [{ label: "A" }, { label: "B" }] }] };
+		const askId = "toolu_ask|fc_1";
+		fs.writeFileSync(
+			file,
+			JSON.stringify({ type: "session", version: 5, id: sid, cwd: "/tmp" }) +
+				"\n" +
+				record({ role: "user", content: [{ type: "text", text: "A와 B 물어봐" }] }) +
+				record({
+					role: "assistant",
+					stopReason: "toolUse",
+					content: [
+						{ type: "toolCall", id: "toolu_read|fc_0", name: "read", arguments: { path: "x" } },
+						{ type: "toolCall", id: askId, name: "ask", arguments: ask },
+					],
+				}) +
+				record({ role: "toolResult", toolCallId: "toolu_read|fc_0", toolName: "read", content: [{ type: "text", text: "x" }] }),
+		);
+		const askUpdate = (status: string) => (e: { ev: string; p: any }) =>
+			e.ev === "session.update" && e.p.sessionId === sid && e.p.update.toolCallId === askId && e.p.update.status === status;
+		await client.request("sdk.control", { sessionId: sid, op: "turn.steer", input: { text: "terminal turn" } });
+		const shown = await client.waitFor(askUpdate("pending"), 3000);
+		expect(shown.p.update).toMatchObject({ sessionUpdate: "tool_call", title: "ask: A와 B 중 무엇?", rawInput: ask });
+		expect(shown.p.update.content[0].content.text).toContain("  • B");
+		// Only the ask: tools that already have a result are not repeated.
+		expect(client.events.filter(e => e.ev === "session.update" && e.p.update.toolCallId === "toolu_read|fc_0")).toEqual([]);
+
+		fs.appendFileSync(
+			file,
+			record({ role: "toolResult", toolCallId: askId, toolName: "ask", content: [{ type: "text", text: "User selected: A" }] }),
+		);
+		const answered = await client.waitFor(askUpdate("completed"), 3000);
+		expect(answered.p.update.content[0].content.text).toBe("User selected: A");
+		await Bun.sleep(1200);
+		expect(client.events.filter(e => e.ev === "session.update" && e.p.update.toolCallId === askId)).toHaveLength(2);
+	});
+
+	test("a TUI ask left unanswered when the terminal turn ends is shown as failed", async () => {
+		const bridge = await useBridge();
+		const { client } = await bridge.pairedClient();
+		const sid = (await client.request("session.new", {})).sessionId;
+		const dir = path.join(bridge.home, "agent", "sessions", "v2-fake");
+		fs.mkdirSync(dir, { recursive: true });
+		const ask = { type: "toolCall", id: "toolu_ask|fc_2", name: "ask", arguments: { questions: [{ id: "q", question: "계속?" }] } };
+		fs.writeFileSync(
+			path.join(dir, `2026-10-26T00-00-00-000Z_${sid}.jsonl`),
+			`${JSON.stringify({ type: "session", version: 5, id: sid, cwd: "/tmp" })}\n${JSON.stringify({ type: "message", message: { role: "assistant", content: [ask] } })}\n`,
+		);
+		await client.request("sdk.control", { sessionId: sid, op: "turn.steer", input: { text: "terminal turn" } });
+		await client.waitFor(e => e.ev === "session.update" && e.p.update.toolCallId === ask.id && e.p.update.status === "pending", 3000);
+		await client.request("sdk.control", { sessionId: sid, op: "turn.steer", input: { text: "terminal done" } });
+		const failed = await client.waitFor(e => e.ev === "session.update" && e.p.update.toolCallId === ask.id && e.p.update.status === "failed", 3000);
+		expect(failed.p.update.content[0].content.text).toContain("턴이 끝났습니다");
+	});
+
 	test("session.status carries gjc's queue while the session works, whoever queued the message", async () => {
 		const bridge = await useBridge();
 		const { client } = await bridge.pairedClient();

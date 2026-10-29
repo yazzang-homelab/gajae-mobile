@@ -200,6 +200,11 @@ async function handle(msg: any) {
 					update(params.sessionId, { sessionUpdate: "session_info_update", _meta: { gjcPhase: "working", running: true } });
 					return reply({ accepted: true });
 				}
+				// "terminal done" ends that TUI turn.
+				if (text === "terminal done") {
+					update(params.sessionId, { sessionUpdate: "session_info_update", _meta: { gjcPhase: "idle", running: false } });
+					return reply({ accepted: true });
+				}
 				// "taken" stands for a steer the model consumed at its next step: it never stays queued.
 				if (text !== "taken") steers.set(params.sessionId, [...(steers.get(params.sessionId) ?? []), { id: `steer:${nextSteer++}`, text, mode: "steer", label: "Steer" }]);
 				return reply({ accepted: true });

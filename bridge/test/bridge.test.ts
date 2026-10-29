@@ -101,10 +101,14 @@ describe("gjc ACP process failures", () => {
 		expect(failure.message).toBe("gjc ACP process exited (code 3): starting | Error: No models available.");
 	});
 
-	test("a failed rpc log line carries gjc's error data, where -32603 keeps its reason", () => {
-		const data = { code: "unavailable", details: "Lifecycle worktree does not exist" };
+	test("a failed rpc log line names gjc's error kind but never its free-text details", () => {
+		const data = { code: "prompt_failed", details: "model rejected: <the user's prompt text>" };
 		expect(rpcFailureLine("session.new", -32603, 2552, "Internal error", data)).toBe(
-			'rpc session.new failed -32603 2552ms: Internal error data={"code":"unavailable","details":"Lifecycle worktree does not exist"}',
+			"rpc session.new failed -32603 (prompt_failed) 2552ms: Internal error",
+		);
+		// A code that is not a plain identifier is free text too.
+		expect(rpcFailureLine("session.new", -32603, 1, "Internal error", { code: "see: my secret prompt" })).toBe(
+			"rpc session.new failed -32603 1ms: Internal error",
 		);
 		expect(rpcFailureLine("host.info", -32000, 5, "gjc ACP process exited", undefined)).toBe(
 			"rpc host.info failed -32000 5ms: gjc ACP process exited",

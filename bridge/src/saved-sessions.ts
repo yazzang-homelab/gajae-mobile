@@ -99,6 +99,11 @@ export class SavedSessionIndex {
 		return undefined;
 	}
 
+	/** Path of the session's transcript file. */
+	transcript(sessionId: string): string | undefined {
+		return this.#files().find(file => this.#header(file.path, file.mtimeMs)?.sessionId === sessionId)?.path;
+	}
+
 	ids(): Set<string> {
 		const ids = new Set<string>();
 		for (const file of this.#files()) {

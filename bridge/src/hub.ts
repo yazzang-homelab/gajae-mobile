@@ -13,6 +13,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { AcpError, AcpProcess, type AcpSpawnOptions } from "./acp";
+import { hostAskSettled, hostAskToolCall, scanTranscriptAsks } from "./host-asks";
 import { SavedSessionIndex } from "./saved-sessions";
 import { Throughput } from "./throughput";
 
@@ -116,6 +117,10 @@ interface SessionState {
 	 * owns the chosen mode and reapplies it whenever it reloads the session.
 	 */
 	permissionMode: PermissionMode;
+	/** Asks of a TUI turn the phone was shown from the transcript (see host-asks.ts), still unanswered. */
+	hostAsks: Set<string>;
+	/** Transcript path and the size/mtime last scanned for [hostAsks]. */
+	hostAskScan?: { file: string; size: number; mtimeMs: number };
 }
 
 export interface SessionStatus {
@@ -341,6 +346,7 @@ export class SessionHub {
 				queued: [],
 				configOptions: [],
 				permissionMode: "prompt",
+				hostAsks: new Set(),
 			};
 			this.#sessions.set(sessionId, state);
 		} else if (cwd) {
@@ -399,6 +405,7 @@ export class SessionHub {
 			this.#ensureStatusTimer();
 			this.#publishStatus(state);
 		} else {
+			this.#sampleHostAsks(state, true);
 			state.throughput.finish();
 			// gjc drains or drops its queue when the turn ends; a follow-up it starts sets the session working again.
 			state.queued = [];
@@ -447,13 +454,54 @@ export class SessionHub {
 		return state.queueSample;
 	}
 
+	/**
+	 * Shows the phone the asks a turn typed in the TUI waits on, which gjc never sends over ACP (see host-asks.ts):
+	 * a pending `ask` in the transcript becomes a `tool_call` with the id gjc's own replay uses, and its
+	 * `toolResult` (the option picked in the terminal) settles it. Turns this bridge started stream their asks
+	 * over ACP and are skipped. `final` runs once the turn goes idle and fails asks left without an answer.
+	 */
+	#sampleHostAsks(state: SessionState, final = false): void {
+		if (!state.loaded) return;
+		if (final ? state.hostAsks.size === 0 : state.running || !state.hostRunning) return;
+		const file = state.hostAskScan?.file ?? this.#saved.transcript(state.sessionId);
+		if (!file) return;
+		let stat: fs.Stats;
+		try {
+			stat = fs.statSync(file);
+		} catch {
+			state.hostAskScan = undefined;
+			return;
+		}
+		const last = state.hostAskScan;
+		const changed = !last || last.file !== file || last.size !== stat.size || last.mtimeMs !== stat.mtimeMs;
+		state.hostAskScan = { file, size: stat.size, mtimeMs: stat.mtimeMs };
+		if (!changed && !final) return;
+		const scan = scanTranscriptAsks(file);
+		if (!scan) return;
+		if (!final) {
+			for (const ask of scan.pending) {
+				if (state.hostAsks.has(ask.toolCallId)) continue;
+				state.hostAsks.add(ask.toolCallId);
+				this.#append(state, hostAskToolCall(ask));
+			}
+		}
+		for (const id of state.hostAsks) {
+			const result = scan.results.get(id);
+			if (!result && !final) continue;
+			state.hostAsks.delete(id);
+			this.#append(state, hostAskSettled(id, result));
+		}
+	}
+
 	/** One tick per second while any session is working, so list rows show a live rate and chats gjc's queue. */
 	#ensureStatusTimer(): void {
 		if (this.#statusTimer) return;
 		this.#statusTimer = setInterval(() => {
 			const active = [...this.#sessions.values()].filter(isActive);
-			for (const state of active)
+			for (const state of active) {
+				this.#sampleHostAsks(state);
 				void Promise.all([this.#sampleUsage(state), this.#sampleQueue(state)]).finally(() => this.#publishStatus(state));
+			}
 			if (active.length === 0) {
 				clearInterval(this.#statusTimer);
 				this.#statusTimer = undefined;
@@ -522,6 +570,9 @@ export class SessionHub {
 				// A reload replays the full history again; start the replay buffer from scratch.
 				state.buffer = [];
 				state.bufferBytes = 0;
+				// The replay carries a waiting ask as failed ("ends without a result"); show it again as pending.
+				state.hostAsks.clear();
+				state.hostAskScan = undefined;
 				const result = await acp.request("session/load", {
 					sessionId: state.sessionId,
 					cwd: state.cwd,

@@ -594,7 +594,9 @@ describe("sessions over the bridge", () => {
 		expect(compact.message).toContain("Nothing to compact");
 		const outdated = await client.request("sdk.control", { sessionId: sid, op: "turn.btw", input: { question: "q" } }).catch((e: any) => e);
 		expect(outdated.code).toBe(-32020);
-		expect(outdated.message).toContain("gjc --resume");
+		expect(outdated.message).toBe(
+			"이 세션의 gjc가 turn.btw을(를) 지원하지 않습니다. 공식 gjc 릴리스에 없는 기능이거나, 그 기능이 들어가기 전에 시작된 세션입니다.",
+		);
 		const blocked = await client.request("sdk.control", { sessionId: sid, op: "bash.execute", input: { cmd: "id" } }).catch((e: any) => e);
 		expect(blocked.code).toBe(-32601);
 		const unopened = await client.request("sdk.query", { sessionId: "nope", op: "context.get" }).catch((e: any) => e);

@@ -6,6 +6,7 @@ import { BridgeClient, BridgeClientError } from "../src/client";
 import { generateKeyPair } from "../src/crypto";
 import { AGENT_EXIT, PERMISSION_MODE_UPDATE, TURN_END, supportedConfigOptions } from "../src/hub";
 import { parseOfferUrl, offerUrl } from "../src/offer";
+import { rpcFailureLine } from "../src/server";
 import { CHUNK_BYTES } from "../src/uploads";
 import { startTestBridge } from "./helpers";
 
@@ -98,6 +99,16 @@ describe("gjc ACP process failures", () => {
 		expect(failure).toBeInstanceOf(BridgeClientError);
 		expect(failure.code).toBe(-32000);
 		expect(failure.message).toBe("gjc ACP process exited (code 3): starting | Error: No models available.");
+	});
+
+	test("a failed rpc log line carries gjc's error data, where -32603 keeps its reason", () => {
+		const data = { code: "unavailable", details: "Lifecycle worktree does not exist" };
+		expect(rpcFailureLine("session.new", -32603, 2552, "Internal error", data)).toBe(
+			'rpc session.new failed -32603 2552ms: Internal error data={"code":"unavailable","details":"Lifecycle worktree does not exist"}',
+		);
+		expect(rpcFailureLine("host.info", -32000, 5, "gjc ACP process exited", undefined)).toBe(
+			"rpc host.info failed -32000 5ms: gjc ACP process exited",
+		);
 	});
 });
 

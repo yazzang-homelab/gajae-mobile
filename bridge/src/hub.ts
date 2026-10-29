@@ -877,11 +877,12 @@ export class SessionHub {
 				throw new AcpError(-32002, "Session is not open; call session.open first", { code: "session_reload_required" });
 			}
 			if (error.code === "unknown_operation") {
-				// The operation exists in the bridge allowlist but the gjc process hosting this session predates it
-				// (a terminal session started before a local patch such as turn.btw). Only a restart of that host fixes it.
+				// The operation is in the bridge allowlist but the gjc hosting this session lacks it: either the gjc build
+				// never had it (turn.btw is not in any official gjc release) or the session host started before it was added.
+				// A restart only helps in the second case, so the message does not promise it.
 				throw new AcpError(
 					-32020,
-					`이 세션을 띄운 gjc가 아직 ${params.op}을(를) 모릅니다. 터미널의 gjc를 다시 시작하면(종료 후 gjc --resume) 쓸 수 있습니다.`,
+					`이 세션의 gjc가 ${params.op}을(를) 지원하지 않습니다. 공식 gjc 릴리스에 없는 기능이거나, 그 기능이 들어가기 전에 시작된 세션입니다.`,
 					{ code: "host_outdated" },
 				);
 			}

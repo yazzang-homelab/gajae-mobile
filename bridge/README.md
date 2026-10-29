@@ -49,7 +49,7 @@ bun src/cli.ts revoke <id> # 기기 해제
 
 ## gjc 요구 사항
 
-- `turn.btw` ACP 제어(BTW 사이드 질문, [BTW.ko.md](../docs/BTW.ko.md))를 지원하는 gjc 빌드가 필요합니다. 지원하지 않는 gjc는 `unknown_operation`으로 답하고, 브리지는 이를 `host_outdated`로 앱에 전달합니다.
+- BTW 사이드 질문([BTW.ko.md](../docs/BTW.ko.md))은 `turn.btw` ACP 제어를 넣은 gjc 빌드가 필요합니다. 공식 gjc 릴리스에는 아직 없습니다. 지원하지 않는 gjc는 `unknown_operation`으로 답하고, 브리지는 이를 `host_outdated`로 앱에 전달합니다.
 - `GJC_ACP_SESSION_READINESS_TIMEOUT_MS`(허용 범위 4000–60000ms, 그 밖은 22000으로 되돌아감)는 이를 지원하는 gjc 빌드에서만 적용됩니다. 지원하지 않는 빌드에서는 콜드 재개가 22초에서 실패할 수 있습니다.
 
 ## 심사용 데모 호스트

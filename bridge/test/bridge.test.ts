@@ -6,6 +6,7 @@ import { BridgeClient, BridgeClientError } from "../src/client";
 import { generateKeyPair } from "../src/crypto";
 import { AGENT_EXIT, PERMISSION_MODE_UPDATE, TURN_END, supportedConfigOptions } from "../src/hub";
 import { parseOfferUrl, offerUrl } from "../src/offer";
+import { rpcFailureLine } from "../src/server";
 import { CHUNK_BYTES } from "../src/uploads";
 import { startTestBridge } from "./helpers";
 
@@ -81,6 +82,33 @@ describe("pairing and authentication", () => {
 		await expect(client.request("ping")).rejects.toBeInstanceOf(BridgeClientError);
 		expect((await client.closed).reason).toBe("device_revoked");
 		await expect(BridgeClient.connect(bridge.endpoint, identity)).rejects.toMatchObject({ code: "unknown_device" });
+	});
+});
+
+describe("gjc ACP process failures", () => {
+	test("a gjc that dies before answering initialize reports its exit code and stderr", async () => {
+		const dying = [
+			process.execPath,
+			"-e",
+			"console.error('starting'); console.error('\\x1b[31mError: No models available.\\x1b[39m'); process.exit(3)",
+		];
+		const bridge = await startTestBridge(dying);
+		running.push(bridge);
+		const { client } = await bridge.pairedClient();
+		const failure = await client.request("host.info").catch(error => error);
+		expect(failure).toBeInstanceOf(BridgeClientError);
+		expect(failure.code).toBe(-32000);
+		expect(failure.message).toBe("gjc ACP process exited (code 3): starting | Error: No models available.");
+	});
+
+	test("a failed rpc log line carries gjc's error data, where -32603 keeps its reason", () => {
+		const data = { code: "unavailable", details: "Lifecycle worktree does not exist" };
+		expect(rpcFailureLine("session.new", -32603, 2552, "Internal error", data)).toBe(
+			'rpc session.new failed -32603 2552ms: Internal error data={"code":"unavailable","details":"Lifecycle worktree does not exist"}',
+		);
+		expect(rpcFailureLine("host.info", -32000, 5, "gjc ACP process exited", undefined)).toBe(
+			"rpc host.info failed -32000 5ms: gjc ACP process exited",
+		);
 	});
 });
 

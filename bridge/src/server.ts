@@ -28,6 +28,16 @@ import type { UploadStore } from "./uploads";
 export const MAX_FRAME_BYTES = 32 * 1024 * 1024;
 /** RPCs slower than this are logged; a resume waits on gjc spawning a session host. */
 const SLOW_RPC_MS = 5_000;
+
+/**
+ * The log line for a failed phone RPC. gjc reports most agent failures as `-32603 Internal error` with
+ * the reason only in `data` (`{ code, details }`), so the data goes into the line too. Method, code,
+ * message and gjc's error data only: prompt text and file bytes never reach the log.
+ */
+export function rpcFailureLine(method: string, code: number, ms: number, message: string, data: unknown): string {
+	const detail = data === undefined || data === null ? "" : ` data=${JSON.stringify(data).slice(0, 300)}`;
+	return `rpc ${method} failed ${code} ${ms}ms: ${message.slice(0, 300)}${detail}`;
+}
 const HANDSHAKE_TIMEOUT_MS = 15_000;
 
 interface Conn {
@@ -219,8 +229,7 @@ export function startBridgeServer(options: BridgeServerOptions): Server<Conn> {
 		} catch (error: any) {
 			const code = error instanceof AcpError ? error.code : -32603;
 			const text = String(error?.message ?? error);
-			// Method, code and message only: prompt text and file bytes never reach the log.
-			log(`rpc ${m} failed ${code} ${Math.round(performance.now() - started)}ms: ${text.slice(0, 300)}`);
+			log(rpcFailureLine(m, code, Math.round(performance.now() - started), text, error?.data));
 			send(ws, { id, e: { code, message: text, data: error?.data } });
 		}
 	};

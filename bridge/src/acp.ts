@@ -30,6 +30,17 @@ export class AcpError extends Error {
 	}
 }
 
+const STDERR_DRAIN_MS = 500;
+/** Keeps the whole message inside the bridge's 300-char rpc failure log line. */
+const EXIT_REASON_CHARS = 240;
+
+/** "gjc ACP process exited (code 1): <stderr tail>", so a failed start says why in the bridge log and on the phone. */
+export function exitMessage(code: number | null, stderrTail: string): string {
+	// biome-ignore lint/suspicious/noControlCharactersInRegex: strips ANSI colour codes from gjc's stderr
+	const reason = stderrTail.replace(/\x1b\[[0-9;]*m/g, "").trim().replace(/\s*\n\s*/g, " | ").slice(-EXIT_REASON_CHARS);
+	return `gjc ACP process exited (code ${code ?? "signal"})${reason ? `: ${reason}` : ""}`;
+}
+
 export class AcpProcess {
 	#proc: Subprocess<"pipe", "pipe", "pipe">;
 	#nextId = 1;
@@ -48,10 +59,14 @@ export class AcpProcess {
 			stderr: "pipe",
 		});
 		void this.#readStdout();
-		void this.#readStderr();
-		void this.#proc.exited.then(code => {
+		const stderrDrained = this.#readStderr().catch(() => {});
+		void this.#proc.exited.then(async code => {
+			// gjc's last stderr lines say why it died; let them land, but never wait on a pipe that a
+			// detached child (the SDK broker) may still hold open.
+			await Promise.race([stderrDrained, Bun.sleep(STDERR_DRAIN_MS)]);
 			this.#closed = true;
-			for (const p of this.#pending.values()) p.reject(new AcpError(-32000, "gjc ACP process exited"));
+			const error = new AcpError(-32000, exitMessage(code, this.stderrTail));
+			for (const p of this.#pending.values()) p.reject(error);
 			this.#pending.clear();
 			this.#handlers.onExit(code);
 		});

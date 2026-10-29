@@ -121,10 +121,15 @@ export class BridgeState {
 		return live;
 	}
 
-	consumePairing(id: string): PendingPairing | undefined {
+	/**
+	 * Consumes the pairing `id` only if `proven` accepts it, so a request with a wrong proof cannot burn a
+	 * one-time code. Synchronous from lookup to removal: of two valid requests for the same code, one wins.
+	 */
+	consumePairing(id: string, proven: (pairing: PendingPairing) => boolean): PendingPairing | undefined {
 		const pending = this.pendingPairings();
 		const found = pending.find(p => p.id === id);
-		if (found && !found.reusable) writePrivate(path.join(this.home, "pairings.json"), pending.filter(p => p !== found));
+		if (!found || !proven(found)) return undefined;
+		if (!found.reusable) writePrivate(path.join(this.home, "pairings.json"), pending.filter(p => p !== found));
 		return found;
 	}
 }

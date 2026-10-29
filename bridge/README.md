@@ -49,8 +49,22 @@ bun src/cli.ts revoke <id> # 기기 해제
 
 ## gjc 요구 사항
 
-- `turn.btw` ACP 제어(BTW 사이드 질문, [BTW.ko.md](../docs/BTW.ko.md))를 지원하는 gjc 빌드가 필요합니다. 지원하지 않는 gjc는 `unknown_operation`으로 답하고, 브리지는 이를 `host_outdated`로 앱에 전달합니다.
+- BTW 사이드 질문([BTW.ko.md](../docs/BTW.ko.md))은 `turn.btw` ACP 제어를 넣은 gjc 빌드가 필요합니다. 공식 gjc 릴리스에는 아직 없습니다. 지원하지 않는 gjc는 `unknown_operation`으로 답하고, 브리지는 이를 `host_outdated`로 앱에 전달합니다.
 - `GJC_ACP_SESSION_READINESS_TIMEOUT_MS`(허용 범위 4000–60000ms, 그 밖은 22000으로 되돌아감)는 이를 지원하는 gjc 빌드에서만 적용됩니다. 지원하지 않는 빌드에서는 콜드 재개가 22초에서 실패할 수 있습니다.
+
+## 외부망에서 접속하기
+
+모든 요청은 앱과 브리지 사이에서 종단 간 암호화(X25519 + AES-256-GCM)되고, 등록된 기기만 받습니다. 그래도 브리지 포트를 인터넷에 열면 누구나 접속을 시도할 수 있으므로 아래 순서로 고릅니다.
+
+1. **Tailscale(권장).** PC와 휴대폰에 Tailscale을 켜 두면 `pair`가 Tailscale 주소를 첫 번째 엔드포인트로 넣습니다. LTE/5G에서도 연결되고 공유기 포트를 열 필요가 없습니다.
+2. **WSS 리버스 프록시.** 도메인과 TLS 인증서가 있으면 Caddy·nginx 같은 프록시가 `wss://<도메인>/ws`를 받아 `ws://127.0.0.1:7787/ws`로 넘기고, 브리지는 `--host 127.0.0.1`로 띄웁니다. 프록시에서 WebSocket Upgrade를 허용하고 연결 수·속도 제한을 겁니다. TLS는 E2EE를 대체하지 않고 전송 계층과 접속 메타데이터를 더 보호합니다.
+3. **공유기 포트포워딩(DDNS).** 권장하지 않습니다. 써야 한다면 브리지 포트 하나만 그 PC로 넘기고, 브리지 앞에 연결 제한이 없다는 점(인증 전 접속은 15초 핸드셰이크 타임아웃만 있음)을 감안합니다.
+
+페어링 QR에는 주소를 여러 개 넣을 수 있고 앱은 연결되는 주소를 씁니다: `bun src/cli.ts pair --endpoint wss://<도메인>/ws --endpoint ws://<LAN IP>:7787/ws`. 외부에 연 브리지에서는 `pair --reusable`과 `serve --demo-endpoint`를 쓰지 않습니다(둘 다 여러 기기가 같은 코드로 페어링하는 심사용 데모 기능입니다). 페어링 코드는 기본 10분 동안 한 번만 쓸 수 있고, 잃어버린 기기는 `bun src/cli.ts revoke <이름>`으로 끊습니다.
+
+## 문제 해결
+
+**모든 요청이 약 70초 뒤 `gjc ACP process exited`로 실패(Windows).** gjc 세션 인덱스 잠금 `%USERPROFILE%\.gjc\agent\sdk\sessions\index.jsonl.lock`이 남아 gjc가 시작하지 못하는 gjc 본체 문제입니다([gajae-code#6008](https://github.com/Yeachan-Heo/gajae-code/issues/6008), 수정 이후에도 재발 보고됨). 브리지 로그의 같은 줄 뒤에 gjc가 남긴 오류가 함께 찍힙니다. 브리지와 gjc(터미널 TUI 포함)를 모두 끈 뒤 그 `index.jsonl.lock` 디렉터리를 다른 이름으로 옮기거나 지우고 브리지를 다시 띄웁니다. 세션 기록은 `index.jsonl`과 세션 파일에 그대로 남습니다. gjc가 하나라도 실행 중일 때는 지우지 않습니다.
 
 ## 심사용 데모 호스트
 

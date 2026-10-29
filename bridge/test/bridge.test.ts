@@ -6,6 +6,7 @@ import { BridgeClient, BridgeClientError } from "../src/client";
 import { generateKeyPair } from "../src/crypto";
 import { AGENT_EXIT, PERMISSION_MODE_UPDATE, TURN_END, supportedConfigOptions } from "../src/hub";
 import { parseOfferUrl, offerUrl } from "../src/offer";
+import { rpcFailureLine } from "../src/server";
 import { CHUNK_BYTES } from "../src/uploads";
 import { startTestBridge } from "./helpers";
 
@@ -57,6 +58,16 @@ describe("pairing and authentication", () => {
 		});
 		await expect(forged).rejects.toMatchObject({ code: "pairing_invalid" });
 		expect(bridge.state.devices()).toHaveLength(1);
+		// A wrong proof does not burn the code: its owner can still pair with it, once.
+		const owner = await BridgeClient.connect(bridge.endpoint, BridgeClient.identityFromOffer(o2), {
+			pairing: { id: o2.pairingId, secret: o2.secret },
+		});
+		owner.close();
+		expect(bridge.state.devices()).toHaveLength(2);
+		const again = BridgeClient.connect(bridge.endpoint, BridgeClient.identityFromOffer(o2), {
+			pairing: { id: o2.pairingId, secret: o2.secret },
+		});
+		await expect(again).rejects.toMatchObject({ code: "pairing_invalid" });
 	});
 
 	test("unknown devices are refused and wrong host keys never get a response", async () => {
@@ -81,6 +92,37 @@ describe("pairing and authentication", () => {
 		await expect(client.request("ping")).rejects.toBeInstanceOf(BridgeClientError);
 		expect((await client.closed).reason).toBe("device_revoked");
 		await expect(BridgeClient.connect(bridge.endpoint, identity)).rejects.toMatchObject({ code: "unknown_device" });
+	});
+});
+
+describe("gjc ACP process failures", () => {
+	test("a gjc that dies before answering initialize reports its exit code and stderr", async () => {
+		const dying = [
+			process.execPath,
+			"-e",
+			"console.error('starting'); console.error('\\x1b[31mError: No models available.\\x1b[39m'); process.exit(3)",
+		];
+		const bridge = await startTestBridge(dying);
+		running.push(bridge);
+		const { client } = await bridge.pairedClient();
+		const failure = await client.request("host.info").catch(error => error);
+		expect(failure).toBeInstanceOf(BridgeClientError);
+		expect(failure.code).toBe(-32000);
+		expect(failure.message).toBe("gjc ACP process exited (code 3): starting | Error: No models available.");
+	});
+
+	test("a failed rpc log line names gjc's error kind but never its free-text details", () => {
+		const data = { code: "prompt_failed", details: "model rejected: <the user's prompt text>" };
+		expect(rpcFailureLine("session.new", -32603, 2552, "Internal error", data)).toBe(
+			"rpc session.new failed -32603 (prompt_failed) 2552ms: Internal error",
+		);
+		// A code that is not a plain identifier is free text too.
+		expect(rpcFailureLine("session.new", -32603, 1, "Internal error", { code: "see: my secret prompt" })).toBe(
+			"rpc session.new failed -32603 1ms: Internal error",
+		);
+		expect(rpcFailureLine("host.info", -32000, 5, "gjc ACP process exited", undefined)).toBe(
+			"rpc host.info failed -32000 5ms: gjc ACP process exited",
+		);
 	});
 });
 
@@ -562,7 +604,9 @@ describe("sessions over the bridge", () => {
 		expect(compact.message).toContain("Nothing to compact");
 		const outdated = await client.request("sdk.control", { sessionId: sid, op: "turn.btw", input: { question: "q" } }).catch((e: any) => e);
 		expect(outdated.code).toBe(-32020);
-		expect(outdated.message).toContain("gjc --resume");
+		expect(outdated.message).toBe(
+			"이 세션의 gjc가 turn.btw을(를) 지원하지 않습니다. 공식 gjc 릴리스에 없는 기능이거나, 그 기능이 들어가기 전에 시작된 세션입니다.",
+		);
 		const blocked = await client.request("sdk.control", { sessionId: sid, op: "bash.execute", input: { cmd: "id" } }).catch((e: any) => e);
 		expect(blocked.code).toBe(-32601);
 		const unopened = await client.request("sdk.query", { sessionId: "nope", op: "context.get" }).catch((e: any) => e);

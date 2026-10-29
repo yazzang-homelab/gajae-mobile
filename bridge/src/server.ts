@@ -28,6 +28,20 @@ import type { UploadStore } from "./uploads";
 export const MAX_FRAME_BYTES = 32 * 1024 * 1024;
 /** RPCs slower than this are logged; a resume waits on gjc spawning a session host. */
 const SLOW_RPC_MS = 5_000;
+
+/** gjc's error discriminators are short identifiers (`unavailable`, `prompt_failed`, …). */
+const ERROR_CODE_RE = /^[A-Za-z0-9_.-]{1,64}$/;
+
+/**
+ * The log line for a failed phone RPC. gjc reports most agent failures as `-32603 Internal error` with the
+ * kind of failure in `data.code`, so that identifier goes into the line. `data.details` stays out: it is free
+ * text that can quote user input. Method, codes and message only: prompt text and file bytes never reach the log.
+ */
+export function rpcFailureLine(method: string, code: number, ms: number, message: string, data: unknown): string {
+	const kind = (data as { code?: unknown } | null | undefined)?.code;
+	const detail = typeof kind === "string" && ERROR_CODE_RE.test(kind) ? ` (${kind})` : "";
+	return `rpc ${method} failed ${code}${detail} ${ms}ms: ${message.slice(0, 300)}`;
+}
 const HANDSHAKE_TIMEOUT_MS = 15_000;
 
 interface Conn {
@@ -144,10 +158,12 @@ export function startBridgeServer(options: BridgeServerOptions): Server<Conn> {
 		}
 		const deviceKeyText = b64urlEncode(deviceKey);
 		if (hello.pairing) {
-			const pending = state.consumePairing(String(hello.pairing.id ?? ""));
 			const proof = Buffer.from(String(hello.pairing.proof ?? ""), "base64url");
-			const expected = pending ? pairingProof(b64urlDecode(pending.secret), deviceKey, clientEph) : undefined;
-			if (!expected || proof.length !== expected.length || !crypto.timingSafeEqual(proof, expected)) {
+			const pending = state.consumePairing(String(hello.pairing.id ?? ""), candidate => {
+				const expected = pairingProof(b64urlDecode(candidate.secret), deviceKey, clientEph);
+				return proof.length === expected.length && crypto.timingSafeEqual(proof, expected);
+			});
+			if (!pending) {
 				log(`pairing rejected device=${deviceKeyText.slice(0, 8)}`);
 				return fail(ws, "pairing_invalid", "pairing code is invalid, used, or expired");
 			}
@@ -219,8 +235,7 @@ export function startBridgeServer(options: BridgeServerOptions): Server<Conn> {
 		} catch (error: any) {
 			const code = error instanceof AcpError ? error.code : -32603;
 			const text = String(error?.message ?? error);
-			// Method, code and message only: prompt text and file bytes never reach the log.
-			log(`rpc ${m} failed ${code} ${Math.round(performance.now() - started)}ms: ${text.slice(0, 300)}`);
+			log(rpcFailureLine(m, code, Math.round(performance.now() - started), text, error?.data));
 			send(ws, { id, e: { code, message: text, data: error?.data } });
 		}
 	};

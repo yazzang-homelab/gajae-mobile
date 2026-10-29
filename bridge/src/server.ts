@@ -158,10 +158,12 @@ export function startBridgeServer(options: BridgeServerOptions): Server<Conn> {
 		}
 		const deviceKeyText = b64urlEncode(deviceKey);
 		if (hello.pairing) {
-			const pending = state.consumePairing(String(hello.pairing.id ?? ""));
 			const proof = Buffer.from(String(hello.pairing.proof ?? ""), "base64url");
-			const expected = pending ? pairingProof(b64urlDecode(pending.secret), deviceKey, clientEph) : undefined;
-			if (!expected || proof.length !== expected.length || !crypto.timingSafeEqual(proof, expected)) {
+			const pending = state.consumePairing(String(hello.pairing.id ?? ""), candidate => {
+				const expected = pairingProof(b64urlDecode(candidate.secret), deviceKey, clientEph);
+				return proof.length === expected.length && crypto.timingSafeEqual(proof, expected);
+			});
+			if (!pending) {
 				log(`pairing rejected device=${deviceKeyText.slice(0, 8)}`);
 				return fail(ws, "pairing_invalid", "pairing code is invalid, used, or expired");
 			}

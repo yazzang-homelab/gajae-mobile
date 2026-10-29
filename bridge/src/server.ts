@@ -29,14 +29,18 @@ export const MAX_FRAME_BYTES = 32 * 1024 * 1024;
 /** RPCs slower than this are logged; a resume waits on gjc spawning a session host. */
 const SLOW_RPC_MS = 5_000;
 
+/** gjc's error discriminators are short identifiers (`unavailable`, `prompt_failed`, …). */
+const ERROR_CODE_RE = /^[A-Za-z0-9_.-]{1,64}$/;
+
 /**
- * The log line for a failed phone RPC. gjc reports most agent failures as `-32603 Internal error` with
- * the reason only in `data` (`{ code, details }`), so the data goes into the line too. Method, code,
- * message and gjc's error data only: prompt text and file bytes never reach the log.
+ * The log line for a failed phone RPC. gjc reports most agent failures as `-32603 Internal error` with the
+ * kind of failure in `data.code`, so that identifier goes into the line. `data.details` stays out: it is free
+ * text that can quote user input. Method, codes and message only: prompt text and file bytes never reach the log.
  */
 export function rpcFailureLine(method: string, code: number, ms: number, message: string, data: unknown): string {
-	const detail = data === undefined || data === null ? "" : ` data=${JSON.stringify(data).slice(0, 300)}`;
-	return `rpc ${method} failed ${code} ${ms}ms: ${message.slice(0, 300)}${detail}`;
+	const kind = (data as { code?: unknown } | null | undefined)?.code;
+	const detail = typeof kind === "string" && ERROR_CODE_RE.test(kind) ? ` (${kind})` : "";
+	return `rpc ${method} failed ${code}${detail} ${ms}ms: ${message.slice(0, 300)}`;
 }
 const HANDSHAKE_TIMEOUT_MS = 15_000;
 

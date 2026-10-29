@@ -101,7 +101,8 @@ export class Throughput {
 		const tokens = turn.reported + turn.pending;
 		const openToolMs = turn.toolSince === undefined ? 0 : this.now() - turn.toolSince;
 		const modelMs = (turn.endedAt ?? this.now()) - turn.startedAt - turn.toolMs - openToolMs;
-		if (tokens <= 0 || modelMs <= 0) return this.#active ? 0 : undefined;
+		if (tokens <= 0) return this.#active ? 0 : undefined;
+		// Shorter than a second (down to zero: start and end in the same clock tick) counts as one second.
 		return Math.round((tokens / Math.max(modelMs / 1000, 1)) * 10) / 10;
 	}
 

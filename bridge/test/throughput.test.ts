@@ -53,6 +53,14 @@ test("without usage (older gjc, session not open here) the text estimate still c
 	expect(meter.rate()).toBe(0); // a new turn starts from zero, not the previous figure
 });
 
+test("a turn that produced output within one clock tick still reports a rate", () => {
+	const meter = new Throughput(() => 1000); // start and finish land in the same millisecond
+	meter.start();
+	meter.add("a".repeat(40)); // 10 tokens
+	meter.finish();
+	expect(meter.rate()).toBe(10); // the 1 s floor, as for any turn shorter than a second
+});
+
 test("a tool still running at turn end stops counting as tool time", () => {
 	let now = 0;
 	const meter = new Throughput(() => now);

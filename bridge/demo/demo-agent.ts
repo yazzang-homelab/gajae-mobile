@@ -133,8 +133,9 @@ function takeQueued(sessionId: string, mode: QueuedMessage["mode"]) {
 	return taken;
 }
 
-async function streamNote(session: DemoSession, note: string) {
+async function streamNote(session: DemoSession, note: string, signal: { cancelled: boolean }) {
 	for (const p of note.match(/.{1,6}/gsu) ?? []) {
+		if (signal.cancelled) throw new Cancelled();
 		await Bun.sleep(CHUNK_DELAY_MS);
 		update(session.id, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: p } });
 	}
@@ -185,7 +186,7 @@ async function stream(session: DemoSession, kind: "agent_message_chunk" | "agent
 		const queued = kind === "agent_message_chunk" ? takeQueued(session.id, "steer") : [];
 		if (queued.length) {
 			const note = `\n\n↪ 끼어든 지시를 반영합니다: “${queued.map(s => s.text).join(" / ")}”\n데모 에이전트라 지시를 확인했다는 사실만 보여 드립니다.\n`;
-			return sent + (await streamNote(session, note));
+			return sent + (await streamNote(session, note, signal));
 		}
 	}
 	return sent;
@@ -273,10 +274,10 @@ async function prompt(session: DemoSession, blocks: any[]): Promise<string> {
 			"시험해 볼 기능:\n• 답변 중 메시지를 보내 끼어들기\n• 우측 상단 메뉴에서 모델·추론 강도 변경\n• “파일 목록 보여줘”로 명령 승인 흐름 확인\n• 사진·파일 첨부";
 		let said = await stream(session, "agent_message_chunk", answer, signal);
 		// gjc runs a follow-up as the next turn; the demo answers it at the end of this reply.
-		const followUps = takeQueued(session.id, "followUp");
-		if (followUps.length) {
+		// Follow-ups that arrive while one is being answered are answered in turn, so none outlives the turn.
+		for (let followUps = takeQueued(session.id, "followUp"); followUps.length; followUps = takeQueued(session.id, "followUp")) {
 			const note = `\n\n↪ 이어서 받은 메시지: “${followUps.map(m => m.text).join(" / ")}”\n실제 호스트에서는 이 메시지로 다음 턴을 시작합니다.`;
-			said += await streamNote(session, note);
+			said += await streamNote(session, note, signal);
 		}
 		session.plan = session.plan.map(e => ({ ...e, status: "completed" }));
 		session.history.push({ role: "agent", text: said });

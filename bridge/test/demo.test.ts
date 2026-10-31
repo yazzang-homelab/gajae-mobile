@@ -190,6 +190,33 @@ describe("review demo host", () => {
 		expect((await client.request("sdk.query", { sessionId: sid, op: "queue.messages.list" })).items).toEqual([]);
 	});
 
+	test("a follow-up sent while one is being answered is answered too, and stop ends that tail", async () => {
+		const b = await demoBridge();
+		const { client } = await b.pairedClient();
+		const sid = (await client.request("session.new", {})).sessionId;
+		const said = () => updates(client, sid, "agent_message_chunk").map(e => e.p.update.content.text).join("");
+		const followUp = (text: string) => client.request("sdk.control", { sessionId: sid, op: "turn.follow_up", input: { text } });
+
+		await client.request("session.prompt", { sessionId: sid, prompt: [{ type: "text", text: "첫 번째" }] });
+		await client.waitFor(() => updates(client, sid, "agent_thought_chunk").length > 0);
+		await followUp("하나");
+		await client.waitFor(() => said().includes("이어서 받은 메시지: “하나”"));
+		await followUp("둘");
+		await client.waitFor(() => updates(client, sid, TURN_END).length >= 1);
+		expect(updates(client, sid, TURN_END)[0].p.update.stopReason).toBe("end_turn");
+		expect(said()).toContain("이어서 받은 메시지: “둘”");
+		expect((await client.request("sdk.query", { sessionId: sid, op: "queue.messages.list" })).items).toEqual([]);
+
+		await client.request("session.prompt", { sessionId: sid, prompt: [{ type: "text", text: "두 번째" }] });
+		await client.waitFor(() => updates(client, sid, "agent_thought_chunk").length > 0 && updates(client, sid, TURN_END).length === 1);
+		await followUp("셋");
+		await client.waitFor(() => said().includes("이어서 받은 메시지: “셋”"));
+		await client.request("session.cancel", { sessionId: sid });
+		await client.waitFor(() => updates(client, sid, TURN_END).length >= 2);
+		expect(updates(client, sid, TURN_END)[1].p.update.stopReason).toBe("cancelled");
+		expect(said().split("이 메시지로 다음 턴을 시작합니다.").length - 1).toBe(2);
+	});
+
 	test("/btw side chat answers on the demo host without touching the session", async () => {
 		const b = await demoBridge();
 		const { client } = await b.pairedClient();

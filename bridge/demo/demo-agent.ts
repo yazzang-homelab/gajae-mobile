@@ -26,17 +26,31 @@ interface DemoSession {
 	history: { role: "user" | "agent"; text: string }[];
 	model: string;
 	thinking: string;
+	/** History entries before this index were compacted or cleared away and no longer count toward context. */
+	contextStart: number;
+	/** The last turn's plan, which `todo.list` reports like gjc's todo phases. */
+	plan: { content: string; status: string }[];
+	jobs: { id: string; label: string; status: string }[];
+	goal?: { objective: string; status: "active" | "paused" | "completed" };
+}
+
+interface QueuedMessage {
+	id: string;
+	text: string;
+	mode: "steer" | "followUp";
+	label: "Steer" | "Follow-up";
 }
 
 const sessions = new Map<string, DemoSession>();
 const attached = new Set<string>();
 const running = new Map<string, () => void>();
-const steers = new Map<string, { id: string; text: string; mode: "steer"; label: "Steer" }[]>();
+/** Messages waiting on a session's turn: steers join at the next chunk, follow-ups after the reply. */
+const queues = new Map<string, QueuedMessage[]>();
 /** Like gjc, each ACP attachment (session/new, session/load) starts at `prompt`. */
 const permissionModes = new Map<string, "prompt" | "allow" | "deny">();
 const pending = new Map<number, (result: any) => void>();
 let nextRequestId = 1;
-let nextSteerId = 1;
+let nextQueuedId = 1;
 
 const MODELS = [
 	{ value: "demo/gajae-fast", name: "Gajae Fast (demo)" },
@@ -69,6 +83,9 @@ function load(id: string): DemoSession | undefined {
 		history: rest.filter(r => r.type === "message").map(r => ({ role: r.role, text: r.text })),
 		model: MODELS[0].value,
 		thinking: "medium",
+		contextStart: 0,
+		plan: [],
+		jobs: [],
 	};
 	sessions.set(id, session);
 	return session;
@@ -81,9 +98,45 @@ function prune() {
 		.map(f => ({ f, t: fs.statSync(path.join(sessionsDir, f)).mtimeMs }))
 		.sort((a, b) => b.t - a.t);
 	for (const { f } of files.slice(MAX_SESSIONS)) {
+		const id = f.replace(/\.jsonl$/, "");
 		fs.rmSync(path.join(sessionsDir, f), { force: true });
-		sessions.delete(f.replace(/\.jsonl$/, ""));
+		fs.rmSync(exportFile(id), { force: true });
+		sessions.delete(id);
 	}
+}
+
+const exportsDir = path.join(agentDir, "exports");
+function exportFile(id: string) {
+	return path.join(exportsDir, `${id}.html`);
+}
+
+const escapeHtml = (text: string) => text.replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]!);
+
+/** Token counts the demo reports; roughly two characters per token, plus a fixed system prompt. */
+function tokens(session: DemoSession | undefined) {
+	const count = (role: "user" | "agent", from = 0) =>
+		Math.round((session?.history ?? []).slice(from).filter(h => h.role === role).reduce((n, h) => n + h.text.length, 0) / 2);
+	const turns = (session?.history ?? []).filter(h => h.role === "user").length;
+	return {
+		context: 1800 + count("user", session?.contextStart) + count("agent", session?.contextStart),
+		// Every turn re-reads the system prompt and the conversation so far; the demo bills that as cached input.
+		usage: { input: count("user") + 1800 * turns, output: count("agent"), cacheRead: 1200 * turns, cacheWrite: 0, premiumRequests: 0, cost: 0 },
+	};
+}
+
+function takeQueued(sessionId: string, mode: QueuedMessage["mode"]) {
+	const all = queues.get(sessionId) ?? [];
+	const taken = all.filter(m => m.mode === mode);
+	if (taken.length) queues.set(sessionId, all.filter(m => m.mode !== mode));
+	return taken;
+}
+
+async function streamNote(session: DemoSession, note: string) {
+	for (const p of note.match(/.{1,6}/gsu) ?? []) {
+		await Bun.sleep(CHUNK_DELAY_MS);
+		update(session.id, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: p } });
+	}
+	return note;
 }
 
 function configOptions(session: DemoSession) {
@@ -127,15 +180,10 @@ async function stream(session: DemoSession, kind: "agent_message_chunk" | "agent
 		update(session.id, { sessionUpdate: kind, content: { type: "text", text: part } });
 		sent += part;
 		// gjc hands a steer to the model at the next step; the demo picks it up at the next chunk boundary.
-		const queued = steers.get(session.id);
-		if (kind === "agent_message_chunk" && queued?.length) {
-			steers.delete(session.id);
+		const queued = kind === "agent_message_chunk" ? takeQueued(session.id, "steer") : [];
+		if (queued.length) {
 			const note = `\n\n↪ 끼어든 지시를 반영합니다: “${queued.map(s => s.text).join(" / ")}”\n데모 에이전트라 지시를 확인했다는 사실만 보여 드립니다.\n`;
-			for (const p of note.match(/.{1,6}/gsu) ?? []) {
-				await Bun.sleep(CHUNK_DELAY_MS);
-				update(session.id, { sessionUpdate: kind, content: { type: "text", text: p } });
-			}
-			return sent + note;
+			return sent + (await streamNote(session, note));
 		}
 	}
 	return sent;
@@ -167,13 +215,14 @@ async function prompt(session: DemoSession, blocks: any[]): Promise<string> {
 				signal,
 			);
 		}
+		session.plan = [
+			{ content: "요청 확인", status: "completed" },
+			{ content: wantsTool(text) ? "호스트에서 명령 실행(승인 필요)" : "답변 작성", status: "in_progress" },
+			{ content: "결과 정리", status: "pending" },
+		];
 		update(session.id, {
 			sessionUpdate: "plan",
-			entries: [
-				{ content: "요청 확인", priority: "high", status: "completed" },
-				{ content: wantsTool(text) ? "호스트에서 명령 실행(승인 필요)" : "답변 작성", priority: "medium", status: "in_progress" },
-				{ content: "결과 정리", priority: "low", status: "pending" },
-			],
+			entries: session.plan.map((e, i) => ({ ...e, priority: ["high", "medium", "low"][i] })),
 		});
 		let toolNote = "";
 		if (wantsTool(text)) {
@@ -205,6 +254,7 @@ async function prompt(session: DemoSession, blocks: any[]): Promise<string> {
 					status: "completed",
 					content: [{ type: "content", content: { type: "text", text: "README.md\nsrc/\ntests/\npackage.json\n" } }],
 				});
+				session.jobs = [{ id: toolCall.toolCallId, label: toolCall.title, status: "completed" }, ...session.jobs].slice(0, 5);
 				toolNote = "승인하신 명령을 (데모로) 실행했고, 위에 결과가 표시됩니다.\n\n";
 			} else {
 				update(session.id, { sessionUpdate: "tool_call_update", toolCallId: toolCall.toolCallId, status: "failed" });
@@ -219,7 +269,14 @@ async function prompt(session: DemoSession, blocks: any[]): Promise<string> {
 			"파일 편집이나 명령 실행이 필요하면 지금처럼 휴대폰으로 승인을 요청합니다.\n\n" +
 			"This is a scripted demo host for app review. With a real host, Gajae Code running on the user's own computer answers here.\n\n" +
 			"시험해 볼 기능:\n• 답변 중 메시지를 보내 끼어들기\n• 우측 상단 메뉴에서 모델·추론 강도 변경\n• “파일 목록 보여줘”로 명령 승인 흐름 확인\n• 사진·파일 첨부";
-		const said = await stream(session, "agent_message_chunk", answer, signal);
+		let said = await stream(session, "agent_message_chunk", answer, signal);
+		// gjc runs a follow-up as the next turn; the demo answers it at the end of this reply.
+		const followUps = takeQueued(session.id, "followUp");
+		if (followUps.length) {
+			const note = `\n\n↪ 이어서 받은 메시지: “${followUps.map(m => m.text).join(" / ")}”\n실제 호스트에서는 이 메시지로 다음 턴을 시작합니다.`;
+			said += await streamNote(session, note);
+		}
+		session.plan = session.plan.map(e => ({ ...e, status: "completed" }));
 		session.history.push({ role: "agent", text: said });
 		save(session);
 		return "end_turn";
@@ -242,6 +299,9 @@ function newSession(cwd: string): DemoSession {
 		history: [],
 		model: MODELS[0].value,
 		thinking: "medium",
+		contextStart: 0,
+		plan: [],
+		jobs: [],
 	};
 	sessions.set(session.id, session);
 	attached.add(session.id);
@@ -291,6 +351,7 @@ async function handle(msg: any) {
 			if (session) {
 				sessions.delete(session.id);
 				fs.rmSync(transcriptFile(session.id), { force: true });
+				fs.rmSync(exportFile(session.id), { force: true });
 			}
 			return reply({});
 		case "session/set_config_option": {
@@ -306,17 +367,44 @@ async function handle(msg: any) {
 		}
 		case "session/cancel":
 			running.get(params.sessionId)?.();
-			steers.delete(params.sessionId);
+			queues.delete(params.sessionId);
 			return;
 		case "_gjc/sdk/query": {
 			const ok = (items: unknown[]) => reply({ type: "query_response", id: "q", ok: true, page: { items, complete: true } });
-			if (params.query === "queue.messages.list") return ok(steers.get(params.sessionId) ?? []);
-			if (params.query === "context.get") {
-				const chars = (session?.history ?? []).reduce((n, h) => n + h.text.length, 0);
-				const tokens = 1800 + Math.round(chars / 2);
-				return ok([{ usage: { tokens, contextWindow: 200000, percent: (tokens / 200000) * 100 }, systemPrompt: ["demo"] }]);
+			const queued = queues.get(params.sessionId) ?? [];
+			switch (params.query) {
+				case "queue.messages.list":
+					return ok(queued);
+				case "context.get": {
+					const used = tokens(session).context;
+					return ok([
+						{
+							usage: { tokens: used, contextWindow: 200000, percent: (used / 200000) * 100 },
+							systemPrompt: ["demo"],
+							steeringQueueDepth: queued.filter(m => m.mode === "steer").length,
+							followupQueueDepth: queued.filter(m => m.mode === "followUp").length,
+						},
+					]);
+				}
+				case "usage.get":
+				case "session.stats":
+					return ok([tokens(session).usage]);
+				case "session.metadata":
+					return ok(session ? [{ sessionId: session.id, cwd: session.cwd, kind: "demo", title: session.title }] : []);
+				case "session.last_assistant": {
+					const last = session?.history.filter(h => h.role === "agent").at(-1);
+					return ok(last ? [{ text: last.text }] : []);
+				}
+				case "todo.list":
+					return ok(session?.plan.length ? [{ name: "데모 작업", tasks: session.plan }] : []);
+				case "goal.list/get":
+					return ok([session?.goal ? { enabled: true, goal: session.goal } : { enabled: false, message: "설정된 목표가 없습니다." }]);
+				case "runtime.jobs.list":
+					return ok([{ running: [], recent: session?.jobs ?? [], delivery: { queued: 0 } }]);
+				default:
+					// Skills, extensions, providers, diffs and workflow gates: the demo host has none.
+					return ok([]);
 			}
-			return reply({ type: "query_response", id: "q", ok: false, error: { code: "unsupported", message: `${params.query} is not available on the demo host` } });
 		}
 		case "_gjc/sdk/control": {
 			const op = params.operation;
@@ -332,12 +420,41 @@ async function handle(msg: any) {
 				session.model = params.input.model;
 				return reply({ changed: true });
 			}
-			if (op === "turn.steer") {
-				const list = steers.get(params.sessionId) ?? [];
-				list.push({ id: `steer:${nextSteerId++}`, text: String(params.input?.text ?? ""), mode: "steer", label: "Steer" });
-				steers.set(params.sessionId, list);
+			if (op === "turn.steer" || op === "turn.follow_up") {
+				const list = queues.get(params.sessionId) ?? [];
+				const mode = op === "turn.steer" ? "steer" : "followUp";
+				list.push({ id: `${mode}:${nextQueuedId++}`, text: String(params.input?.text ?? ""), mode, label: mode === "steer" ? "Steer" : "Follow-up" });
+				queues.set(params.sessionId, list);
 				return reply({ accepted: true });
 			}
+			if (op === "compaction.run" && session) {
+				const tokensBefore = tokens(session).context;
+				// Keeps the last exchange, as a summary would.
+				session.contextStart = Math.max(session.contextStart, session.history.length - 2);
+				return reply({ tokensBefore });
+			}
+			if (op === "context.clear" && session) {
+				session.contextStart = session.history.length;
+				return reply({ cleared: true });
+			}
+			if (op === "session.export_html" && session) {
+				const body = session.history.map(h => `<p><b>${h.role === "user" ? "사용자" : "가재코드"}</b><br>${escapeHtml(h.text)}</p>`).join("\n");
+				fs.mkdirSync(exportsDir, { recursive: true });
+				fs.writeFileSync(exportFile(session.id), `<!doctype html><meta charset="utf-8"><title>${escapeHtml(session.title)}</title>\n${body}\n`);
+				return reply({ path: `~/.gjc/agent/exports/${session.id}.html` });
+			}
+			if (op === "mode.goal.operate" && session) {
+				const goalOp = params.input?.op;
+				const objective = String(params.input?.objective ?? "").trim();
+				if (goalOp === "create" && objective) session.goal = { objective: objective.slice(0, 500), status: "active" };
+				else if (goalOp === "drop") session.goal = undefined;
+				else if (session.goal && goalOp === "pause") session.goal.status = "paused";
+				else if (session.goal && goalOp === "resume") session.goal.status = "active";
+				else if (session.goal && goalOp === "complete") session.goal.status = "completed";
+				else return reply({ ok: false, error: { code: "invalid_input", message: session.goal ? `Unknown goal operation: ${goalOp}` : "설정된 목표가 없습니다." } });
+				return reply({ type: "control_response", result: { goal: session.goal ?? null } });
+			}
+			if (op === "service_tier.set") return reply({ changed: true });
 			if (op === "turn.btw") {
 				// Scripted /btw side chat: answers from nothing but the question and prior exchanges, like the real
 				// one never writes to the session history.
@@ -349,7 +466,7 @@ async function handle(msg: any) {
 				});
 			}
 			if (op === "queue.message.remove") {
-				steers.set(params.sessionId, (steers.get(params.sessionId) ?? []).filter(m => m.id !== params.input?.id));
+				queues.set(params.sessionId, (queues.get(params.sessionId) ?? []).filter(m => m.id !== params.input?.id));
 				return reply({ removed: true });
 			}
 			if (op === "session.rename" && session && typeof params.input?.name === "string") {

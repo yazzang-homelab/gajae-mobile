@@ -14,7 +14,7 @@ function isFakeAgent(command: string[]): boolean {
 }
 
 /** Starts a bridge in a child process (see serve-fixture.ts) sharing a temp GJCM_HOME with the test. */
-export async function startTestBridge(command: string[] = FAKE_AGENT, cwd = os.tmpdir()) {
+export async function startTestBridge(command: string[] = FAKE_AGENT, cwd = os.tmpdir(), env: Record<string, string> = {}) {
 	const home = fs.mkdtempSync(path.join(os.tmpdir(), "gjcm-test-"));
 	const proc = Bun.spawn([process.execPath, path.join(import.meta.dir, "serve-fixture.ts")], {
 		env: {
@@ -31,6 +31,7 @@ export async function startTestBridge(command: string[] = FAKE_AGENT, cwd = os.t
 			...(command === DEMO_AGENT ? { GJCM_TEST_DEMO_ENDPOINT: "wss://demo.example/ws" } : {}),
 			// Only fake-agent bridges index the scratch dir; real gjc keeps its login and session store.
 			...(isFakeAgent(command) ? { GJC_CODING_AGENT_DIR: path.join(home, "agent") } : {}),
+			...env,
 		},
 		stdout: "pipe",
 		stderr: "inherit",

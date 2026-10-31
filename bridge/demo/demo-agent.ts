@@ -114,6 +114,15 @@ function exportFile(id: string) {
 
 const escapeHtml = (text: string) => text.replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]!);
 
+class Cancelled extends Error {}
+
+/** Waits one chunk interval; a cancel that arrived before or during the wait ends the turn before the next chunk. */
+async function pause(signal: { cancelled: boolean }) {
+	if (signal.cancelled) throw new Cancelled();
+	await Bun.sleep(CHUNK_DELAY_MS);
+	if (signal.cancelled) throw new Cancelled();
+}
+
 /** Token counts the demo reports; roughly two characters per token, plus a fixed system prompt. */
 function tokens(session: DemoSession | undefined) {
 	const count = (role: "user" | "agent", from = 0) =>
@@ -135,8 +144,7 @@ function takeQueued(sessionId: string, mode: QueuedMessage["mode"]) {
 
 async function streamNote(session: DemoSession, note: string, signal: { cancelled: boolean }) {
 	for (const p of note.match(/.{1,6}/gsu) ?? []) {
-		if (signal.cancelled) throw new Cancelled();
-		await Bun.sleep(CHUNK_DELAY_MS);
+		await pause(signal);
 		update(session.id, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: p } });
 	}
 	return note;
@@ -171,15 +179,13 @@ function phase(sessionId: string, busy: boolean) {
 	update(sessionId, { sessionUpdate: "session_info_update", _meta: { gjcPhase: busy ? "working" : "idle", running: busy } });
 }
 
-class Cancelled extends Error {}
 
 /** Streams text in small chunks like a model would; a cancel or a waiting steer interrupts between chunks. */
 async function stream(session: DemoSession, kind: "agent_message_chunk" | "agent_thought_chunk", text: string, signal: { cancelled: boolean }) {
 	const parts = text.match(/.{1,6}/gsu) ?? [];
 	let sent = "";
 	for (const part of parts) {
-		if (signal.cancelled) throw new Cancelled();
-		await Bun.sleep(CHUNK_DELAY_MS);
+		await pause(signal);
 		update(session.id, { sessionUpdate: kind, content: { type: "text", text: part } });
 		sent += part;
 		// gjc hands a steer to the model at the next step; the demo picks it up at the next chunk boundary.

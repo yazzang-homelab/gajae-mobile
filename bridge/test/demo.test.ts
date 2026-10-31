@@ -12,8 +12,8 @@ afterEach(async () => {
 	for (const b of bridges) await b.stop();
 	bridges = [];
 });
-async function demoBridge() {
-	const b = await startTestBridge(DEMO_AGENT);
+async function demoBridge(env: Record<string, string> = {}) {
+	const b = await startTestBridge(DEMO_AGENT, undefined, env);
 	bridges.push(b);
 	return b;
 }
@@ -190,32 +190,44 @@ describe("review demo host", () => {
 		expect((await client.request("sdk.query", { sessionId: sid, op: "queue.messages.list" })).items).toEqual([]);
 	});
 
-	test("a follow-up sent while one is being answered is answered too, and stop ends that tail", async () => {
-		const b = await demoBridge();
+	test("a follow-up sent while one is being answered is answered too", async () => {
+		// Slow chunks leave a wide window to send the second follow-up while the first is still streaming.
+		const b = await demoBridge({ GJCM_DEMO_CHUNK_MS: "60" });
 		const { client } = await b.pairedClient();
 		const sid = (await client.request("session.new", {})).sessionId;
+		await client.request("session.setConfig", { sessionId: sid, configId: "thinking", value: "off" });
 		const said = () => updates(client, sid, "agent_message_chunk").map(e => e.p.update.content.text).join("");
 		const followUp = (text: string) => client.request("sdk.control", { sessionId: sid, op: "turn.follow_up", input: { text } });
 
-		await client.request("session.prompt", { sessionId: sid, prompt: [{ type: "text", text: "첫 번째" }] });
-		await client.waitFor(() => updates(client, sid, "agent_thought_chunk").length > 0);
+		await client.request("session.prompt", { sessionId: sid, prompt: [{ type: "text", text: "안녕" }] });
 		await followUp("하나");
 		await client.waitFor(() => said().includes("이어서 받은 메시지: “하나”"));
 		await followUp("둘");
-		await client.waitFor(() => updates(client, sid, TURN_END).length >= 1);
+		await client.waitFor(() => updates(client, sid, TURN_END).length >= 1, 15_000);
 		expect(updates(client, sid, TURN_END)[0].p.update.stopReason).toBe("end_turn");
 		expect(said()).toContain("이어서 받은 메시지: “둘”");
 		expect((await client.request("sdk.query", { sessionId: sid, op: "queue.messages.list" })).items).toEqual([]);
+	}, 20_000);
 
-		await client.request("session.prompt", { sessionId: sid, prompt: [{ type: "text", text: "두 번째" }] });
-		await client.waitFor(() => updates(client, sid, "agent_thought_chunk").length > 0 && updates(client, sid, TURN_END).length === 1);
-		await followUp("셋");
-		await client.waitFor(() => said().includes("이어서 받은 메시지: “셋”"));
+	test("stop during the last chunk's wait ends the turn as cancelled without sending that chunk", async () => {
+		const b = await demoBridge({ GJCM_DEMO_CHUNK_MS: "150" });
+		const { client } = await b.pairedClient();
+		const sid = (await client.request("session.new", {})).sessionId;
+		await client.request("session.setConfig", { sessionId: sid, configId: "thinking", value: "off" });
+		const said = () => updates(client, sid, "agent_message_chunk").map(e => e.p.update.content.text).join("");
+		const note = "\n\n↪ 이어서 받은 메시지: “셋”\n실제 호스트에서는 이 메시지로 다음 턴을 시작합니다.";
+		const chunks = note.match(/.{1,6}/gsu)!;
+		const allButLast = chunks.slice(0, -1).join("");
+
+		await client.request("session.prompt", { sessionId: sid, prompt: [{ type: "text", text: "안녕" }] });
+		await client.request("sdk.control", { sessionId: sid, op: "turn.follow_up", input: { text: "셋" } });
+		// The next-to-last chunk just arrived: the agent is now waiting before the last one.
+		await client.waitFor(() => said().endsWith(allButLast), 60_000);
 		await client.request("session.cancel", { sessionId: sid });
-		await client.waitFor(() => updates(client, sid, TURN_END).length >= 2);
-		expect(updates(client, sid, TURN_END)[1].p.update.stopReason).toBe("cancelled");
-		expect(said().split("이 메시지로 다음 턴을 시작합니다.").length - 1).toBe(2);
-	});
+		await client.waitFor(() => updates(client, sid, TURN_END).length >= 1);
+		expect(updates(client, sid, TURN_END)[0].p.update.stopReason).toBe("cancelled");
+		expect(said().endsWith(allButLast)).toBe(true);
+	}, 90_000);
 
 	test("/btw side chat answers on the demo host without touching the session", async () => {
 		const b = await demoBridge();

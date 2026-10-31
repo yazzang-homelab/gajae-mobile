@@ -1,4 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import fs from "node:fs";
+import path from "node:path";
 import { BridgeClient } from "../src/client";
 import { generateKeyPair } from "../src/crypto";
 import { buildOffer, parseOfferUrl } from "../src/offer";
@@ -159,6 +161,18 @@ describe("review demo host", () => {
 		// Every other query the bridge exposes answers (possibly empty) rather than failing.
 		for (const op of ["session.last_assistant", "skill.list/state", "models.list/current", "workflow.gates.list", "extensions.list", "providers.list/active"])
 			expect(Array.isArray(await query(op))).toBe(true);
+	});
+
+	test("a session id that walks out of the demo directory never reaches the filesystem", async () => {
+		const b = await demoBridge();
+		const { client } = await b.pairedClient();
+		const agentDir = path.join(b.home, "agent");
+		fs.mkdirSync(agentDir, { recursive: true });
+		const outside = path.join(agentDir, "victim.jsonl");
+		fs.writeFileSync(outside, `${JSON.stringify({ type: "session", id: "x", cwd: "/", title: "t" })}\n`);
+		await expect(client.request("session.open", { sessionId: "../../victim" })).rejects.toThrow();
+		await client.request("session.delete", { sessionId: "../../victim" }).catch(() => {});
+		expect(fs.existsSync(outside)).toBe(true);
 	});
 
 	test("a follow-up sent during a turn is answered when that turn's reply ends", async () => {

@@ -72,6 +72,8 @@ function save(session: DemoSession) {
 function load(id: string): DemoSession | undefined {
 	const cached = sessions.get(id);
 	if (cached) return cached;
+	// Session ids come from the phone and name files; only the demo's own UUIDs may reach the filesystem.
+	if (!/^[0-9a-f-]{36}$/.test(id)) return undefined;
 	const file = transcriptFile(id);
 	if (!fs.existsSync(file)) return undefined;
 	const [head, ...rest] = fs.readFileSync(file, "utf8").trim().split("\n").map(line => JSON.parse(line));

@@ -1,0 +1,71 @@
+name: asc-submit
+
+# Prepares an App Store version and submits it for review with the App Store Connect API key
+# (tools/asc_submit.py). Upload the build first with the `appstore` workflow (upload=true).
+# submit=false only prints the current state.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: App Store version (MARKETING_VERSION), e.g. 1.0.1
+        required: true
+      build:
+        description: Build number of the uploaded build (appstore run_number + 000), e.g. 3000
+        required: true
+      whats_new_ko:
+        description: What's New (Korean)
+        required: true
+      whats_new_en:
+        description: What's New (English; also used for locales without their own text)
+        required: true
+      whats_new_zh:
+        description: What's New (Simplified Chinese)
+        required: false
+        default: ""
+      submit:
+        description: Create/attach/submit (false = print state only)
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: asc-submit
+  cancel-in-progress: false
+
+jobs:
+  submit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install cryptography
+
+      - name: App Store Connect API key
+        env:
+          ASC_API_KEY_BASE64: ${{ secrets.ASC_API_KEY_BASE64 }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/asc"
+          echo "$ASC_API_KEY_BASE64" | base64 --decode > "$RUNNER_TEMP/asc/AuthKey_$ASC_KEY_ID.p8"
+
+      - name: Submit
+        working-directory: tools
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          VERSION: ${{ inputs.version }}
+          BUILD: ${{ inputs.build }}
+          WHATS_NEW_KO: ${{ inputs.whats_new_ko }}
+          WHATS_NEW_EN: ${{ inputs.whats_new_en }}
+          WHATS_NEW_ZH: ${{ inputs.whats_new_zh }}
+          SUBMIT: ${{ inputs.submit && '--submit' || '' }}
+        run: |
+          python3 asc_submit.py --key-id "$ASC_KEY_ID" --key-path "$RUNNER_TEMP/asc/AuthKey_$ASC_KEY_ID.p8" \
+            --issuer "$ASC_ISSUER_ID" --bundle-id dev.gajae.gjcmobile \
+            --version "$VERSION" --build "$BUILD" \
+            --whats-new-ko "$WHATS_NEW_KO" --whats-new-en "$WHATS_NEW_EN" --whats-new-zh "$WHATS_NEW_ZH" $SUBMIT

@@ -62,7 +62,10 @@ Then open the app and scan the code. `deploy/gjcm-bridge.service` is an example 
 
 ### Getting the app
 
-There are no store releases yet; build from source.
+- **iPhone (iOS 17+):** [Download on the App Store](https://apps.apple.com/app/id6827397865) ("Gajae Code", free)
+- **Android (8.0+):** not on Google Play yet; build from source.
+
+To build it yourself:
 
 | Platform | Build |
 |---|---|

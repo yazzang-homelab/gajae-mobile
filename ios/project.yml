@@ -52,9 +52,10 @@ targets:
             CFBundleURLSchemes: [gjcm]
         # Bridge traffic is end-to-end encrypted (gjcm-e2ee-v1) on top of ws:// to LAN/Tailscale
         # addresses, so ATS transport TLS adds nothing; the hosts are raw IPs without certificates.
+        # Only NSAllowsArbitraryLoads: with NSAllowsLocalNetworking present iOS ignores it, and ATS then
+        # blocks ws:// to Tailscale (100.64.0.0/10, *.ts.net) before any packet leaves the phone (#44).
         NSAppTransportSecurity:
           NSAllowsArbitraryLoads: true
-          NSAllowsLocalNetworking: true
         UILaunchScreen: {}
         # Export compliance: only standard algorithms (X25519, HKDF-SHA256, AES-256-GCM via swift-crypto) protecting
         # the user's own data in a mass-market app — exempt under Category 5 Part 2 (5D992.c), so no per-build prompt.

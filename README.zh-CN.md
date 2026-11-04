@@ -48,15 +48,14 @@ gajae-mobile 是 [Gajae Code（`gjc`）](https://github.com/Yeachan-Heo/gajae-co
 电脑上需要 [Bun](https://bun.sh)，并且 [Gajae Code](https://github.com/Yeachan-Heo/gajae-code)（`gjc`）在 `PATH` 中。
 
 ```bash
-git clone https://github.com/yazzang-homelab/gajae-mobile.git
-cd gajae-mobile/bridge && bun install
-
 # 1. 在 gjc 旁边运行桥接器
-bun src/cli.ts serve --host 0.0.0.0 --port 7787 --gjc "gjc --mode=acp"
+bunx gjcm-bridge serve
 
 # 2. 在另一个终端生成一次性配对码（二维码 + gjcm:// 链接）
-bun src/cli.ts pair
+bunx gjcm-bridge pair
 ```
+
+默认参数为 `--host 0.0.0.0 --port 7787 --gjc "gjc --mode=acp"`。使用 `bunx gjcm-bridge@latest serve` 获取新版本。如需从源码运行：`git clone https://github.com/yazzang-homelab/gajae-mobile.git && cd gajae-mobile/bridge && bun install && bun src/cli.ts serve`。
 
 打开应用扫码即可连接。如需常驻运行，可参考示例 systemd 单元 `deploy/gjcm-bridge.service`。
 

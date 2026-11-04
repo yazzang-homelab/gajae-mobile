@@ -48,15 +48,14 @@ gajae-mobile is a native iOS and Android companion for [Gajae Code (`gjc`)](http
 Requirements on the computer: [Bun](https://bun.sh) and [Gajae Code](https://github.com/Yeachan-Heo/gajae-code) (`gjc`) on `PATH`.
 
 ```bash
-git clone https://github.com/yazzang-homelab/gajae-mobile.git
-cd gajae-mobile/bridge && bun install
-
 # 1. Run the bridge next to gjc
-bun src/cli.ts serve --host 0.0.0.0 --port 7787 --gjc "gjc --mode=acp"
+bunx gjcm-bridge serve
 
 # 2. In another terminal: a one-time pairing code (QR + gjcm:// link)
-bun src/cli.ts pair
+bunx gjcm-bridge pair
 ```
+
+The defaults are `--host 0.0.0.0 --port 7787 --gjc "gjc --mode=acp"`. `bunx gjcm-bridge@latest serve` picks up a new release. To run from source instead: `git clone https://github.com/yazzang-homelab/gajae-mobile.git && cd gajae-mobile/bridge && bun install && bun src/cli.ts serve`.
 
 Then open the app and scan the code. `deploy/gjcm-bridge.service` is an example systemd unit for running the bridge permanently.
 

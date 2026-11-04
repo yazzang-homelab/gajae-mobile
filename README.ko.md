@@ -48,15 +48,14 @@ gajae-mobile은 내 컴퓨터에서 돌아가는 코딩 에이전트 [가재코�
 컴퓨터에 [Bun](https://bun.sh)과 [가재코드](https://github.com/Yeachan-Heo/gajae-code)(`gjc`)가 `PATH`에 있어야 합니다.
 
 ```bash
-git clone https://github.com/yazzang-homelab/gajae-mobile.git
-cd gajae-mobile/bridge && bun install
-
 # 1. gjc 옆에서 브리지 실행
-bun src/cli.ts serve --host 0.0.0.0 --port 7787 --gjc "gjc --mode=acp"
+bunx gjcm-bridge serve
 
 # 2. 다른 터미널에서 1회용 페어링 코드(QR + gjcm:// 링크) 발급
-bun src/cli.ts pair
+bunx gjcm-bridge pair
 ```
+
+기본값은 `--host 0.0.0.0 --port 7787 --gjc "gjc --mode=acp"`입니다. 새 버전은 `bunx gjcm-bridge@latest serve`로 받습니다. 소스에서 실행하려면 `git clone https://github.com/yazzang-homelab/gajae-mobile.git && cd gajae-mobile/bridge && bun install && bun src/cli.ts serve`.
 
 앱을 열고 코드를 찍으면 연결됩니다. 브리지를 상시 실행하려면 예시 systemd 유닛 `deploy/gjcm-bridge.service`를 참고하세요.
 

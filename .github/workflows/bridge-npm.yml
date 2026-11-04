@@ -1,0 +1,46 @@
+name: bridge-npm
+
+# Publishes bridge/ to npm as `gjcm-bridge` when a `bridge-v<version>` tag is pushed.
+# The tag must match bridge/package.json "version". Needs the repository secret NPM_TOKEN
+# (npm granular access token with publish rights on gjcm-bridge).
+on:
+  push:
+    tags: ["bridge-v*"]
+
+permissions:
+  contents: read
+  id-token: write # npm provenance
+
+concurrency:
+  group: bridge-npm
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: bridge
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+
+      - name: Tag matches package version
+        run: |
+          want="bridge-v$(node -p 'require("./package.json").version')"
+          [ "$GITHUB_REF_NAME" = "$want" ] || { echo "tag $GITHUB_REF_NAME does not match $want"; exit 1; }
+
+      - run: bun install --frozen-lockfile
+      - run: bun x tsc --noEmit
+      - run: bun test
+
+      - name: Include the repository license
+        run: cp ../LICENSE LICENSE
+
+      - run: npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

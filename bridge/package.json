@@ -1,12 +1,15 @@
 {
   "name": "gjcm-bridge",
   "version": "0.1.0",
-  "private": true,
   "type": "module",
   "description": "Host bridge that exposes gjc --mode=acp to the Gajae Code mobile apps over an end-to-end encrypted WebSocket",
   "bin": {
     "gjcm-bridge": "src/cli.ts"
   },
+  "files": [
+    "src",
+    "demo"
+  ],
   "scripts": {
     "serve": "bun src/cli.ts serve",
     "test": "bun test",
@@ -20,5 +23,20 @@
     "@types/qrcode": "^1.5.5",
     "typescript": "^5.9.0"
   },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yazzang-homelab/gajae-mobile.git",
+    "directory": "bridge"
+  },
+  "homepage": "https://github.com/yazzang-homelab/gajae-mobile/tree/main/bridge#readme",
+  "bugs": "https://github.com/yazzang-homelab/gajae-mobile/issues",
+  "keywords": [
+    "gajae-code",
+    "gjc",
+    "acp",
+    "coding-agent",
+    "mobile",
+    "bridge"
+  ],
   "license": "AGPL-3.0-only"
 }

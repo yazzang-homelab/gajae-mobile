@@ -62,7 +62,10 @@ bun src/cli.ts pair
 
 ### 앱 받기
 
-아직 스토어 배포가 없어 소스에서 빌드합니다.
+- **iPhone (iOS 17+):** [App Store에서 받기](https://apps.apple.com/app/id6827397865) (「가재코드」, 무료)
+- **Android (8.0+):** Google Play 공개 전이라 소스에서 빌드합니다.
+
+직접 빌드하려면:
 
 | 플랫폼 | 빌드 |
 |---|---|

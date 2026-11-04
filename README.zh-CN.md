@@ -62,7 +62,10 @@ bun src/cli.ts pair
 
 ### 获取应用
 
-目前尚未上架应用商店，请从源码构建。
+- **iPhone（iOS 17+）：** [在 App Store 下载](https://apps.apple.com/app/id6827397865)（“Gajae Code”，免费）
+- **Android（8.0+）：** 尚未上架 Google Play，请从源码构建。
+
+自行构建：
 
 | 平台 | 构建 |
 |---|---|

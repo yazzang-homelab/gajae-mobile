@@ -62,6 +62,14 @@ final class HostConnection {
 
     var connectedClient: BridgeClient? { status == .connected ? client : nil }
 
+    /// Saves (or with nil clears) the directory new chats on this host start in. Only an explicit user action calls
+    /// this; a path picked for one chat stays in `draftCwd`.
+    func setPreferredCwd(_ cwd: String?) {
+        guard host.preferredCwd != cwd else { return }
+        host.preferredCwd = cwd
+        onHostChange(host)
+    }
+
     func ensureConnected() {
         guard status != .connected, connectTask == nil else { return }
         connectTask = Task { await connectLoop() }

@@ -73,7 +73,9 @@ class AppModel(application: Application) : AndroidViewModel(application) {
         for (endpoint in offer.endpoints) {
             try {
                 val client = BridgeClient.connect(endpoint, device, hostKey, deviceName, pairing = offer.pairingId to secret)
-                var host = PairedHost(offer).copy(lastEndpoint = endpoint)
+                // Pairing the same host again keeps the directory the user saved for it.
+                val saved = hosts.firstOrNull { it.hostId == offer.hostId }?.preferredCwd
+                var host = PairedHost(offer).copy(lastEndpoint = endpoint, preferredCwd = saved)
                 runCatching { client.hostInfo() }.getOrNull()?.let { host = host.copy(name = it.hostName) }
                 update(host)
                 connection(host).adopt(client, endpoint)

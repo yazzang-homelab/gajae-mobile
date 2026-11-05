@@ -46,14 +46,15 @@ npm 패키지 `gjcm-bridge`이며 [Bun](https://bun.sh)으로만 실행됩니다
 
 ## 세션 목록과 재개
 
-- 목록은 ACP `session/list`가 아니라 gjc가 저장한 트랜스크립트(`sessions/<bucket>/<stamp>_<id>.jsonl` 헤더)에서 최신순으로 만듭니다. TUI `/resume`이 보여주는 목록과 같습니다. ACP `session/list`는 브로커 엔드포인트 색인을 오래된 순으로 주고, 실측 시 100행 중 78행에 저장 기록이 없었으며 저장된 859개 중 837개가 빠져 있었습니다.
-- 재개(세션 호스트 기동)는 바쁜 호스트에서 약 36초 걸립니다. gjc 기본 준비 타임아웃 22초로는 실패하므로 서비스 파일에서 `GJC_ACP_SESSION_READINESS_TIMEOUT_MS=60000`을 줍니다.
+- 목록은 ACP `session/list`가 아니라 gjc가 저장한 트랜스크립트(`sessions/<bucket>/<stamp>_<id>.jsonl` 헤더)에서 최신순으로 만듭니다. TUI `/resume`이 보여주는 목록과 같습니다. ACP `session/list`는 브로커 엔드포인트 색인(30일 보존)을 오래된 순으로 줍니다. 실측 시 100행 중 78행에 저장 기록이 없었고, 저장된 859개 중 837개(0.19.3에서는 214개 중 181개)가 빠져 있었습니다. ACP 프로세스가 재시작될 때마다 열 수 없는 빈 행이 하나씩 생기는 문제는 상류 [gajae-code#7558](https://github.com/Yeachan-Heo/gajae-code/pull/7558)로 0.19.3 다음 릴리스에서 고쳐집니다.
+- 재개(세션 호스트 기동, `session/load`)는 0.19.3 격리 환경 콜드 실측 2.7초입니다. 이전에 바쁜 호스트에서 약 36초가 걸린 기록이 있고, 공식 gjc의 준비 타임아웃은 22초로 고정입니다.
+- 최근 답변이 긴 세션(최근 이벤트 합계가 1 MiB 초과)은 0.19.3에서 `cursor_expired`로 재개가 실패합니다. 상류 [gajae-code#7564](https://github.com/Yeachan-Heo/gajae-code/pull/7564)가 dev에 들어가 0.19.3 다음 릴리스에서 고쳐집니다.
 - ACP 프로세스의 브로커 소켓이 장시간 운영 뒤 망가지면 `SDK request outcome is uncertain after the frame was sent`가 납니다. 실행 중인 턴과 대기 중인 권한 요청이 없을 때 브리지가 ACP 프로세스를 자동으로 재시작합니다.
 
 ## gjc 요구 사항
 
 - BTW 사이드 질문([BTW.ko.md](../docs/BTW.ko.md))은 `turn.btw` ACP 제어를 넣은 gjc 빌드가 필요합니다. 공식 gjc 릴리스에는 아직 없습니다. 지원하지 않는 gjc는 `unknown_operation`으로 답하고, 브리지는 이를 `host_outdated`로 앱에 전달합니다.
-- `GJC_ACP_SESSION_READINESS_TIMEOUT_MS`(허용 범위 4000–60000ms, 그 밖은 22000으로 되돌아감)는 이를 지원하는 gjc 빌드에서만 적용됩니다. 지원하지 않는 빌드에서는 콜드 재개가 22초에서 실패할 수 있습니다.
+- `GJC_ACP_SESSION_READINESS_TIMEOUT_MS`(허용 범위 4000–60000ms, 그 밖은 22000으로 되돌아감)는 **공식 gjc(0.19.3과 dev 포함)가 읽지 않습니다.** 로컬 패치 `0002-acp-session-readiness-timeout-env.patch`를 넣은 빌드에서만 적용됩니다. 서비스 예시와 e2e 명령에 남아 있는 값은 그런 빌드를 위한 것이고, 공식 빌드에서는 아무 효과가 없습니다. 공식 빌드에서는 바쁜 호스트의 콜드 재개가 22초에서 실패할 수 있습니다.
 
 ## 외부망에서 접속하기
 

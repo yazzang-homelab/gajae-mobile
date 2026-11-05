@@ -72,7 +72,7 @@ GCM nonce = 0x00000000 ‖ 카운터,  AAD = "gjcm1"
 
 ## 4. 세션 흐름
 
-1. `session.new{cwd}` → gjc ACP `session/new`. 실측 약 12초가 걸려 앱은 첫 메시지와 함께 생성합니다.
+1. `session.new{cwd}` → gjc ACP `session/new`. 0.19.3 실측 중간값 6.2초(4.7~13.8초, 45회)이고 대부분은 세션 호스트 기동입니다. 그래서 앱은 첫 메시지와 함께 생성합니다.
 2. `session.prompt`는 수락 즉시 응답하고 진행 상황은 `session.update` 이벤트로 흘러옵니다. 턴 종료는 브리지가 붙이는 `x_gjcm_turn_end`로 알립니다.
 3. 작업 중 메시지는 `turn.steer`(다음 모델 단계에 주입) 또는 `turn.follow_up`(턴 종료 후 전송)으로 보냅니다.
 4. **끼어들기**(`session.interrupt`): 대기열 조회 → `session/cancel` → 남은 지시 제거 → 같은 텍스트로 새 `session/prompt`. 실측 응답 196ms.
@@ -80,11 +80,15 @@ GCM nonce = 0x00000000 ‖ 카운터,  AAD = "gjcm1"
    - 앱의 '전달 대기' 표시와 끼어들기 버튼은 `session.status.queued`(gjc 대기열, 1초마다)를 따릅니다. 그래서 TUI에서 넣은 steer도 보입니다. 도구 실행 중의 steer는 gjc가 도구를 백그라운드로 접고 곧바로 전달하므로(실측 약 4초) 대기열에 잠깐만 머뭅니다.
    - 터미널에서 시작한 턴은 앱에서 끼어들 수 없습니다. gjc는 턴을 시작한 연결에만 중단을 허용합니다. 실측: `session/cancel` 무효, `turn.abort`는 `no_active_turn`, terminal 모드는 `terminal_no_effect`, operator 모드는 Broker 경로 전용입니다. 그래서 브리지는 이런 턴을 바로 거절하고(-32004 `host_turn`), 지시는 대기열에 남아 턴의 다음 단계에서 전달됩니다.
 5. 연결이 끊겼다가 돌아오면 앱은 열려 있던 세션을 `session.open{afterSeq}`로 다시 열어 놓친 업데이트만 받습니다.
-6. 터미널(TUI)에서 진행 중인 턴도 실시간으로 보입니다. 사용자가 입력한 지시, 도구 호출(bash 등)과 그 출력, 답변이 `session.update`로 흘러옵니다. gjc 로컬 패치 `0005-acp-mirror-terminal-turns.patch`가 이를 추가합니다.
-   - 세션 호스트는 턴 내용을 그 턴을 보낸 연결과 관찰자(observer) 연결에만 보냅니다. 패치 전 ACP는 둘 다 아니어서 앱에는 working/idle만 보였습니다.
-   - ACP를 관찰자로 만들면 안 됩니다. 분리된 세션 호스트는 관찰자만 붙어 있으면 스스로 종료하므로 앱이 연 세션이 사라집니다. 그래서 패치는 별도 능력 `turn_stream_mirror_v1`을 추가합니다.
-   - 호스트 쪽 코드가 필요하므로 패치보다 먼저 시작된 터미널 세션은 그 gjc를 다시 시작해야 보입니다. 실측(2026-10-25): 패치 적용 시 사용자 입력 0.9초, 도구 호출·출력·답변이 실시간 도착. 미적용 대조군은 `session_info_update`만 도착.
-7. 추론은 `agent_thought_chunk`로 와서 "추론" 블록으로 보입니다. Anthropic 요약 추론과 OpenAI Responses 추론 요약은 `thinking_delta`가 아니라 `reasoning_summary_*` 이벤트로 오는데, 상류 ACP 매퍼는 이를 버려 앱에 추론이 한 줄도 오지 않았습니다(실측 2026-10-26, opus-5-5 medium: `agent_message_chunk` 56개, `agent_thought_chunk` 0개). gjc 로컬 패치 `0006-acp-reasoning-summary-thoughts.patch`가 요약 델타를 추론 청크로 보내고, 델타 없이 끝에만 오는 요약은 한 번만 보냅니다.
+6. 터미널(TUI)에서 진행 중인 턴도 실시간으로 보입니다. 사용자가 입력한 지시, 도구 호출(bash 등)과 그 출력, 답변이 `session.update`로 흘러옵니다. gjc 0.19.3부터 공식 빌드에 들어 있습니다(상류 [gajae-code#7286](https://github.com/Yeachan-Heo/gajae-code/pull/7286)). 이전에 쓰던 로컬 패치 `0005-acp-mirror-terminal-turns.patch`는 2026-11-05에 폐기했습니다.
+   - 세션 호스트는 원래 턴 내용을 그 턴을 보낸 연결과 관찰자(observer) 연결에만 보냈습니다. ACP는 둘 다 아니어서 0.19.3 이전 gjc에서는 앱에 working/idle만 보입니다.
+   - ACP를 관찰자로 만들면 안 됩니다. 분리된 세션 호스트는 관찰자만 붙어 있으면 스스로 종료하므로 앱이 연 세션이 사라집니다. 상류 수정도 관찰자로 만들지 않고 턴 스트림만 보냅니다.
+   - 호스트 쪽 코드가 필요하므로 0.19.3 이전 gjc로 시작된 터미널 세션은 그 gjc를 다시 시작해야 보입니다. 실측(2026-11-04, 공식 0.19.3, 패치 없음): TUI 턴의 bash `tool_call`과 진행·완료, ask, 답변, idle이 실시간 도착.
+7. 추론은 `agent_thought_chunk`로 와서 "추론" 블록으로 보입니다. Anthropic 요약 추론과 OpenAI Responses 추론 요약은 `thinking_delta`가 아니라 `reasoning_summary_*` 이벤트로 옵니다.
+   - 공식 0.19.3의 ACP 매퍼는 이를 버리므로 앱에 추론이 오지 않습니다. 근거는 코드입니다(아래 #7557은 v0.19.3 태그에 없음). 실측은 0.19.3 이전의 0.19.0 dev에서 한 것입니다(2026-10-26, opus-5-5 medium: `agent_message_chunk` 56개, `agent_thought_chunk` 0개).
+   - 상류 [gajae-code#7557](https://github.com/Yeachan-Heo/gajae-code/pull/7557)이 dev에 들어가 0.19.3 다음 릴리스부터 요약 델타가 추론 청크로 옵니다.
+   - 델타 없이 끝에만 오는 요약은 #7557 범위 밖입니다. 로컬 패치 `0006-acp-reasoning-summary-thoughts.patch`가 이것을 한 번만 보내고, 빈 요약의 구분자("\n\n")를 버립니다. 2026-11-05에 #7557 위로 다시 만들었습니다.
+   - 실측(2026-11-05, dev + 패치 0006): `oci-opencodex/gpt-5.6-sol`에서 추론 청크 2개. opencodex 뒤의 opus-5-5는 요약 본문을 비워 보내므로 0개가 정상입니다.
 
 ## 5. 설계 결정과 근거
 
@@ -93,7 +97,7 @@ GCM nonce = 0x00000000 ‖ 카운터,  AAD = "gjcm1"
 | 앱 계층 E2EE + `ws://` 허용 | 호스트가 인증서 없는 LAN·Tailscale IP에 있으므로 TLS를 강제할 수 없습니다. 암호화를 앱 계층에 두면 경로(ws·wss·Funnel)와 무관하게 같은 보장이 성립합니다. |
 | 추론 강도 변경은 SDK `thinking.set` | gjc `session/set_config_option`은 모델 카탈로그(약 1,080개)를 세 번 다시 만들어 4.1초가 걸렸고, `thinking.set`은 13~24ms였습니다. 모델 변경은 선택지가 모델에 따라 바뀌므로 느린 경로를 유지합니다. |
 | 끼어들기를 브리지에서 조립 | gjc `turn.abort`는 ACP에서 `uncertain_after_send`를 내고 약 80초 멈췄고, `turn.abort_and_prompt`는 출력이 없었으며, 단순 취소는 대기 지시를 잃었습니다. |
-| 세션 목록은 저장된 트랜스크립트에서 생성 | ACP `session/list`는 저장된 859개 중 837개가 빠져 있었습니다. |
+| 세션 목록은 저장된 트랜스크립트에서 생성 | ACP `session/list`는 브로커 색인(30일 보존)에서 나오므로 저장된 대화가 많이 빠집니다. 실측: 859개 중 837개, 0.19.3에서는 214개 중 181개. |
 | **iOS는 Swift 유지, Android는 Kotlin으로 별도 구현** | 아래 표 참고 |
 
 ### Swift 유지 vs 공통 코드 재작성 (2026-10-23 결정)

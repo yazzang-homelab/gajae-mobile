@@ -40,9 +40,9 @@ npm 패키지 `gjcm-bridge`이며 [Bun](https://bun.sh)으로만 실행됩니다
 
 `session.setPermissionMode`는 앱 세션 메뉴의 「권한모드」 항목입니다(누를 때마다 `prompt` → `allow` → `deny` 순환). gjc SDK `permission_mode.set`으로 세션의 가드 도구(`bash`·`eval`·`delete`·`move`) 정책을 바꾸고, 모든 폰에 `x_gjcm_permission_mode{mode}` 업데이트를 보냅니다. 스냅샷에는 `permissionMode`가 들어갑니다. gjc는 ACP 연결(`session/new`·`session/load`)마다 `prompt`로 되돌리므로 브리지가 세션별 모드를 기억했다가 다시 불러올 때 재적용합니다(브리지 재시작 시에는 `prompt`). 모드를 바꿀 때 이미 대기 중인 승인 요청은 새 모드대로(`allow` → 한 번 허용, `deny` → 한 번 거부) 처리합니다. 추적을 위해 `permission_mode.set`은 범용 `sdk.control`에서 열지 않습니다.
 
-`sdk.query`/`sdk.control`은 gjc `_gjc/sdk/query|control` 패스스루이며 `src/hub.ts`의 `SDK_QUERIES`/`SDK_CONTROLS` 허용 목록 밖의 op는 -32601로 거부합니다. `context.get` 응답의 `systemPrompt` 본문(~40KB)은 잘라내고 `systemPromptChars`만 보냅니다.
+`sdk.query`/`sdk.control`은 gjc `_gjc/sdk/query|control` 패스스루이며(단, `turn.btw`는 브리지가 세션 호스트에 맞는 연산으로 바꿔 보냅니다. 아래 [gjc 요구 사항](#gjc-요구-사항) 참고) `src/hub.ts`의 `SDK_QUERIES`/`SDK_CONTROLS` 허용 목록 밖의 op는 -32601로 거부합니다. `context.get` 응답의 `systemPrompt` 본문(~40KB)은 잘라내고 `systemPromptChars`만 보냅니다.
 
-오류 코드: -32002 모르는 세션, -32003 실행 중, -32020 SDK op 실패(gjc 메시지 그대로), -32601 허용 안 됨, -32010..-32014 업로드.
+오류 코드: -32002 모르는 세션, -32003 실행 중, -32020 SDK op 실패(gjc 메시지 또는 브리지 진단: `host_outdated` 등), -32601 허용 안 됨, -32010..-32014 업로드.
 
 ## 세션 목록과 재개
 
@@ -53,7 +53,7 @@ npm 패키지 `gjcm-bridge`이며 [Bun](https://bun.sh)으로만 실행됩니다
 
 ## gjc 요구 사항
 
-- BTW 사이드 질문([BTW.ko.md](../docs/BTW.ko.md))은 `turn.btw` ACP 제어를 넣은 gjc 빌드가 필요합니다. 공식 gjc 릴리스에는 아직 없습니다. 지원하지 않는 gjc는 `unknown_operation`으로 답하고, 브리지는 이를 `host_outdated`로 앱에 전달합니다.
+- BTW 사이드 질문([BTW.ko.md](../docs/BTW.ko.md))은 gjc 0.19.3 이상이 필요합니다. 브리지가 세션 호스트의 `runtime.capabilities`를 보고 로컬 패치 0004의 `turn.btw`가 있으면 그것을, 없으면 공식 `btw.ask`로 보냅니다. 0.19.3의 `btw.ask`는 이전 문답(`exchanges`)을 받아도 무시하므로 브리지가 질문 본문에 붙이고, `btwAskExchangesVersion` 1을 광고하는 호스트(상류 gajae-code#7583 포함 릴리스)에는 `exchanges`로 그대로 넘깁니다. 둘 다 없는 gjc에서는 `host_outdated`로 앱에 전달합니다.
 - `GJC_ACP_SESSION_READINESS_TIMEOUT_MS`(허용 범위 4000–60000ms, 그 밖은 22000으로 되돌아감)는 **공식 gjc(0.19.3과 dev 포함)가 읽지 않습니다.** 로컬 패치 `0002-acp-session-readiness-timeout-env.patch`를 넣은 빌드에서만 적용됩니다. 서비스 예시와 e2e 명령에 남아 있는 값은 그런 빌드를 위한 것이고, 공식 빌드에서는 아무 효과가 없습니다. 공식 빌드에서는 바쁜 호스트의 콜드 재개가 22초에서 실패할 수 있습니다.
 
 ## 외부망에서 접속하기

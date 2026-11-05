@@ -46,7 +46,8 @@ export const SDK_QUERIES = new Set([
 ]);
 export const SDK_CONTROLS = new Set([
 	"turn.steer",
-	// Ephemeral /btw side question (gjc local patch 0004): { question, exchanges? } -> { replyText }.
+	// Ephemeral /btw side question: { question, exchanges? } -> { replyText }. The hub routes it to official btw.ask or to
+	// turn.btw (local patch 0004) by the session host's runtime.capabilities; see #sideQuestion.
 	"turn.btw",
 	"turn.follow_up",
 	"compaction.run",
@@ -908,15 +909,70 @@ export class SessionHub {
 		const state = this.#sessions.get(params.sessionId);
 		if (!state?.loaded) throw new AcpError(-32002, "Session is not open; call session.open first");
 		const acp = await this.agent();
-		const input = params.input ?? {};
+		if (params.kind === "control" && params.op === "turn.btw") return { result: await this.#sideQuestion(acp, state, params.input ?? {}) };
+		const response = await this.#sdkRequest(acp, state, params.kind, params.op, params.input ?? {}, params.confirm);
+		if (params.kind === "query") {
+			const items: unknown[] = response?.page?.items ?? [];
+			return { items: params.op === "context.get" ? items.map(withoutSystemPrompt) : items, complete: response?.page?.complete !== false };
+		}
+		// Measured shapes: most operations answer with the bare result ({renamed:true}, {path}, …);
+		// some (mode.goal.operate) answer with the control envelope instead.
+		if (response?.type === "control_response") return { result: response.result ?? null };
+		return { result: response ?? null };
+	}
+
+	/**
+	 * The phone's `/btw` (`turn.btw` {question, exchanges?: [{question, answer}]} -> {replyText}) on whichever side-question
+	 * operation the gjc hosting this session has, read from its `runtime.capabilities` on every call (a session host can
+	 * restart on another build):
+	 * - `turn.btw` (local patch 0004): unchanged. First, because only it answers mid-turn with the main turn's pending
+	 *   request kept out of the side conversation; a patched build rebased past gajae-code#7583 advertises both;
+	 * - official `btw.ask` that takes `exchanges` (`btwAskExchangesVersion` 1, gajae-code#7583): history passed as is;
+	 * - official `btw.ask` without it (0.19.3 accepts and silently drops `exchanges`, measured): the answered history is
+	 *   folded into the question, oldest exchanges dropped first to stay within gjc's 16 KiB question limit.
+	 */
+	async #sideQuestion(acp: AcpProcess, state: SessionState, input: Record<string, unknown>): Promise<{ replyText: string }> {
+		const response = await this.#sdkRequest(acp, state, "query", "runtime.capabilities", {});
+		const capabilities = response?.page?.items?.[0];
+		if (!Array.isArray(capabilities?.operations)) {
+			throw new AcpError(-32020, "gjc의 runtime.capabilities 응답에 연산 목록(page.items[0].operations)이 없습니다.", { code: "internal" });
+		}
+		const operations: unknown[] = capabilities.operations;
+		const question = typeof input.question === "string" ? input.question : "";
+		const exchanges = btwExchanges(input.exchanges);
+		if (operations.includes("turn.btw")) {
+			return { replyText: String((await this.#sdkRequest(acp, state, "control", "turn.btw", input))?.replyText ?? "") };
+		}
+		if (operations.includes("btw.ask") && capabilities.btwAskExchangesVersion >= 1) {
+			const asked = { question, ...(exchanges.length ? { exchanges: exchanges.map(e => ({ question: e.question, reply: e.answer })) } : {}) };
+			return { replyText: String((await this.#sdkRequest(acp, state, "control", "btw.ask", asked))?.reply ?? "") };
+		}
+		if (operations.includes("btw.ask")) {
+			const asked = { question: foldBtwExchanges(question, exchanges) };
+			return { replyText: String((await this.#sdkRequest(acp, state, "control", "btw.ask", asked))?.reply ?? "") };
+		}
+		throw new AcpError(-32020, "이 세션의 gjc에는 BTW 기능(btw.ask)이 없습니다. gjc 0.19.3 이상이 필요하고, 업데이트 전에 시작된 세션이면 gjc를 다시 시작해야 합니다.", {
+			code: "host_outdated",
+		});
+	}
+
+	/** One `_gjc/sdk/query|control` round trip; gjc's `{ok:false}` answers become typed AcpErrors. */
+	async #sdkRequest(
+		acp: AcpProcess,
+		state: SessionState,
+		kind: "query" | "control",
+		op: string,
+		input: Record<string, unknown>,
+		confirm?: boolean,
+	): Promise<any> {
 		const response =
-			params.kind === "query"
-				? await acp.request("_gjc/sdk/query", { sessionId: params.sessionId, query: params.op, input })
+			kind === "query"
+				? await acp.request("_gjc/sdk/query", { sessionId: state.sessionId, query: op, input })
 				: await acp.request("_gjc/sdk/control", {
-						sessionId: params.sessionId,
-						operation: params.op,
+						sessionId: state.sessionId,
+						operation: op,
 						input,
-						...(params.confirm ? { confirm: true } : {}),
+						...(confirm ? { confirm: true } : {}),
 					});
 		if (response?.ok === false) {
 			const error = response.error ?? {};
@@ -929,24 +985,17 @@ export class SessionHub {
 			}
 			if (error.code === "unknown_operation") {
 				// The operation is in the bridge allowlist but the gjc hosting this session lacks it: either the gjc build
-				// never had it (turn.btw is not in any official gjc release) or the session host started before it was added.
+				// never had it or the session host started before it was added.
 				// A restart only helps in the second case, so the message does not promise it.
 				throw new AcpError(
 					-32020,
-					`이 세션의 gjc가 ${params.op}을(를) 지원하지 않습니다. 공식 gjc 릴리스에 없는 기능이거나, 그 기능이 들어가기 전에 시작된 세션입니다.`,
+					`이 세션의 gjc가 ${op}을(를) 지원하지 않습니다. 공식 gjc 릴리스에 없는 기능이거나, 그 기능이 들어가기 전에 시작된 세션입니다.`,
 					{ code: "host_outdated" },
 				);
 			}
 			throw new AcpError(-32020, message, { code: error.code ?? "internal" });
 		}
-		if (params.kind === "query") {
-			const items: unknown[] = response?.page?.items ?? [];
-			return { items: params.op === "context.get" ? items.map(withoutSystemPrompt) : items, complete: response?.page?.complete !== false };
-		}
-		// Measured shapes: most operations answer with the bare result ({renamed:true}, {path}, …);
-		// some (mode.goal.operate) answer with the control envelope instead.
-		if (response?.type === "control_response") return { result: response.result ?? null };
-		return { result: response ?? null };
+		return response;
 	}
 
 	respondPermission(params: { requestId: string; optionId?: string | null }): { ok: boolean } {
@@ -1006,6 +1055,44 @@ function activeModelProfile(config: AgentConfig): string | undefined {
 
 function publicPermission(p: PendingPermission): Omit<PendingPermission, "resolve"> {
 	return { requestId: p.requestId, sessionId: p.sessionId, toolCall: p.toolCall, options: p.options };
+}
+
+/** gjc's `btw.ask` question limit (BTW_MAX_QUESTION_UTF8_BYTES). */
+const BTW_ASK_QUESTION_BYTES = 16 * 1024;
+
+interface BtwExchange {
+	question: string;
+	answer: string;
+}
+
+/**
+ * The phone's answered `/btw` history (`[{question, answer}]`) for the `btw.ask` paths. The apps only send answered
+ * exchanges; a malformed entry is left out rather than failing the whole side question.
+ */
+function btwExchanges(value: unknown): BtwExchange[] {
+	if (!Array.isArray(value)) return [];
+	return value.flatMap(entry =>
+		typeof entry?.question === "string" && typeof entry?.answer === "string" ? [{ question: entry.question, answer: entry.answer }] : [],
+	);
+}
+
+/**
+ * The question for a `btw.ask` that drops `exchanges`: the answered history quoted ahead of it, oldest exchanges left
+ * out first so the whole stays within gjc's question limit. A question that alone exceeds it goes out unchanged and
+ * gjc refuses it as `invalid_input`; so does an empty question, which is not dressed up with history.
+ */
+export function foldBtwExchanges(question: string, exchanges: BtwExchange[]): string {
+	if (!question.trim()) return question;
+	const bytes = (text: string) => Buffer.byteLength(text, "utf8");
+	for (let start = 0; start < exchanges.length; start++) {
+		const history = exchanges
+			.slice(start)
+			.map(e => `Q: ${e.question}\nA: ${e.answer}`)
+			.join("\n\n");
+		const folded = `Earlier questions and answers in this side chat, oldest first:\n\n${history}\n\nCurrent question: ${question}`;
+		if (bytes(folded) <= BTW_ASK_QUESTION_BYTES) return folded;
+	}
+	return question;
 }
 
 /** context.get carries the whole system prompt (~40KB measured); the phone only needs its size. */

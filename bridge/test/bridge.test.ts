@@ -4,7 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { BridgeClient, BridgeClientError } from "../src/client";
 import { generateKeyPair } from "../src/crypto";
-import { AGENT_EXIT, PERMISSION_MODE_UPDATE, TURN_END, supportedConfigOptions } from "../src/hub";
+import { AGENT_EXIT, foldBtwExchanges, PERMISSION_MODE_UPDATE, TURN_END, supportedConfigOptions } from "../src/hub";
 import { parseOfferUrl, offerUrl } from "../src/offer";
 import { rpcFailureLine } from "../src/server";
 import { CHUNK_BYTES } from "../src/uploads";
@@ -14,8 +14,8 @@ const running: Array<Awaited<ReturnType<typeof startTestBridge>>> = [];
 afterEach(async () => {
 	await Promise.all(running.splice(0).map(b => b.stop()));
 });
-async function useBridge() {
-	const bridge = await startTestBridge();
+async function useBridge(env: Record<string, string> = {}) {
+	const bridge = await startTestBridge(undefined, undefined, env);
 	running.push(bridge);
 	return bridge;
 }
@@ -665,15 +665,98 @@ describe("sessions over the bridge", () => {
 		const compact = await client.request("sdk.control", { sessionId: sid, op: "compaction.run" }).catch((e: any) => e);
 		expect(compact.code).toBe(-32020);
 		expect(compact.message).toContain("Nothing to compact");
-		const outdated = await client.request("sdk.control", { sessionId: sid, op: "turn.btw", input: { question: "q" } }).catch((e: any) => e);
+		const outdated = await client.request("sdk.control", { sessionId: sid, op: "service_tier.set", input: { tier: "flex" } }).catch((e: any) => e);
 		expect(outdated.code).toBe(-32020);
 		expect(outdated.message).toBe(
-			"이 세션의 gjc가 turn.btw을(를) 지원하지 않습니다. 공식 gjc 릴리스에 없는 기능이거나, 그 기능이 들어가기 전에 시작된 세션입니다.",
+			"이 세션의 gjc가 service_tier.set을(를) 지원하지 않습니다. 공식 gjc 릴리스에 없는 기능이거나, 그 기능이 들어가기 전에 시작된 세션입니다.",
+		);
+		const noBtw = await client.request("sdk.control", { sessionId: sid, op: "turn.btw", input: { question: "q" } }).catch((e: any) => e);
+		expect(noBtw.code).toBe(-32020);
+		expect(noBtw.message).toBe(
+			"이 세션의 gjc에는 BTW 기능(btw.ask)이 없습니다. gjc 0.19.3 이상이 필요하고, 업데이트 전에 시작된 세션이면 gjc를 다시 시작해야 합니다.",
 		);
 		const blocked = await client.request("sdk.control", { sessionId: sid, op: "bash.execute", input: { cmd: "id" } }).catch((e: any) => e);
 		expect(blocked.code).toBe(-32601);
 		const unopened = await client.request("sdk.query", { sessionId: "nope", op: "context.get" }).catch((e: any) => e);
 		expect(unopened.code).toBe(-32002);
+	});
+
+	const btwHistory = [
+		{ question: "비밀단어는 KIWI야", answer: "기억했어요" },
+		{ question: "색은?", answer: "초록" },
+	];
+	/** One /btw on a fresh bridge whose fake gjc has the FAKE_BTW surface; returns the reply or the error. */
+	const sideQuestion = async (surface: string, input: Record<string, unknown> = { question: "뭐였지?", exchanges: btwHistory }) => {
+		const bridge = await useBridge({ FAKE_BTW: surface });
+		const { client } = await bridge.pairedClient();
+		const sid = (await client.request("session.new", {})).sessionId;
+		const outcome = await client
+			.request("sdk.control", { sessionId: sid, op: "turn.btw", input })
+			.then((r: any) => r.result.replyText as string, (e: any) => e);
+		return { client, sid, outcome };
+	};
+	const viaTurn = `turn.btw ${JSON.stringify({ question: "뭐였지?", exchanges: btwHistory })}`;
+
+	test("/btw on a btw.ask that takes exchanges passes the history renamed answer -> reply", async () => {
+		expect((await sideQuestion("ask-exchanges")).outcome).toBe(
+			`btw.ask ${JSON.stringify({
+				question: "뭐였지?",
+				exchanges: [
+					{ question: "비밀단어는 KIWI야", reply: "기억했어요" },
+					{ question: "색은?", reply: "초록" },
+				],
+			})}`,
+		);
+	});
+
+	test("/btw on a patch 0004 build goes to turn.btw unchanged, also when btw.ask v1 is there too", async () => {
+		expect((await sideQuestion("turn")).outcome).toBe(viaTurn);
+		expect((await sideQuestion("turn-exchanges")).outcome).toBe(viaTurn);
+	});
+
+	test("/btw on official 0.19.3 folds the history into the btw.ask question", async () => {
+		const folded = foldBtwExchanges("뭐였지?", btwHistory);
+		expect(folded).toBe(
+			"Earlier questions and answers in this side chat, oldest first:\n\nQ: 비밀단어는 KIWI야\nA: 기억했어요\n\nQ: 색은?\nA: 초록\n\nCurrent question: 뭐였지?",
+		);
+		expect((await sideQuestion("ask")).outcome).toBe(`btw.ask ${JSON.stringify({ question: folded })}`);
+	});
+
+	test("/btw reports a capability answer without an operation list instead of calling gjc outdated", async () => {
+		const { outcome } = await sideQuestion("malformed");
+		expect(outcome.code).toBe(-32020);
+		expect(outcome.message).toBe("gjc의 runtime.capabilities 응답에 연산 목록(page.items[0].operations)이 없습니다.");
+	});
+
+	test("/btw that finds the attachment stale asks the phone to reopen the session", async () => {
+		const { client, sid, outcome } = await sideQuestion("stale");
+		expect(outcome.code).toBe(-32002);
+		// The bridge marked the session closed: a prompt (which the fake would accept) is refused until session.open.
+		const prompt = await client.request("session.prompt", { sessionId: sid, prompt: [{ type: "text", text: "하나" }] }).catch((e: any) => e);
+		expect(prompt.code).toBe(-32002);
+	});
+
+	test("folded /btw history drops the oldest exchanges to fit gjc's 16 KiB question limit", () => {
+		const big = "가".repeat(2000); // 6000 UTF-8 bytes
+		const exchanges = [1, 2, 3].map(n => ({ question: `q${n}`, answer: big }));
+		const folded = foldBtwExchanges("now?", exchanges);
+		expect(Buffer.byteLength(folded, "utf8")).toBeLessThanOrEqual(16 * 1024);
+		expect(folded).not.toContain("Q: q1\n");
+		expect(folded).toContain("Q: q2\n");
+		expect(folded).toContain("Q: q3\n");
+		expect(folded.endsWith("Current question: now?")).toBe(true);
+		const huge = "x".repeat(17 * 1024);
+		expect(foldBtwExchanges(huge, exchanges)).toBe(huge);
+		expect(foldBtwExchanges("only", [])).toBe("only");
+		// An empty question stays empty so gjc refuses it, as it does on the other paths.
+		expect(foldBtwExchanges("", exchanges)).toBe("");
+		expect(foldBtwExchanges(" \n", exchanges)).toBe(" \n");
+		// Exactly 16384 bytes still fits.
+		const one = [{ question: "q", answer: "a" }];
+		const overhead = Buffer.byteLength(foldBtwExchanges("x", one), "utf8") - 1;
+		const atLimit = "x".repeat(16 * 1024 - overhead);
+		expect(Buffer.byteLength(foldBtwExchanges(atLimit, one), "utf8")).toBe(16 * 1024);
+		expect(foldBtwExchanges(`${atLimit}x`, one)).toBe(`${atLimit}x`);
 	});
 });
 

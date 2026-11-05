@@ -1,7 +1,8 @@
 import Foundation
 
 /// The `/btw` side chat: questions answered from the session's visible conversation through
-/// `_gjc/sdk/control` `turn.btw` (gjc local patch 0004). Nothing is written to the session transcript.
+/// `_gjc/sdk/control` `turn.btw`. The bridge sends it on as gjc local patch 0004's `turn.btw` or gjc's `btw.ask`,
+/// whichever the session host has (docs/BTW.ko.md). Nothing is written to the session transcript.
 ///
 /// The host is stateless: each call carries the earlier answered exchanges, so follow-ups keep context
 /// and closing the bubble simply drops this value.

@@ -384,6 +384,9 @@ async function handle(msg: any) {
 			switch (params.query) {
 				case "queue.messages.list":
 					return ok(queued);
+				// The bridge reads this before every /btw to pick the side-question operation; the demo answers turn.btw.
+				case "runtime.capabilities":
+					return ok([{ operations: ["turn.steer", "turn.follow_up", "turn.btw"], hostTools: false }]);
 				case "context.get": {
 					const used = tokens(session).context;
 					return ok([

@@ -172,6 +172,22 @@ async function handle(msg: any) {
 			}
 			if (params.query === "queue.messages.list")
 				return reply({ type: "query_response", id: "q", ok: true, page: { items: steers.get(params.sessionId) ?? [], complete: true } });
+			if (params.query === "runtime.capabilities") {
+				// FAKE_BTW picks the session host's /btw surface: none, turn (local patch 0004), ask (official 0.19.3,
+				// which drops exchanges), ask-exchanges (btw.ask with btwAskExchangesVersion 1, gajae-code#7583) or
+				// turn-exchanges (patch 0004 rebased past gajae-code#7583: both operations and the version).
+				const btw = process.env.FAKE_BTW ?? "none";
+				if (btw === "malformed")
+					return reply({ type: "query_response", id: "q", ok: true, page: { items: [{ hostTools: false }], complete: true } });
+				if (btw === "stale") {
+					// The capability read finds the attachment gone, as after a session-host restart.
+					staleAttachments.add(params.sessionId);
+					return reply({ type: "query_response", id: "q", ok: false, error: { code: "internal", message: "SDK session attachment is stale." } });
+				}
+				const operations = ["turn.steer", ...(btw.startsWith("turn") ? ["turn.btw", "btw.ask"] : btw.startsWith("ask") ? ["btw.ask"] : [])];
+				const item = { operations, hostTools: false, ...(btw.endsWith("-exchanges") ? { btwAskExchangesVersion: 1 } : {}) };
+				return reply({ type: "query_response", id: "q", ok: true, page: { items: [item], complete: true } });
+			}
 			if (params.query === "context.get")
 				return reply({ type: "query_response", id: "q", ok: true, page: { items: [{ usage: { tokens: 1200, contextWindow: 100000, percent: 1.2 }, systemPrompt: ["abc", "de"] }], complete: true } });
 			return reply({ type: "query_response", id: "q", ok: false, error: { code: "unsupported", message: `no ${params.query}` } });
@@ -231,9 +247,14 @@ async function handle(msg: any) {
 				fs.writeFileSync(file, `${Bun.YAML.stringify(config, null, 2)}\n`);
 				return reply({ patched: Object.keys(patch), revision: "1" });
 			}
-			// A session host started before turn.btw existed (measured: gjc dispatch.ts "unknown_operation").
-			if (params.operation === "turn.btw")
-				return reply({ ok: false, error: { code: "unknown_operation", message: "Unknown control operation: turn.btw." } });
+			// Side questions echo the input they received so tests can see what the bridge sent.
+			if (params.operation === "turn.btw" && process.env.FAKE_BTW?.startsWith("turn"))
+				return reply({ replyText: `turn.btw ${JSON.stringify(params.input)}` });
+			if (params.operation === "btw.ask" && process.env.FAKE_BTW && process.env.FAKE_BTW !== "none")
+				return reply({ reply: `btw.ask ${JSON.stringify(params.input)}` });
+			// A session host without the operation (measured: gjc dispatch.ts "unknown_operation").
+			if (params.operation === "turn.btw" || params.operation === "btw.ask" || params.operation === "service_tier.set")
+				return reply({ ok: false, error: { code: "unknown_operation", message: `Unknown control operation: ${params.operation}.` } });
 			if (params.operation === "mode.goal.operate") return reply({ type: "control_response", id: "c", ok: true });
 			if (params.operation === "compaction.run")
 				return reply({ ok: false, error: { code: "invalid_request", message: "Nothing to compact (session too small)" } });

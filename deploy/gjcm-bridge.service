@@ -10,7 +10,8 @@ Type=simple
 User=gajae
 Environment=PATH=/home/gajae/.local/bin:/home/gajae/.bun/bin:/usr/local/bin:/usr/bin:/bin
 # Resuming a saved session spawns a gjc session host; on a loaded host that can take longer than gjc's default
-# ACP readiness timeout. Honored by gjc builds that support it; 60s is the broker maximum.
+# ACP readiness timeout. Official gjc (0.19.3, dev) ignores this variable and keeps 22s; only builds with the
+# local readiness patch (0002) honor it. Harmless otherwise; 60s is the broker maximum.
 Environment=GJC_ACP_SESSION_READINESS_TIMEOUT_MS=60000
 WorkingDirectory=/opt/gajae-mobile/bridge
 # On SIGHUP the bridge restarts its ACP process once no phone-started turn is running (e.g. after updating gjc).

@@ -57,6 +57,7 @@ GitHub Actions의 macOS 러너가 결제/지출 한도로 멈출 수 있어(2026
 - 서명은 App Store Connect API 키를 쓰는 자동 클라우드 서명(`-allowProvisioningUpdates`)입니다. 저장소에 `.p12`를 두지 않습니다.
 - 서명 검증만: `appstore` 브랜치에 푸시합니다(`git push origin HEAD:appstore`).
 - 업로드: 기본 브랜치에서 `gh workflow run appstore.yml -f upload=true`를 실행합니다. App Store Connect에 앱 레코드가 있어야 성공합니다.
+- 심사 제출: 업로드한 빌드가 처리되면 `gh workflow run asc-submit.yml -f version=<버전> -f build=<빌드> -f whats_new_ko=… -f whats_new_en=… [-f whats_new_zh=…] -f submit=true`. 버전 생성(또는 재사용), 빌드 지정, 모든 현지화의 What's New, 심사 정보(없으면 직전 버전에서 복사), 심사 제출을 차례로 합니다. `submit=false`는 상태만 출력합니다. 다른 제출이 대기·심사 중이거나 빌드가 `VALID`가 아니면 아무것도 바꾸지 않고 멈춥니다.
 - 팀 `6Z6SXY7BTZ`, 번들 ID `dev.gajae.gjcmobile`.
 
 | 시크릿 | 내용 |

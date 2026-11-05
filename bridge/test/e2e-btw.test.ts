@@ -1,5 +1,6 @@
 /**
- * Real-gjc check for the /btw side chat (`sdk.control` → `turn.btw`, gjc local patch 0004).
+ * Real-gjc check for the /btw side chat (`sdk.control` → `turn.btw`, routed by the bridge to official `btw.ask` or to
+ * `turn.btw` from gjc local patch 0004).
  * Opt-in like e2e-gjc: GJCM_E2E=1 [GJCM_E2E_GJC="gjc --mode=acp"] bun test test/e2e-btw.test.ts
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
@@ -53,12 +54,14 @@ describe.skipIf(!enabled)("bridge ↔ real gjc /btw", () => {
 		await client.request("session.prompt", { sessionId: sid, prompt: [{ type: "text", text: "1부터 200까지 쉼표로 써라. 도구 금지." }] });
 		await client.waitFor(after(seen, update("agent_message_chunk")), 240_000);
 		const reply = await btw("2+3은? 숫자만.");
-		// Measured before the pending-request placeholder: the side reply re-ran the whole count.
+		// Measured before the pending-request placeholder: the side reply re-ran the whole count. Patch 0004's turn.btw has
+		// the placeholder; official btw.ask (0.19.3 and dev 2026-11-05) does not and fails this check (measured 2026-11-05).
 		expect(reply.trim()).toBe("5");
 		await client.waitFor(after(seen, update(TURN_END)), 240_000);
 	}, 300_000);
 
 	test("rejects an empty question", async () => {
-		await expect(btw("   ")).rejects.toThrow("non-empty question");
+		// turn.btw: "non-empty question"; btw.ask: "nonempty question".
+		await expect(btw("   ")).rejects.toThrow(/non-?empty question/);
 	});
 });

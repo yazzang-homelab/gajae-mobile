@@ -51,14 +51,18 @@ public struct PairedHost: Codable, Hashable, Identifiable, Sendable {
     public var endpoints: [String]
     public var lastEndpoint: String?
     public let pairedAt: Date
+    /// Directory on the host PC that new chats on this host start in, saved only by an explicit "save as default".
+    /// Hosts saved before this field existed decode it as nil.
+    public var preferredCwd: String?
 
-    public init(hostId: String, name: String, hostKey: String, endpoints: [String], lastEndpoint: String? = nil, pairedAt: Date = Date()) {
+    public init(hostId: String, name: String, hostKey: String, endpoints: [String], lastEndpoint: String? = nil, pairedAt: Date = Date(), preferredCwd: String? = nil) {
         self.hostId = hostId
         self.name = name
         self.hostKey = hostKey
         self.endpoints = endpoints
         self.lastEndpoint = lastEndpoint
         self.pairedAt = pairedAt
+        self.preferredCwd = preferredCwd
     }
 
     public init(offer: PairingOffer) {
@@ -69,6 +73,12 @@ public struct PairedHost: Codable, Hashable, Identifiable, Sendable {
     public var endpointsToTry: [String] {
         guard let lastEndpoint else { return endpoints }
         return [lastEndpoint] + endpoints.filter { $0 != lastEndpoint }
+    }
+
+    /// Directory a new chat starts in: a path picked for this chat, else this host's saved default, else the
+    /// bridge's `host.info.defaultCwd`. Empty means "let the bridge decide".
+    public func newChatCwd(explicit: String?, bridgeDefault: String?) -> String {
+        explicit ?? preferredCwd ?? bridgeDefault ?? ""
     }
 }
 

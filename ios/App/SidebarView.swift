@@ -53,7 +53,7 @@ struct SidebarView: View {
             Button("시작") { onNewChat(newCwd.isEmpty ? nil : newCwd) }
             Button("취소", role: .cancel) {}
         } message: {
-            Text("호스트에서 gjc가 실행될 디렉터리입니다. 첫 메시지를 보낼 때 세션이 만들어집니다.")
+            Text("호스트 PC에서 gjc가 실행될 절대 경로입니다(예: C:\\AI\\shared, /home/me/project). 첫 메시지를 보낼 때 세션이 만들어집니다.")
         }
         .alert("오류", isPresented: Binding(get: { error != nil }, set: { if !$0 { error = nil } })) {
             Button("확인", role: .cancel) {}
@@ -115,7 +115,7 @@ struct SidebarView: View {
             }
             .listRowBackground(Palette.shell)
             Button {
-                newCwd = connection.info?.defaultCwd ?? ""
+                newCwd = connection.host.newChatCwd(explicit: nil, bridgeDefault: connection.info?.defaultCwd)
                 showNew = true
             } label: {
                 Label("다른 디렉터리에서 새 세션", systemImage: "folder.badge.plus").foregroundStyle(Palette.muted)

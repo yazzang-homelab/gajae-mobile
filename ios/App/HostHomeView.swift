@@ -83,7 +83,13 @@ struct NewChatView: View {
     @State private var showFiles = false
     @FocusState private var focused: Bool
 
-    private var effectiveCwd: String { cwd ?? connection.info?.defaultCwd ?? "" }
+    private var savedDefaultLine: String {
+        if let saved = connection.host.preferredCwd { return "저장된 기본값: \(saved)" }
+        let bridge = connection.info?.defaultCwd ?? ""
+        return bridge.isEmpty ? "저장된 기본값 없음" : "저장된 기본값 없음 — 브리지 기본값 \(bridge)"
+    }
+
+    private var effectiveCwd: String { connection.host.newChatCwd(explicit: cwd, bridgeDefault: connection.info?.defaultCwd) }
     private var trimmed: String { draft.trimmingCharacters(in: .whitespacesAndNewlines) }
     private var canSend: Bool { (!trimmed.isEmpty || !attachments.isEmpty) && !starting && connection.status == .connected }
 
@@ -116,10 +122,22 @@ struct NewChatView: View {
         .navigationBarTitleDisplayMode(.inline)
         .alert("작업 디렉터리", isPresented: $editingCwd) {
             TextField("경로", text: $cwdDraft).textInputAutocapitalization(.never).autocorrectionDisabled()
-            Button("적용") { cwd = cwdDraft.isEmpty ? nil : cwdDraft }
+            Button("이번 채팅에만 적용") { cwd = cwdDraft.isEmpty ? nil : cwdDraft }
+            Button("기본값으로 저장") {
+                let path = cwdDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !path.isEmpty else { return }
+                connection.setPreferredCwd(path)
+                cwd = nil
+            }
+            if connection.host.preferredCwd != nil {
+                Button("기본값 해제", role: .destructive) {
+                    connection.setPreferredCwd(nil)
+                    cwd = nil
+                }
+            }
             Button("취소", role: .cancel) {}
         } message: {
-            Text("호스트에서 gjc가 실행될 디렉터리입니다.")
+            Text("호스트 PC에서 gjc가 실행될 절대 경로입니다(예: C:\\AI\\shared, /home/me/project). 「기본값으로 저장」하면 이 호스트의 새 채팅이 늘 이 경로에서 시작합니다.\n\n" + savedDefaultLine)
         }
         .onAppear { focused = true }
         .attachmentPickers(showPhotos: $showPhotos, showFiles: $showFiles) { attachments.append($0) } onError: { error = $0 }
@@ -249,6 +267,7 @@ struct NewChatView: View {
         }
         do {
             let chat = try await connection.createSession(cwd: effectiveCwd.isEmpty ? nil : effectiveCwd)
+            cwd = nil // a path picked for this chat does not carry over to the next one
             chat.draft = text
             chat.attachments = attachments
             draft = ""

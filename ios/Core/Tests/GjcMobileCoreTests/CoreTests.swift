@@ -135,6 +135,34 @@ final class ModelTests: XCTestCase {
         XCTAssertEqual(moved.endpointsToTry.first, "ws://192.168.0.2:7787/ws")
     }
 
+    /// Hosts saved by 1.0.1 (the Keychain list in `JSONEncoder`'s shape, without `preferredCwd`) must still load,
+    /// keys intact; a failed decode would make the app forget every paired host.
+    func testHostsSavedBeforePreferredCwdStillDecode() throws {
+        let saved = #"[{"hostId":"h1","name":"pve","hostKey":"AQID","endpoints":["ws://100.64.0.1:7787/ws"],"lastEndpoint":"ws://100.64.0.1:7787/ws","pairedAt":815000000}]"#
+        let hosts = try JSONDecoder().decode([PairedHost].self, from: Data(saved.utf8))
+        XCTAssertEqual(hosts.count, 1)
+        XCTAssertEqual(hosts[0].hostKey, "AQID")
+        XCTAssertEqual(hosts[0].lastEndpoint, "ws://100.64.0.1:7787/ws")
+        XCTAssertNil(hosts[0].preferredCwd)
+
+        var host = hosts[0]
+        host.preferredCwd = #"C:\AI\shared"#
+        let reloaded = try JSONDecoder().decode([PairedHost].self, from: JSONEncoder().encode([host]))
+        XCTAssertEqual(reloaded[0].preferredCwd, #"C:\AI\shared"#)
+        XCTAssertEqual(reloaded[0].hostKey, "AQID")
+    }
+
+    func testNewChatCwdPrefersThisChatThenSavedDefaultThenBridge() {
+        var host = PairedHost(hostId: "h", name: "n", hostKey: "k", endpoints: [])
+        XCTAssertEqual(host.newChatCwd(explicit: nil, bridgeDefault: "/home/u"), "/home/u")
+        XCTAssertEqual(host.newChatCwd(explicit: nil, bridgeDefault: nil), "")
+        host.preferredCwd = "/srv/work"
+        XCTAssertEqual(host.newChatCwd(explicit: nil, bridgeDefault: "/home/u"), "/srv/work")
+        XCTAssertEqual(host.newChatCwd(explicit: "/tmp/once", bridgeDefault: "/home/u"), "/tmp/once")
+        host.preferredCwd = nil
+        XCTAssertEqual(host.newChatCwd(explicit: nil, bridgeDefault: "/home/u"), "/home/u")
+    }
+
     func testConfigOptionsDecodeFlatAndGroupedChoices() throws {
         let raw: JSONValue = [
             ["id": "model", "name": "Model", "currentValue": "b", "options": [

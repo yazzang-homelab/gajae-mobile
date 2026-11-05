@@ -263,4 +263,14 @@ class HostConnection(
         draftCwd = cwd
         activeChat = null
     }
+
+    /**
+     * Saves (or with null clears) the directory new chats on this host start in. Only an explicit user action
+     * calls this; a path picked for one chat stays in [draftCwd].
+     */
+    fun setPreferredCwd(cwd: String?) {
+        if (host.preferredCwd == cwd) return
+        host = host.copy(preferredCwd = cwd)
+        onHostChange(host)
+    }
 }

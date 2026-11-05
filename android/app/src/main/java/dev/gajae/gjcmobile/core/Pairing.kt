@@ -79,12 +79,20 @@ data class PairedHost(
     val endpoints: List<String>,
     val lastEndpoint: String? = null,
     val pairedAt: String = Instant.now().toString(),
+    /** Directory on the host PC that new chats on this host start in; set only by an explicit "save as default". */
+    val preferredCwd: String? = null,
 ) {
     constructor(offer: PairingOffer) : this(offer.hostId, offer.name, offer.hostKey, offer.endpoints)
 
     /** Endpoint that last worked first, then the advertised order. */
     val endpointsToTry: List<String>
         get() = lastEndpoint?.let { last -> listOf(last) + endpoints.filter { it != last } } ?: endpoints
+
+    /**
+     * Directory a new chat starts in: a path picked for this chat, else this host's saved default, else the
+     * bridge's `host.info.defaultCwd`. Empty means "let the bridge decide".
+     */
+    fun newChatCwd(explicit: String?, bridgeDefault: String?): String = explicit ?: preferredCwd ?: bridgeDefault ?: ""
 
     fun toJson(): JsonElement = buildJsonObject {
         put("hostId", hostId)
@@ -93,6 +101,7 @@ data class PairedHost(
         put("endpoints", JsonArray(endpoints.map(::JsonPrimitive)))
         lastEndpoint?.let { put("lastEndpoint", it) }
         put("pairedAt", pairedAt)
+        preferredCwd?.let { put("preferredCwd", it) }
     }
 
     companion object {
@@ -104,6 +113,7 @@ data class PairedHost(
                 endpoints = json["endpoints"].array?.mapNotNull { it.str } ?: return null,
                 lastEndpoint = json["lastEndpoint"].str,
                 pairedAt = json["pairedAt"].str ?: Instant.now().toString(),
+                preferredCwd = json["preferredCwd"].str,
             )
         }
     }

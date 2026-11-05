@@ -51,6 +51,8 @@ final class AppModel {
                                                             deviceName: deviceName, pairing: (offer.pairingId, secret))
                 var host = PairedHost(offer: offer)
                 host.lastEndpoint = endpoint
+                // Pairing the same host again keeps the directory the user saved for it.
+                host.preferredCwd = hosts.first { $0.hostId == offer.hostId }?.preferredCwd
                 if let info = try? await client.hostInfo() { host.name = info.hostName }
                 update(host: host)
                 connection(for: host).adopt(client: client, endpoint: endpoint)

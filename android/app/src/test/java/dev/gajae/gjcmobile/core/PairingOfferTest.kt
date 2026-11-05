@@ -58,4 +58,26 @@ class PairingOfferTest {
         assertEquals(listOf("wss://h.ts.net/ws", "ws://100.64.0.1:7749/ws"), host.endpointsToTry)
         assertEquals(host, PairedHost.fromJson(host.toJson()))
     }
+
+    /** A host saved by 1.0.1 (no preferredCwd) must still load with its key, or the app would drop the pairing. */
+    @Test
+    fun hostsSavedBeforePreferredCwdStillLoad() {
+        val saved = parseJson("""{"hostId":"h1","name":"pve","hostKey":"AQID","endpoints":["ws://100.64.0.1:7787/ws"],"lastEndpoint":"ws://100.64.0.1:7787/ws","pairedAt":"2026-11-01T00:00:00Z"}""")
+        val host = PairedHost.fromJson(saved)!!
+        assertEquals("AQID", host.hostKey)
+        assertEquals(null, host.preferredCwd)
+        val withDefault = host.copy(preferredCwd = "C:\\AI\\shared")
+        assertEquals(withDefault, PairedHost.fromJson(parseJson(withDefault.toJson().encode())))
+    }
+
+    @Test
+    fun newChatCwdPrefersThisChatThenSavedDefaultThenBridge() {
+        val host = PairedHost("h", "n", "k", emptyList())
+        assertEquals("/home/u", host.newChatCwd(explicit = null, bridgeDefault = "/home/u"))
+        assertEquals("", host.newChatCwd(explicit = null, bridgeDefault = null))
+        val saved = host.copy(preferredCwd = "/srv/work")
+        assertEquals("/srv/work", saved.newChatCwd(explicit = null, bridgeDefault = "/home/u"))
+        assertEquals("/tmp/once", saved.newChatCwd(explicit = "/tmp/once", bridgeDefault = "/home/u"))
+        assertEquals("/home/u", saved.copy(preferredCwd = null).newChatCwd(explicit = null, bridgeDefault = "/home/u"))
+    }
 }

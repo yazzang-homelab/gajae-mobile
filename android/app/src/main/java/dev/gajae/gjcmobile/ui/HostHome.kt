@@ -126,7 +126,7 @@ private fun NewChatScreen(connection: HostConnection, onShowSessions: () -> Unit
     var cwdDraft by remember { mutableStateOf("") }
     var attachments by remember { mutableStateOf<List<PendingAttachment>>(emptyList()) }
     val scope = rememberCoroutineScope()
-    val effectiveCwd = connection.draftCwd ?: connection.info?.defaultCwd ?: ""
+    val effectiveCwd = connection.host.newChatCwd(explicit = connection.draftCwd, bridgeDefault = connection.info?.defaultCwd)
     val canSend = (draft.isNotBlank() || attachments.isNotEmpty()) && !starting && connection.status == HostConnection.Status.Connected
 
     fun send() {
@@ -136,6 +136,7 @@ private fun NewChatScreen(connection: HostConnection, onShowSessions: () -> Unit
         scope.launch {
             try {
                 val chat = connection.createSession(effectiveCwd.ifEmpty { null })
+                connection.draftCwd = null // a path picked for this chat does not carry over to the next one
                 chat.draft = draft.trim()
                 chat.attachments = attachments
                 draft = ""
@@ -214,11 +215,39 @@ private fun NewChatScreen(connection: HostConnection, onShowSessions: () -> Unit
             title = { Text("작업 디렉터리") },
             text = {
                 Column {
-                    Text("호스트에서 gjc가 실행될 디렉터리입니다.", color = Palette.muted)
+                    Text(
+                        "호스트 PC에서 gjc가 실행될 절대 경로입니다(예: C:\\AI\\shared, /home/me/project). " +
+                            "「기본값으로 저장」하면 이 호스트의 새 채팅이 늘 이 경로에서 시작합니다.",
+                        color = Palette.muted,
+                    )
+                    val bridgeDefault = connection.info?.defaultCwd.orEmpty()
+                    Text(
+                        connection.host.preferredCwd?.let { "저장된 기본값: $it" }
+                            ?: if (bridgeDefault.isEmpty()) "저장된 기본값 없음" else "저장된 기본값 없음 — 브리지 기본값 $bridgeDefault",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = Palette.muted,
+                    )
                     OutlinedTextField(cwdDraft, { cwdDraft = it }, placeholder = { Text("경로") }, singleLine = true)
+                    Column {
+                        TextButton(
+                            onClick = {
+                                connection.setPreferredCwd(cwdDraft.trim())
+                                connection.draftCwd = null
+                                editingCwd = false
+                            },
+                            enabled = cwdDraft.isNotBlank(),
+                        ) { Text("기본값으로 저장") }
+                        if (connection.host.preferredCwd != null) {
+                            TextButton(onClick = {
+                                connection.setPreferredCwd(null)
+                                connection.draftCwd = null
+                                editingCwd = false
+                            }) { Text("기본값 해제", color = Palette.gajaeRed) }
+                        }
+                    }
                 }
             },
-            confirmButton = { TextButton(onClick = { connection.draftCwd = cwdDraft.ifEmpty { null }; editingCwd = false }) { Text("적용") } },
+            confirmButton = { TextButton(onClick = { connection.draftCwd = cwdDraft.ifEmpty { null }; editingCwd = false }) { Text("이번 채팅에만 적용") } },
             dismissButton = { TextButton(onClick = { editingCwd = false }) { Text("취소") } },
         )
     }

@@ -204,6 +204,7 @@ describe("sessions over the bridge", () => {
 		const refused = await client.request("session.prompt", { sessionId: sid, prompt: [{ type: "text", text: "봐" }, photo] }).catch(e => e);
 		expect(refused).toMatchObject({ code: -32602, data: { code: "prompt_too_large", limit: 256 * 1024 - 1024 } });
 		expect(refused.message).toContain("256KiB");
+		expect(refused.message).toContain("글 1KiB");
 		// Nothing started: the next prompt is a turn of its own, not refused as "already running".
 		const fits = { ...photo, data: "A".repeat(240_000) };
 		await client.request("session.prompt", { sessionId: sid, prompt: [{ type: "text", text: "봐" }, fits] });
@@ -510,6 +511,26 @@ describe("sessions over the bridge", () => {
 		expect(users).toEqual(["slow count", "이거 먼저\n\n그리고 이것도"]);
 		// The steers the cancel left queued were removed, so they cannot replay into a later turn.
 		expect((await client.request("sdk.query", { sessionId: sid, op: "queue.messages.list" })).items).toEqual([]);
+	});
+
+	test("a prompt sent while 끼어들기 restarts the turn is refused, so the waiting steers keep their turn", async () => {
+		const bridge = await useBridge();
+		const { client } = await bridge.pairedClient();
+		const sid = (await client.request("session.new", {})).sessionId;
+		await client.request("session.prompt", { sessionId: sid, prompt: [{ type: "text", text: "slow count" }] });
+		await client.waitFor(e => e.ev === "session.update" && e.p.update.sessionUpdate === "agent_message_chunk");
+		await client.request("sdk.control", { sessionId: sid, op: "turn.steer", input: { text: "이거 먼저" } });
+		const interrupted = client.request("session.interrupt", { sessionId: sid });
+		// The phone sends its held photo message the moment the cancelled turn ends.
+		await client.waitFor(turnEnd(sid));
+		const held = await client.request("session.prompt", { sessionId: sid, prompt: [{ type: "text", text: "사진 메시지" }] }).catch((e: any) => e);
+		expect(held.code).toBe(-32003);
+		expect((await interrupted).text).toBe("이거 먼저");
+		await client.waitFor(() => client.events.filter(turnEnd(sid)).length >= 2);
+		const users = client.events
+			.filter(e => e.ev === "session.update" && e.p.sessionId === sid && e.p.update.sessionUpdate === "user_message_chunk")
+			.map(e => e.p.update.content.text);
+		expect(users).toEqual(["slow count", "이거 먼저"]);
 	});
 
 	test("session.interrupt does not resend a steer gjc delivered itself before the cancel landed", async () => {

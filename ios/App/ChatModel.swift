@@ -9,7 +9,7 @@ struct InfoSheet: Identifiable, Equatable {
     let topic: InfoTopic
 }
 
-/// A message with photos held on the phone until this phone's own turn ends (gjc's `turn.steer` takes text only).
+/// A message with photos the phone holds until the running turn ends (gjc's `turn.steer` takes text only).
 struct HeldPhotoMessage: Equatable {
     let text: String
     let attachments: [PendingAttachment]
@@ -56,7 +56,7 @@ final class ChatModel: Identifiable {
     private var hostQueueAt: TimeInterval = 0
     /// What waits on the running turn; `followUp` ones wait for the turn to end.
     var queued: [QueuedMessage] { QueuedMessages.merge(sent: sentQueue, host: hostQueue, now: hostQueueAt) }
-    /// Sent by the phone when the running turn ends; see `steer(followUp:)`.
+    /// Sent by the phone once no turn runs; see `steer(followUp:)`. Kept in memory only.
     private(set) var heldPhotoMessage: HeldPhotoMessage?
     var hasQueuedSteer: Bool { queued.contains { !$0.followUp } }
     var infoSheet: InfoSheet?
@@ -146,8 +146,7 @@ final class ChatModel: Identifiable {
     func apply(snapshot: OpenSnapshot) {
         transcript.apply(snapshot: snapshot)
         permissions = snapshot.permissions
-        // The turn may have ended while the phone was away.
-        if heldPhotoMessage != nil, !running { Task { await sendHeldPhotoMessage() } }
+        sendHeldPhotoMessageIfIdle()
     }
 
     func apply(_ update: SequencedUpdate) {
@@ -156,13 +155,15 @@ final class ChatModel: Identifiable {
         case "x_gjcm_turn_end":
             sentQueue = []
             if hostQueue != nil { hostQueue = [] }
-            if heldPhotoMessage != nil { Task { await sendHeldPhotoMessage() } }
             Task { await refreshInsights() }
         case "plan":
             Task { await refreshTodos() }
         default:
             break
         }
+        // `running` covers turns started anywhere (the bridge's own and the terminal's), so this catches the end of
+        // either; the bridge's -32003 holds the message again if another turn of this phone got in first.
+        sendHeldPhotoMessageIfIdle()
     }
 
     func apply(status: SessionStatus) {
@@ -182,7 +183,9 @@ final class ChatModel: Identifiable {
 
     func leave() {
         isVisible = false
-        guard let client = connection?.connectedClient else { return }
+        // Without the subscription the end of the turn would not arrive and the held message would wait for the
+        // chat to be opened again.
+        guard heldPhotoMessage == nil, let client = connection?.connectedClient else { return }
         Task { try? await client.closeSession(sessionId) }
     }
 
@@ -222,13 +225,20 @@ final class ChatModel: Identifiable {
 
     private func send() async {
         guard canSend, let client = connection?.connectedClient else { return }
+        let message = HeldPhotoMessage(text: draft, attachments: attachments)
         do {
-            try await prompt(HeldPhotoMessage(text: draft, attachments: attachments), using: client)
-            draft = ""
-            attachments = []
+            try await prompt(message, using: client)
+            clearSent(message)
         } catch {
             show(error)
         }
+    }
+
+    /// Clears what was sent from the composer, keeping what was typed or attached while it was being sent.
+    private func clearSent(_ message: HeldPhotoMessage) {
+        if trimmedDraft == message.text.trimmingCharacters(in: .whitespacesAndNewlines) { draft = "" }
+        let sent = Set(message.attachments.map(\.id))
+        attachments.removeAll { sent.contains($0.id) }
     }
 
     /// Sends text + attachments as a prompt, its photos re-encoded to fit gjc's inline budget together.
@@ -240,7 +250,8 @@ final class ChatModel: Identifiable {
             uploadProgress = nil
         }
         let files = message.attachments
-        let fitted = try await Task.detached(priority: .userInitiated) { try ImagePreparer.fitInline(files) }.value
+        let text = message.text
+        let fitted = try await Task.detached(priority: .userInitiated) { try ImagePreparer.fitInline(files, text: text) }.value
         let blocks = try await client.promptBlocks(text: message.text, attachments: fitted, sessionId: sessionId) { fraction in
             Task { @MainActor [weak self] in self?.uploadProgress = fraction }
         }
@@ -253,7 +264,7 @@ final class ChatModel: Identifiable {
     /// Both take text only, so a message with photos goes in as a prompt instead. During a turn started in the
     /// terminal gjc queues that prompt and delivers it, photos included, at the turn's next step (or as a turn of its
     /// own once that turn ends). During this phone's own turn the bridge refuses a second prompt (-32003), so the
-    /// message waits here and goes out when the turn ends; "턴이 끝나면 보내기" holds it here right away.
+    /// message waits here and goes out once no turn runs; "턴이 끝나면 보내기" holds it here right away.
     func steer(followUp: Bool) async {
         guard attachments.isEmpty else {
             await sendPhotosDuringTurn(holdUntilTurnEnd: followUp)
@@ -288,8 +299,7 @@ final class ChatModel: Identifiable {
         }
         do {
             try await prompt(message, using: client)
-            draft = ""
-            attachments = []
+            clearSent(message)
             transcript.appendNotice("사진 메시지를 진행 중인 턴에 넣었습니다. 턴의 다음 단계나 턴이 끝난 뒤 전달됩니다.")
         } catch BridgeError.remote(code: -32003, _, _) {
             hold(message)
@@ -300,13 +310,20 @@ final class ChatModel: Identifiable {
 
     private func hold(_ message: HeldPhotoMessage) {
         heldPhotoMessage = message
-        draft = ""
-        attachments = []
-        transcript.appendNotice("사진이 있는 메시지는 턴이 끝나면 보냅니다.")
+        clearSent(message)
+        transcript.appendNotice("사진이 있는 메시지는 이 폰이 들고 있다가 턴이 끝나면 보냅니다. 앱을 닫으면 보내지 않습니다.")
+        // The turn may have ended while the message was on its way.
+        sendHeldPhotoMessageIfIdle()
+    }
+
+    /// Sends the held message once no turn runs and nothing else of this chat is in flight (a send, a 끼어들기).
+    private func sendHeldPhotoMessageIfIdle() {
+        guard heldPhotoMessage != nil, !running, !sending, connected else { return }
+        Task { await sendHeldPhotoMessage() }
     }
 
     private func sendHeldPhotoMessage() async {
-        guard let message = heldPhotoMessage, let client = connection?.connectedClient else { return }
+        guard let message = heldPhotoMessage, !running, !sending, let client = connection?.connectedClient else { return }
         heldPhotoMessage = nil
         do {
             try await prompt(message, using: client)
@@ -338,7 +355,10 @@ final class ChatModel: Identifiable {
     func interrupt() async {
         guard running, hasQueuedSteer, let client = connection?.connectedClient else { return }
         sending = true
-        defer { sending = false }
+        defer {
+            sending = false
+            sendHeldPhotoMessageIfIdle()
+        }
         do {
             _ = try await reopening(client) { try await client.interrupt(sessionId) }
             dropSteers()
@@ -361,6 +381,11 @@ final class ChatModel: Identifiable {
 
     func cancel() async {
         guard let client = connection?.connectedClient else { return }
+        // Stopping the turn is no cue to start the next one: the held message goes back to the composer.
+        if heldPhotoMessage != nil {
+            cancelHeldPhotoMessage()
+            transcript.appendNotice("턴을 멈춰서 보내려던 사진 메시지를 입력창으로 돌려놓았습니다.")
+        }
         try? await client.cancel(sessionId)
     }
 

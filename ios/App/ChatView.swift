@@ -315,14 +315,18 @@ enum ImagePreparer {
         throw AttachmentError.tooLarge(name: name, limit: AttachmentLimits.maxImageBytes)
     }
 
-    /// The message's photos re-encoded to `AttachmentLimits.inlineImageTargets`; files and photos already small
-    /// enough are kept as they are.
-    static func fitInline(_ attachments: [PendingAttachment]) throws -> [PendingAttachment] {
+    /// The message's photos re-encoded to `AttachmentLimits.inlineImageTargets` within what `text` leaves of the
+    /// prompt limit; files and photos already small enough are kept as they are.
+    static func fitInline(_ attachments: [PendingAttachment], text: String) throws -> [PendingAttachment] {
         let photos = attachments.indices.filter {
             if case .image = attachments[$0].payload { return true }
             return false
         }
-        let targets = AttachmentLimits.inlineImageTargets(photos.map { attachments[$0].byteCount })
+        guard !photos.isEmpty else { return attachments }
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let budget = AttachmentLimits.inlineImageBudget(text: trimmed, images: photos.count, files: attachments.count - photos.count)
+        else { throw AttachmentError.textCrowdsOutPhotos }
+        let targets = AttachmentLimits.inlineImageTargets(photos.map { attachments[$0].byteCount }, budget: budget)
         var fitted = attachments
         for (index, target) in zip(photos, targets) {
             guard let target, case let .image(data, _) = attachments[index].payload else { continue }
@@ -339,20 +343,23 @@ enum ImagePreparer {
     /// Lowers the JPEG quality at the longest edge first and shrinks the edge only when the lowest quality still does
     /// not fit: the 2026-11-06 measurement read small text better that way than at a smaller edge and higher quality.
     private static func reencode(_ data: Data, name: String, within target: Int) throws -> Data {
-        guard let image = UIImage(data: data) else { throw AttachmentError.tooLarge(name: name, limit: 0) }
+        guard let image = UIImage(data: data) else { throw AttachmentError.photoCannotShrink(name: name) }
         var edge = min(CGFloat(AttachmentLimits.maxImageEdge), max(image.size.width, image.size.height))
         while edge >= 320 {
-            let resized = scaled(image, longestEdge: edge)
-            // The lowest quality first: when even it does not fit, this edge is skipped without trying the rest.
-            if let lowest = resized.jpegData(compressionQuality: 0.25), lowest.count <= target {
+            // Each edge's renders are released before the next one is drawn.
+            let fitted: Data? = autoreleasepool {
+                let resized = scaled(image, longestEdge: edge)
+                // The lowest quality first: when even it does not fit, this edge is skipped without trying the rest.
+                guard let lowest = resized.jpegData(compressionQuality: 0.25), lowest.count <= target else { return nil }
                 for quality in [0.8, 0.7, 0.6, 0.5, 0.4, 0.32] {
                     if let jpeg = resized.jpegData(compressionQuality: quality), jpeg.count <= target { return jpeg }
                 }
                 return lowest
             }
+            if let fitted { return fitted }
             edge = (edge * 0.85).rounded()
         }
-        throw AttachmentError.inlineImagesTooLarge(bytes: data.count, limit: target)
+        throw AttachmentError.photoCannotShrink(name: name)
     }
 
     private static func scaled(_ image: UIImage, longestEdge: CGFloat) -> UIImage {

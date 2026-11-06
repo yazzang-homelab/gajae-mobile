@@ -27,7 +27,7 @@ import kotlinx.coroutines.launch
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 
-/** A message with photos held on the phone until this phone's own turn ends (gjc's `turn.steer` takes text only). */
+/** A message with photos the phone holds until the running turn ends (gjc's `turn.steer` takes text only). */
 data class HeldPhotoMessage(val text: String, val attachments: List<PendingAttachment>)
 
 /** One chat: the folded transcript plus composer state. Mutated on the main dispatcher only. */
@@ -79,7 +79,7 @@ class ChatModel(
     /** Bumped on every open/close so an answer that arrives after the bubble closed is dropped. */
     private var btwEpoch = 0
     var attachments by mutableStateOf<List<PendingAttachment>>(emptyList())
-    /** Sent by the phone when the running turn ends; see [steer]. */
+    /** Sent by the phone once no turn runs; see [steer]. Kept in memory only. */
     var heldPhotoMessage by mutableStateOf<HeldPhotoMessage?>(null); private set
     var errorMessage by mutableStateOf<String?>(null)
     var isVisible = false
@@ -134,8 +134,7 @@ class ChatModel(
         transcript.apply(snapshot)
         permissions = snapshot.permissions
         publish()
-        // The turn may have ended while the phone was away.
-        if (heldPhotoMessage != null && !running) scope.launch { sendHeldPhotoMessage() }
+        sendHeldPhotoMessageIfIdle()
     }
 
     fun apply(update: SequencedUpdate) {
@@ -143,9 +142,11 @@ class ChatModel(
         if (update.update["sessionUpdate"].str == "x_gjcm_turn_end") {
             sentQueue = emptyList()
             hostQueue = hostQueue?.let { emptyList() }
-            if (heldPhotoMessage != null) scope.launch { sendHeldPhotoMessage() }
         }
         publish()
+        // `running` covers turns started anywhere (the bridge's own and the terminal's), so this catches the end of
+        // either; the bridge's -32003 holds the message again if another turn of this phone got in first.
+        sendHeldPhotoMessageIfIdle()
     }
 
     fun apply(status: SessionStatus) {
@@ -164,6 +165,9 @@ class ChatModel(
 
     fun leave() {
         isVisible = false
+        // Without the subscription the end of the turn would not arrive and the held message would wait for the
+        // chat to be opened again.
+        if (heldPhotoMessage != null) return
         val client = connection.connectedClient ?: return
         scope.launch { runCatching { client.closeSession(sessionId) } }
     }
@@ -184,13 +188,20 @@ class ChatModel(
     private suspend fun send() {
         val client = connection.connectedClient ?: return
         if (!canSend) return
+        val message = HeldPhotoMessage(draft, attachments)
         try {
-            prompt(HeldPhotoMessage(draft, attachments), client)
-            draft = ""
-            attachments = emptyList()
+            prompt(message, client)
+            clearSent(message)
         } catch (e: Exception) {
             show(e)
         }
+    }
+
+    /** Clears what was sent from the composer, keeping what was typed or attached while it was being sent. */
+    private fun clearSent(message: HeldPhotoMessage) {
+        if (draftState.trim() == message.text.trim()) draftState = ""
+        val sent = message.attachments.map { it.id }.toSet()
+        attachments = attachments.filter { it.id !in sent }
     }
 
     /** Sends text + attachments as a prompt, its photos re-encoded to fit gjc's inline budget together. */
@@ -198,7 +209,7 @@ class ChatModel(
         sending = true
         errorMessage = null
         try {
-            val fitted = fitInlinePhotos(message.attachments)
+            val fitted = fitInlinePhotos(message.attachments, message.text)
             val blocks = client.promptBlocks(message.text, fitted, sessionId) { f -> scope.launch { uploadProgress = f } }
             reopening(client) { client.prompt(sessionId, blocks) }
             transcript.markRunning()
@@ -215,7 +226,7 @@ class ChatModel(
      * Both take text only, so a message with photos goes in as a prompt instead. During a turn started in the
      * terminal gjc queues that prompt and delivers it, photos included, at the turn's next step (or as a turn of its
      * own once that turn ends). During this phone's own turn the bridge refuses a second prompt (-32003), so the
-     * message waits here and goes out when the turn ends; "턴이 끝나면 보내기" holds it here right away.
+     * message waits here and goes out once no turn runs; "턴이 끝나면 보내기" holds it here right away.
      */
     suspend fun steer(followUp: Boolean) {
         if (attachments.isNotEmpty()) {
@@ -255,8 +266,7 @@ class ChatModel(
         }
         try {
             prompt(message, client)
-            draft = ""
-            attachments = emptyList()
+            clearSent(message)
             transcript.appendNotice("사진 메시지를 진행 중인 턴에 넣었습니다. 턴의 다음 단계나 턴이 끝난 뒤 전달됩니다.")
             publish()
         } catch (e: BridgeException.Remote) {
@@ -268,14 +278,22 @@ class ChatModel(
 
     private fun hold(message: HeldPhotoMessage) {
         heldPhotoMessage = message
-        draft = ""
-        attachments = emptyList()
-        transcript.appendNotice("사진이 있는 메시지는 턴이 끝나면 보냅니다.")
+        clearSent(message)
+        transcript.appendNotice("사진이 있는 메시지는 이 폰이 들고 있다가 턴이 끝나면 보냅니다. 앱을 닫으면 보내지 않습니다.")
         publish()
+        // The turn may have ended while the message was on its way.
+        sendHeldPhotoMessageIfIdle()
+    }
+
+    /** Sends the held message once no turn runs and nothing else of this chat is in flight (a send, a 끼어들기). */
+    private fun sendHeldPhotoMessageIfIdle() {
+        if (heldPhotoMessage == null || running || sending || !connected) return
+        scope.launch { sendHeldPhotoMessage() }
     }
 
     private suspend fun sendHeldPhotoMessage() {
         val message = heldPhotoMessage ?: return
+        if (running || sending) return
         val client = connection.connectedClient ?: return
         heldPhotoMessage = null
         try {
@@ -335,6 +353,7 @@ class ChatModel(
             show(e)
         } finally {
             sending = false
+            sendHeldPhotoMessageIfIdle()
         }
     }
 
@@ -345,6 +364,12 @@ class ChatModel(
 
     suspend fun cancel() {
         val client = connection.connectedClient ?: return
+        // Stopping the turn is no cue to start the next one: the held message goes back to the composer.
+        if (heldPhotoMessage != null) {
+            cancelHeldPhotoMessage()
+            transcript.appendNotice("턴을 멈춰서 보내려던 사진 메시지를 입력창으로 돌려놓았습니다.")
+            publish()
+        }
         runCatching { client.cancel(sessionId) }
     }
 

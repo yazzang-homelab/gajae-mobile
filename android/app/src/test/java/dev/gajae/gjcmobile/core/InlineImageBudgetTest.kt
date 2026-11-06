@@ -1,8 +1,13 @@
 package dev.gajae.gjcmobile.core
 
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.put
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.util.Base64
 
 class InlineImageBudgetTest {
     @Test
@@ -27,5 +32,44 @@ class InlineImageBudgetTest {
         val targets = AttachmentLimits.inlineImageTargets(sizes, budget = 180_000)
         assertTrue(sizes.zip(targets).sumOf { (size, target) -> target ?: size } <= 180_000)
         assertEquals(listOf(null, null), listOf(targets[1], targets[2]))
+    }
+
+    @Test
+    fun aShortTextLeavesThePhotosTheFullBudget() {
+        assertEquals(AttachmentLimits.MAX_INLINE_IMAGE_BYTES, AttachmentLimits.inlineImageBudget("이거 봐", images = 3, files = 1))
+    }
+
+    @Test
+    fun theTextIsMeasuredAsTheBridgeMeasuresIt() {
+        // 가 is 3 bytes in UTF-8; a quote and a newline are escaped to 2; other control characters to \u00XX.
+        assertEquals(3 + 2 + 2 + 6 + 1 + 4, AttachmentLimits.jsonStringBytes("가\"\n\u0001a\uD83D\uDE00"))
+    }
+
+    /** Whatever the text, the blocks the bridge measures stay under its limit when the photos fill their budget. */
+    @Test
+    fun aLongTextShrinksThePhotoBudgetToFitTheBridgeLimit() {
+        for (text in listOf("a".repeat(60_000), "가".repeat(25_000), "\"\n".repeat(20_000))) {
+            for (images in 1..4) {
+                val budget = AttachmentLimits.inlineImageBudget(text, images, files = 0)!!
+                assertTrue(budget < AttachmentLimits.MAX_INLINE_IMAGE_BYTES)
+                val photos = AttachmentLimits.inlineImageTargets(List(images) { 1_000_000 }, budget)
+                val blocks = JsonArray(
+                    listOf(buildJsonObject { put("type", "text"); put("text", text) }) + photos.map { size ->
+                        buildJsonObject {
+                            put("type", "image"); put("mimeType", "image/jpeg")
+                            put("data", Base64.getEncoder().encodeToString(ByteArray(size!!) { -1 }))
+                        }
+                    },
+                )
+                val bytes = blocks.toString().toByteArray().size
+                assertTrue("${text.length} chars, $images photos: $bytes", bytes <= AttachmentLimits.PROMPT_BYTES_LIMIT)
+            }
+        }
+    }
+
+    @Test
+    fun aTextThatLeavesNoRoomRefusesThePhotos() {
+        val text = "a".repeat(255_000)
+        assertNull(AttachmentLimits.inlineImageBudget(text, images = 1, files = 0))
     }
 }

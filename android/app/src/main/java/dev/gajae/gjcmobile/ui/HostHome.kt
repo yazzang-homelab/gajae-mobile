@@ -66,7 +66,8 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import dev.gajae.gjcmobile.R
 import dev.gajae.gjcmobile.core.AttachmentLimits
-import dev.gajae.gjcmobile.core.InlineImagesTooLarge
+import dev.gajae.gjcmobile.core.PhotoCannotShrink
+import dev.gajae.gjcmobile.core.TextCrowdsOutPhotos
 import dev.gajae.gjcmobile.core.AttachmentTooLarge
 import dev.gajae.gjcmobile.core.PendingAttachment
 import kotlinx.coroutines.Dispatchers
@@ -367,11 +368,13 @@ private suspend fun loadImage(context: Context, uri: Uri): PendingAttachment = w
     throw AttachmentTooLarge(name, AttachmentLimits.MAX_IMAGE_BYTES)
 }
 
-/** The message's photos re-encoded to [AttachmentLimits.inlineImageTargets]; files and photos already small enough
- *  are kept as they are. */
-internal suspend fun fitInlinePhotos(attachments: List<PendingAttachment>): List<PendingAttachment> = withContext(Dispatchers.Default) {
+/** The message's photos re-encoded to [AttachmentLimits.inlineImageTargets] within what [text] leaves of the prompt
+ *  limit; files and photos already small enough are kept as they are. */
+internal suspend fun fitInlinePhotos(attachments: List<PendingAttachment>, text: String): List<PendingAttachment> = withContext(Dispatchers.Default) {
     val photos = attachments.indices.filter { attachments[it].isImage }
-    val targets = AttachmentLimits.inlineImageTargets(photos.map { attachments[it].data.size })
+    if (photos.isEmpty()) return@withContext attachments
+    val budget = AttachmentLimits.inlineImageBudget(text.trim(), photos.size, attachments.size - photos.size) ?: throw TextCrowdsOutPhotos()
+    val targets = AttachmentLimits.inlineImageTargets(photos.map { attachments[it].data.size }, budget)
     val fitted = attachments.toMutableList()
     for ((index, target) in photos.zip(targets)) {
         if (target == null) continue
@@ -385,7 +388,7 @@ internal suspend fun fitInlinePhotos(attachments: List<PendingAttachment>): List
  *  fit: the 2026-11-06 measurement read small text better that way than at a smaller edge and higher quality. */
 private fun reencode(attachment: PendingAttachment, target: Int): ByteArray {
     val bitmap = BitmapFactory.decodeByteArray(attachment.data, 0, attachment.data.size)
-        ?: throw InlineImagesTooLarge(attachment.data.size, target)
+        ?: throw PhotoCannotShrink(attachment.name)
     var edge = minOf(AttachmentLimits.MAX_IMAGE_EDGE, maxOf(bitmap.width, bitmap.height))
     while (edge >= 320) {
         val scale = edge.toFloat() / maxOf(bitmap.width, bitmap.height)
@@ -400,9 +403,10 @@ private fun reencode(attachment: PendingAttachment, target: Int): ByteArray {
             }
             return lowest
         }
+        if (resized !== bitmap) resized.recycle()
         edge = (edge * 0.85f).toInt()
     }
-    throw InlineImagesTooLarge(attachment.data.size, target)
+    throw PhotoCannotShrink(attachment.name)
 }
 
 private suspend fun loadFile(context: Context, uri: Uri): PendingAttachment = withContext(Dispatchers.IO) {

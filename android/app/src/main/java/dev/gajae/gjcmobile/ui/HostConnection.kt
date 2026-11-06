@@ -147,7 +147,8 @@ class HostConnection(
                 waitingKnown = true
             }
             refreshSessions()
-            chats.values.filter { it.isVisible }.forEach { it.open(client) }
+            // A chat holding a photo message stays subscribed after it is left (see ChatModel.leave).
+            chats.values.filter { it.isVisible || it.heldPhotoMessage != null }.forEach { it.open(client) }
         }
     }
 

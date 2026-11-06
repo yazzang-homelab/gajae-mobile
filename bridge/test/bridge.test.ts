@@ -196,6 +196,20 @@ describe("sessions over the bridge", () => {
 		expect((await client.waitFor(turnEnd(sid))).p.update.stopReason).toBe("cancelled");
 	});
 
+	test("a prompt over gjc's frame limit is refused in Korean before a turn starts", async () => {
+		const bridge = await useBridge();
+		const { client } = await bridge.pairedClient();
+		const sid = (await client.request("session.new", {})).sessionId;
+		const photo = { type: "image", mimeType: "image/jpeg", data: "A".repeat(256 * 1024) };
+		const refused = await client.request("session.prompt", { sessionId: sid, prompt: [{ type: "text", text: "봐" }, photo] }).catch(e => e);
+		expect(refused).toMatchObject({ code: -32602, data: { code: "prompt_too_large", limit: 256 * 1024 - 1024 } });
+		expect(refused.message).toContain("256KiB");
+		// Nothing started: the next prompt is a turn of its own, not refused as "already running".
+		const fits = { ...photo, data: "A".repeat(240_000) };
+		await client.request("session.prompt", { sessionId: sid, prompt: [{ type: "text", text: "봐" }, fits] });
+		expect((await client.waitFor(turnEnd(sid))).p.update.stopReason).toBe("end_turn");
+	});
+
 	test("session.open on a session not loaded in this process replays history via session/load", async () => {
 		const bridge = await useBridge();
 		const { client } = await bridge.pairedClient();

@@ -47,7 +47,8 @@ public final class URLSessionFrameTransport: FrameTransport, @unchecked Sendable
 
 public enum BridgeError: Error, Equatable, LocalizedError {
     case rejected(code: String, message: String)
-    case remote(code: Int, message: String)
+    /// A JSON-RPC error from the bridge; `reason` is its `data.code` (`host_turn`, `prompt_too_large`, ...) when sent.
+    case remote(code: Int, message: String, reason: String? = nil)
     case protocolViolation(String)
     case disconnected
     case noReachableEndpoint
@@ -60,7 +61,7 @@ public enum BridgeError: Error, Equatable, LocalizedError {
             case "pairing_invalid": return "페어링 코드가 만료됐거나 이미 사용됐습니다. 호스트에서 `gjcm-bridge pair`를 다시 실행하세요."
             default: return "\(message) (\(code))"
             }
-        case let .remote(_, message): return message
+        case let .remote(_, message, _): return message
         case let .protocolViolation(detail): return "브리지 프로토콜 오류: \(detail)"
         case .disconnected: return "호스트와 연결이 끊겼습니다."
         case .noReachableEndpoint: return "호스트에 연결할 수 없습니다. 같은 네트워크 또는 Tailscale에 연결돼 있는지 확인하세요."
@@ -186,7 +187,11 @@ public actor BridgeClient {
         if let id = message["id"]?.int {
             guard let continuation = pending.removeValue(forKey: id) else { return }
             if let error = message["e"] {
-                continuation.resume(throwing: BridgeError.remote(code: error["code"]?.int ?? -1, message: error["message"]?.string ?? "error"))
+                continuation.resume(throwing: BridgeError.remote(
+                    code: error["code"]?.int ?? -1,
+                    message: error["message"]?.string ?? "error",
+                    reason: error["data"]?["code"]?.string
+                ))
             } else {
                 continuation.resume(returning: message["r"] ?? .null)
             }

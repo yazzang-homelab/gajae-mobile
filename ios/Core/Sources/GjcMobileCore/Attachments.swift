@@ -61,15 +61,45 @@ public enum AttachmentLimits {
     public static let maxFileBytes = 25 * 1024 * 1024
     /// Longest image edge sent to the model.
     public static let maxImageEdge = 2048
+    /// Photos sent inline in one prompt, all together. gjc's ACP refuses a prompt whose SDK frame passes 256 KiB
+    /// (`MAX_PROMPT_FRAME_BYTES`, gjc 0.19.3) and photos travel there as base64 (4/3 their size): 180 KB of JPEG
+    /// is 234 KiB on the wire, leaving room for the text. Measured 2026-11-06 with claude-opus-5-5, gpt-5.6-sol and
+    /// claude-haiku-5-5: a phone screenshot or a menu photo re-encoded into 190 KB (or 47 KB, one of four) read
+    /// as well as the 2048px original; dense small print, such as a bus timetable shot from a step away, did not.
+    public static let inlineImageBudget = 180_000
+
+    /// The byte size each inline photo has to be re-encoded to so that together they fit `budget`, in the order
+    /// given; `nil` keeps that photo as it is. Photos under an even share keep their size and leave the rest of it
+    /// to the larger ones, which share what is left evenly.
+    public static func inlineImageTargets(_ sizes: [Int], budget: Int = inlineImageBudget) -> [Int?] {
+        guard sizes.reduce(0, +) > budget else { return sizes.map { _ in nil } }
+        var targets = [Int?](repeating: nil, count: sizes.count)
+        var remaining = budget
+        var left = sizes.count
+        for index in sizes.indices.sorted(by: { sizes[$0] < sizes[$1] }) {
+            let share = remaining / left
+            if sizes[index] > share {
+                targets[index] = share
+                remaining -= share
+            } else {
+                remaining -= sizes[index]
+            }
+            left -= 1
+        }
+        return targets
+    }
 }
 
 public enum AttachmentError: Error, Equatable, LocalizedError {
     case tooLarge(name: String, limit: Int)
+    case inlineImagesTooLarge(bytes: Int, limit: Int)
 
     public var errorDescription: String? {
         switch self {
         case let .tooLarge(name, limit):
             return "\(name): \(limit / 1024 / 1024)MB를 넘어 보낼 수 없습니다."
+        case let .inlineImagesTooLarge(bytes, limit):
+            return "사진이 모두 합쳐 \(bytes / 1000)KB라 한 번에 보낼 수 있는 \(limit / 1000)KB를 넘습니다. 사진 수를 줄이세요."
         }
     }
 }
@@ -107,6 +137,13 @@ public extension BridgeClient {
     /// `progress` reports the fraction of attachment bytes delivered so far (images count as sent immediately).
     func promptBlocks(text: String, attachments: [PendingAttachment], sessionId: String,
                       progress: (@Sendable (Double) -> Void)? = nil) async throws -> [PromptBlock] {
+        let inlineBytes = attachments.reduce(0) { sum, attachment in
+            if case let .image(data, _) = attachment.payload { return sum + data.count }
+            return sum
+        }
+        guard inlineBytes <= AttachmentLimits.inlineImageBudget else {
+            throw AttachmentError.inlineImagesTooLarge(bytes: inlineBytes, limit: AttachmentLimits.inlineImageBudget)
+        }
         let total = max(1, attachments.reduce(0) { $0 + $1.byteCount })
         var done = 0
         var blocks: [PromptBlock] = []

@@ -693,6 +693,13 @@ export class SessionHub {
 		if (!state?.loaded) throw new AcpError(-32002, "Session is not open; call session.open first");
 		if (state.running) throw new AcpError(-32003, "A turn is already running in this session");
 		if (!Array.isArray(params.prompt) || params.prompt.length === 0) throw new AcpError(-32602, "prompt must be a non-empty block array");
+		const promptBytes = Buffer.byteLength(JSON.stringify(params.prompt));
+		if (promptBytes > PROMPT_BYTES_LIMIT)
+			throw new AcpError(
+				-32602,
+				`메시지가 ${Math.ceil(promptBytes / 1024)}KiB라 gjc가 한 번에 받는 256KiB를 넘습니다. 사진 수를 줄이거나 앱을 업데이트하세요.`,
+				{ code: "prompt_too_large", bytes: promptBytes, limit: PROMPT_BYTES_LIMIT },
+			);
 		state.running = true;
 		state.turnBehindHost = state.hostRunning;
 		state.turnAttachmentText = params.prompt.some(block => (block as { type?: unknown } | null)?.type !== "text")
@@ -1063,6 +1070,13 @@ export const MODEL_ROLE_TARGETS = [
 ] as const;
 const CONFIG_FLUSH_TIMEOUT_MS = 5000;
 const INTERRUPT_SETTLE_TIMEOUT_MS = 10_000;
+/**
+ * gjc's ACP refuses a prompt whose SDK frame passes 256 KiB (`MAX_PROMPT_FRAME_BYTES`, gjc 0.19.3) with an English
+ * message the phone shows as is ("ACP prompt is 326 KiB, over the 256 KiB transport limit..."). The frame carries the
+ * same text and base64 images as the prompt blocks plus a ~200-byte envelope, so the blocks are held to that limit
+ * minus a margin and refused here, before a turn is started, in Korean.
+ */
+const PROMPT_BYTES_LIMIT = 256 * 1024 - 1024;
 const MODEL_SELECTOR = /^[\w.@-]+(\/[\w.@:+-]+)+$/;
 
 interface AgentConfig {

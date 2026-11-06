@@ -9,6 +9,12 @@ struct InfoSheet: Identifiable, Equatable {
     let topic: InfoTopic
 }
 
+/// A message with photos held on the phone until this phone's own turn ends (gjc's `turn.steer` takes text only).
+struct HeldPhotoMessage: Equatable {
+    let text: String
+    let attachments: [PendingAttachment]
+}
+
 /// A slash action that needs a yes before it runs (`/clear`, `/goal drop`, `/drop`, `/session delete`).
 struct PendingConfirmation: Identifiable, Equatable {
     let id = UUID()
@@ -50,6 +56,8 @@ final class ChatModel: Identifiable {
     private var hostQueueAt: TimeInterval = 0
     /// What waits on the running turn; `followUp` ones wait for the turn to end.
     var queued: [QueuedMessage] { QueuedMessages.merge(sent: sentQueue, host: hostQueue, now: hostQueueAt) }
+    /// Sent by the phone when the running turn ends; see `steer(followUp:)`.
+    private(set) var heldPhotoMessage: HeldPhotoMessage?
     var hasQueuedSteer: Bool { queued.contains { !$0.followUp } }
     var infoSheet: InfoSheet?
     var configPicker: ConfigTarget?
@@ -84,7 +92,6 @@ final class ChatModel: Identifiable {
     private var trimmedDraft: String { draft.trimmingCharacters(in: .whitespacesAndNewlines) }
     var canSend: Bool {
         guard !sending, connected else { return false }
-        if running { return !trimmedDraft.isEmpty && attachments.isEmpty }
         return !trimmedDraft.isEmpty || !attachments.isEmpty
     }
 
@@ -125,7 +132,7 @@ final class ChatModel: Identifiable {
     private func reopening<T>(_ client: BridgeClient, _ body: () async throws -> T) async throws -> T {
         do {
             return try await body()
-        } catch BridgeError.remote(code: -32002, _) {
+        } catch BridgeError.remote(code: -32002, _, _) {
             let snapshot = try await client.openSession(sessionId, cwd: cwd, afterSeq: transcript.lastSeq)
             apply(snapshot: snapshot)
             return try await body()
@@ -139,6 +146,8 @@ final class ChatModel: Identifiable {
     func apply(snapshot: OpenSnapshot) {
         transcript.apply(snapshot: snapshot)
         permissions = snapshot.permissions
+        // The turn may have ended while the phone was away.
+        if heldPhotoMessage != nil, !running { Task { await sendHeldPhotoMessage() } }
     }
 
     func apply(_ update: SequencedUpdate) {
@@ -147,6 +156,7 @@ final class ChatModel: Identifiable {
         case "x_gjcm_turn_end":
             sentQueue = []
             if hostQueue != nil { hostQueue = [] }
+            if heldPhotoMessage != nil { Task { await sendHeldPhotoMessage() } }
             Task { await refreshInsights() }
         case "plan":
             Task { await refreshTodos() }
@@ -212,20 +222,8 @@ final class ChatModel: Identifiable {
 
     private func send() async {
         guard canSend, let client = connection?.connectedClient else { return }
-        sending = true
-        errorMessage = nil
-        let text = draft
-        let files = attachments
-        defer {
-            sending = false
-            uploadProgress = nil
-        }
         do {
-            let blocks = try await client.promptBlocks(text: text, attachments: files, sessionId: sessionId) { fraction in
-                Task { @MainActor [weak self] in self?.uploadProgress = fraction }
-            }
-            try await reopening(client) { try await client.prompt(sessionId, blocks: blocks) }
-            transcript.markRunning()
+            try await prompt(HeldPhotoMessage(text: draft, attachments: attachments), using: client)
             draft = ""
             attachments = []
         } catch {
@@ -233,8 +231,34 @@ final class ChatModel: Identifiable {
         }
     }
 
+    /// Sends text + attachments as a prompt, its photos re-encoded to fit gjc's inline budget together.
+    private func prompt(_ message: HeldPhotoMessage, using client: BridgeClient) async throws {
+        sending = true
+        errorMessage = nil
+        defer {
+            sending = false
+            uploadProgress = nil
+        }
+        let files = message.attachments
+        let fitted = try await Task.detached(priority: .userInitiated) { try ImagePreparer.fitInline(files) }.value
+        let blocks = try await client.promptBlocks(text: message.text, attachments: fitted, sessionId: sessionId) { fraction in
+            Task { @MainActor [weak self] in self?.uploadProgress = fraction }
+        }
+        try await reopening(client) { try await client.prompt(sessionId, blocks: blocks) }
+        transcript.markRunning()
+    }
+
     /// `turn.steer` reaches the model at its next step; `turn.follow_up` waits for the turn to end.
+    ///
+    /// Both take text only, so a message with photos goes in as a prompt instead. During a turn started in the
+    /// terminal gjc queues that prompt and delivers it, photos included, at the turn's next step (or as a turn of its
+    /// own once that turn ends). During this phone's own turn the bridge refuses a second prompt (-32003), so the
+    /// message waits here and goes out when the turn ends; "턴이 끝나면 보내기" holds it here right away.
     func steer(followUp: Bool) async {
+        guard attachments.isEmpty else {
+            await sendPhotosDuringTurn(holdUntilTurnEnd: followUp)
+            return
+        }
         let text = trimmedDraft
         guard running, !text.isEmpty, let client = connection?.connectedClient else { return }
         sending = true
@@ -251,6 +275,65 @@ final class ChatModel: Identifiable {
         }
     }
 
+    private func sendPhotosDuringTurn(holdUntilTurnEnd: Bool) async {
+        guard running, let client = connection?.connectedClient else { return }
+        guard heldPhotoMessage == nil else {
+            errorMessage = "턴이 끝나면 보낼 사진 메시지가 이미 있습니다. 그 메시지가 나간 뒤 다시 보내세요."
+            return
+        }
+        let message = HeldPhotoMessage(text: trimmedDraft, attachments: attachments)
+        if holdUntilTurnEnd {
+            hold(message)
+            return
+        }
+        do {
+            try await prompt(message, using: client)
+            draft = ""
+            attachments = []
+            transcript.appendNotice("사진 메시지를 진행 중인 턴에 넣었습니다. 턴의 다음 단계나 턴이 끝난 뒤 전달됩니다.")
+        } catch BridgeError.remote(code: -32003, _, _) {
+            hold(message)
+        } catch {
+            show(error)
+        }
+    }
+
+    private func hold(_ message: HeldPhotoMessage) {
+        heldPhotoMessage = message
+        draft = ""
+        attachments = []
+        transcript.appendNotice("사진이 있는 메시지는 턴이 끝나면 보냅니다.")
+    }
+
+    private func sendHeldPhotoMessage() async {
+        guard let message = heldPhotoMessage, let client = connection?.connectedClient else { return }
+        heldPhotoMessage = nil
+        do {
+            try await prompt(message, using: client)
+        } catch BridgeError.remote(code: -32003, _, _) {
+            heldPhotoMessage = message // another turn of this phone started first; it goes out when that one ends
+        } catch {
+            restore(message)
+            show(error)
+        }
+    }
+
+    /// Puts the held message back into the composer instead of sending it.
+    func cancelHeldPhotoMessage() {
+        guard let message = heldPhotoMessage else { return }
+        heldPhotoMessage = nil
+        restore(message)
+    }
+
+    private func restore(_ message: HeldPhotoMessage) {
+        if trimmedDraft.isEmpty {
+            draft = message.text
+        } else if !message.text.isEmpty {
+            draft = message.text + "\n" + draft
+        }
+        attachments = message.attachments + attachments
+    }
+
     /// "끼어들기": the TUI's Esc with a steer waiting — stop the turn now and send the waiting steers.
     func interrupt() async {
         guard running, hasQueuedSteer, let client = connection?.connectedClient else { return }
@@ -260,9 +343,12 @@ final class ChatModel: Identifiable {
             _ = try await reopening(client) { try await client.interrupt(sessionId) }
             dropSteers()
             transcript.appendNotice("진행 중인 턴을 중단하고 대기 중인 지시를 바로 보냈습니다.")
-        } catch BridgeError.remote(code: -32005, _) {
+        } catch BridgeError.remote(code: -32005, _, _) {
             dropSteers()
             transcript.appendNotice("대기 중인 지시는 이미 모델에 전달됐습니다.")
+        } catch let BridgeError.remote(code: -32004, message, .some("host_turn")) {
+            // Not a failure: the turn keeps running and the waiting steers reach it at its next step.
+            transcript.appendNotice(message)
         } catch {
             show(error)
         }

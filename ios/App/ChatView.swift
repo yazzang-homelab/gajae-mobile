@@ -158,7 +158,6 @@ struct ChatView: View {
                 } label: {
                     Image(systemName: "plus.circle").font(.title3).padding(8)
                 }
-                .disabled(chat.running)
                 .accessibilityLabel("첨부와 명령")
                 TextField(chat.running ? "끼어들 지시 (진행 중인 턴에 전달)" : "gjc에게 지시 · / 명령", text: $chat.draft, axis: .vertical)
                     .lineLimit(1 ... 6)
@@ -194,6 +193,14 @@ struct ChatView: View {
                 Image(systemName: "text.badge.plus").foregroundStyle(Palette.strawGold)
                 Text("전달 대기 \(chat.queued.count)건: \(chat.queued.last?.text ?? "")").font(.caption).foregroundStyle(Palette.muted).lineLimit(1)
                 Spacer()
+            }
+        }
+        if let held = chat.heldPhotoMessage {
+            HStack(spacing: 6) {
+                Image(systemName: "photo.on.rectangle").foregroundStyle(Palette.strawGold)
+                Text("턴이 끝나면 보냄: 첨부 \(held.attachments.count)개 \(held.text)").font(.caption).foregroundStyle(Palette.muted).lineLimit(1)
+                Spacer()
+                Button("취소") { chat.cancelHeldPhotoMessage() }.font(.caption)
             }
         }
     }
@@ -294,26 +301,68 @@ extension View {
     }
 }
 
-/// Re-encodes photos as JPEG with the long edge capped, so they fit the inline image budget.
-@MainActor
+/// Re-encodes photos as JPEG with the long edge capped when picked, and again at send time so the photos of one
+/// message fit gjc's inline prompt budget together.
 enum ImagePreparer {
     static func attachment(from data: Data, name: String = "사진.jpg") throws -> PendingAttachment {
         guard let image = UIImage(data: data) else { throw AttachmentError.tooLarge(name: name, limit: 0) }
-        let maxEdge = CGFloat(AttachmentLimits.maxImageEdge)
-        let longest = max(image.size.width, image.size.height)
-        let scale = min(1, maxEdge / longest)
-        let size = CGSize(width: (image.size.width * scale).rounded(), height: (image.size.height * scale).rounded())
-        let format = UIGraphicsImageRendererFormat()
-        format.scale = 1
-        let resized = UIGraphicsImageRenderer(size: size, format: format).image { _ in
-            image.draw(in: CGRect(origin: .zero, size: size))
-        }
+        let resized = scaled(image, longestEdge: CGFloat(AttachmentLimits.maxImageEdge))
         for quality in [0.85, 0.7, 0.5] {
             if let jpeg = resized.jpegData(compressionQuality: quality), jpeg.count <= AttachmentLimits.maxImageBytes {
                 return PendingAttachment(name: name, payload: .image(jpeg, mimeType: "image/jpeg"))
             }
         }
         throw AttachmentError.tooLarge(name: name, limit: AttachmentLimits.maxImageBytes)
+    }
+
+    /// The message's photos re-encoded to `AttachmentLimits.inlineImageTargets`; files and photos already small
+    /// enough are kept as they are.
+    static func fitInline(_ attachments: [PendingAttachment]) throws -> [PendingAttachment] {
+        let photos = attachments.indices.filter {
+            if case .image = attachments[$0].payload { return true }
+            return false
+        }
+        let targets = AttachmentLimits.inlineImageTargets(photos.map { attachments[$0].byteCount })
+        var fitted = attachments
+        for (index, target) in zip(photos, targets) {
+            guard let target, case let .image(data, _) = attachments[index].payload else { continue }
+            let attachment = attachments[index]
+            fitted[index] = PendingAttachment(
+                id: attachment.id,
+                name: attachment.name,
+                payload: .image(try reencode(data, name: attachment.name, within: target), mimeType: "image/jpeg")
+            )
+        }
+        return fitted
+    }
+
+    /// Lowers the JPEG quality at the longest edge first and shrinks the edge only when the lowest quality still does
+    /// not fit: the 2026-11-06 measurement read small text better that way than at a smaller edge and higher quality.
+    private static func reencode(_ data: Data, name: String, within target: Int) throws -> Data {
+        guard let image = UIImage(data: data) else { throw AttachmentError.tooLarge(name: name, limit: 0) }
+        var edge = min(CGFloat(AttachmentLimits.maxImageEdge), max(image.size.width, image.size.height))
+        while edge >= 320 {
+            let resized = scaled(image, longestEdge: edge)
+            // The lowest quality first: when even it does not fit, this edge is skipped without trying the rest.
+            if let lowest = resized.jpegData(compressionQuality: 0.25), lowest.count <= target {
+                for quality in [0.8, 0.7, 0.6, 0.5, 0.4, 0.32] {
+                    if let jpeg = resized.jpegData(compressionQuality: quality), jpeg.count <= target { return jpeg }
+                }
+                return lowest
+            }
+            edge = (edge * 0.85).rounded()
+        }
+        throw AttachmentError.inlineImagesTooLarge(bytes: data.count, limit: target)
+    }
+
+    private static func scaled(_ image: UIImage, longestEdge: CGFloat) -> UIImage {
+        let scale = min(1, longestEdge / max(image.size.width, image.size.height))
+        let size = CGSize(width: (image.size.width * scale).rounded(), height: (image.size.height * scale).rounded())
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 1
+        return UIGraphicsImageRenderer(size: size, format: format).image { _ in
+            image.draw(in: CGRect(origin: .zero, size: size))
+        }
     }
 }
 

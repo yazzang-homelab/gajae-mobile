@@ -66,6 +66,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import dev.gajae.gjcmobile.R
 import dev.gajae.gjcmobile.core.AttachmentLimits
+import dev.gajae.gjcmobile.core.PhotoCannotShrink
 import dev.gajae.gjcmobile.core.AttachmentTooLarge
 import dev.gajae.gjcmobile.core.PendingAttachment
 import kotlinx.coroutines.Dispatchers
@@ -364,6 +365,47 @@ private suspend fun loadImage(context: Context, uri: Uri): PendingAttachment = w
         if (out.size() <= AttachmentLimits.MAX_IMAGE_BYTES) return@withContext PendingAttachment(name, out.toByteArray(), "image/jpeg", isImage = true)
     }
     throw AttachmentTooLarge(name, AttachmentLimits.MAX_IMAGE_BYTES)
+}
+
+/** The message's photos re-encoded to [AttachmentLimits.inlineImageTargets] within what [text] leaves of the prompt
+ *  limit; files and photos already small enough are kept as they are. */
+internal suspend fun fitInlinePhotos(attachments: List<PendingAttachment>, text: String): List<PendingAttachment> = withContext(Dispatchers.Default) {
+    val photos = attachments.indices.filter { attachments[it].isImage }
+    if (photos.isEmpty()) return@withContext attachments
+    val budget = AttachmentLimits.inlineImageBudget(text.trim(), photos.size, attachments.size - photos.size) ?: throw AttachmentLimits.noRoomError(photos.size, attachments.size - photos.size)
+    val targets = AttachmentLimits.inlineImageTargets(photos.map { attachments[it].data.size }, budget)
+    val fitted = attachments.toMutableList()
+    for ((index, target) in photos.zip(targets)) {
+        if (target == null) continue
+        val attachment = attachments[index]
+        fitted[index] = PendingAttachment(attachment.name, reencode(attachment, target), "image/jpeg", isImage = true, id = attachment.id)
+    }
+    fitted
+}
+
+/** Lowers the JPEG quality at the longest edge first and shrinks the edge only when the lowest quality still does not
+ *  fit: the 2026-11-06 measurement read small text better that way than at a smaller edge and higher quality. */
+private fun reencode(attachment: PendingAttachment, target: Int): ByteArray {
+    val bitmap = BitmapFactory.decodeByteArray(attachment.data, 0, attachment.data.size)
+        ?: throw PhotoCannotShrink(attachment.name)
+    var edge = minOf(AttachmentLimits.MAX_IMAGE_EDGE, maxOf(bitmap.width, bitmap.height))
+    while (edge >= 320) {
+        val scale = edge.toFloat() / maxOf(bitmap.width, bitmap.height)
+        val resized = if (scale < 1f) Bitmap.createScaledBitmap(bitmap, (bitmap.width * scale).toInt(), (bitmap.height * scale).toInt(), true) else bitmap
+        fun jpeg(quality: Int) = ByteArrayOutputStream().also { resized.compress(Bitmap.CompressFormat.JPEG, quality, it) }.toByteArray()
+        // The lowest quality first: when even it does not fit, this edge is skipped without trying the rest.
+        val lowest = jpeg(25)
+        if (lowest.size <= target) {
+            for (quality in listOf(80, 70, 60, 50, 40, 32)) {
+                val out = jpeg(quality)
+                if (out.size <= target) return out
+            }
+            return lowest
+        }
+        if (resized !== bitmap) resized.recycle()
+        edge = (edge * 0.85f).toInt()
+    }
+    throw PhotoCannotShrink(attachment.name)
 }
 
 private suspend fun loadFile(context: Context, uri: Uri): PendingAttachment = withContext(Dispatchers.IO) {

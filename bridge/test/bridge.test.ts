@@ -196,6 +196,21 @@ describe("sessions over the bridge", () => {
 		expect((await client.waitFor(turnEnd(sid))).p.update.stopReason).toBe("cancelled");
 	});
 
+	test("a prompt over gjc's frame limit is refused in Korean before a turn starts", async () => {
+		const bridge = await useBridge();
+		const { client } = await bridge.pairedClient();
+		const sid = (await client.request("session.new", {})).sessionId;
+		const photo = { type: "image", mimeType: "image/jpeg", data: "A".repeat(256 * 1024) };
+		const refused = await client.request("session.prompt", { sessionId: sid, prompt: [{ type: "text", text: "봐" }, photo] }).catch(e => e);
+		expect(refused).toMatchObject({ code: -32602, data: { code: "prompt_too_large", limit: 256 * 1024 - 1024 } });
+		expect(refused.message).toContain("256KiB");
+		expect(refused.message).toContain("글 1KiB");
+		// Nothing started: the next prompt is a turn of its own, not refused as "already running".
+		const fits = { ...photo, data: "A".repeat(240_000) };
+		await client.request("session.prompt", { sessionId: sid, prompt: [{ type: "text", text: "봐" }, fits] });
+		expect((await client.waitFor(turnEnd(sid))).p.update.stopReason).toBe("end_turn");
+	});
+
 	test("session.open on a session not loaded in this process replays history via session/load", async () => {
 		const bridge = await useBridge();
 		const { client } = await bridge.pairedClient();
@@ -498,6 +513,26 @@ describe("sessions over the bridge", () => {
 		expect((await client.request("sdk.query", { sessionId: sid, op: "queue.messages.list" })).items).toEqual([]);
 	});
 
+	test("a prompt sent while 끼어들기 restarts the turn is refused, so the waiting steers keep their turn", async () => {
+		const bridge = await useBridge();
+		const { client } = await bridge.pairedClient();
+		const sid = (await client.request("session.new", {})).sessionId;
+		await client.request("session.prompt", { sessionId: sid, prompt: [{ type: "text", text: "slow count" }] });
+		await client.waitFor(e => e.ev === "session.update" && e.p.update.sessionUpdate === "agent_message_chunk");
+		await client.request("sdk.control", { sessionId: sid, op: "turn.steer", input: { text: "이거 먼저" } });
+		const interrupted = client.request("session.interrupt", { sessionId: sid });
+		// The phone sends its held photo message the moment the cancelled turn ends.
+		await client.waitFor(turnEnd(sid));
+		const held = await client.request("session.prompt", { sessionId: sid, prompt: [{ type: "text", text: "사진 메시지" }] }).catch((e: any) => e);
+		expect(held.code).toBe(-32003);
+		expect((await interrupted).text).toBe("이거 먼저");
+		await client.waitFor(() => client.events.filter(turnEnd(sid)).length >= 2);
+		const users = client.events
+			.filter(e => e.ev === "session.update" && e.p.sessionId === sid && e.p.update.sessionUpdate === "user_message_chunk")
+			.map(e => e.p.update.content.text);
+		expect(users).toEqual(["slow count", "이거 먼저"]);
+	});
+
 	test("session.interrupt does not resend a steer gjc delivered itself before the cancel landed", async () => {
 		const bridge = await useBridge();
 		const { client } = await bridge.pairedClient();
@@ -541,6 +576,17 @@ describe("sessions over the bridge", () => {
 		expect(Date.now() - started).toBeLessThan(1000);
 		// The steer stays queued for gjc to deliver at the turn's next step.
 		expect((await client.request("sdk.query", { sessionId: sid, op: "queue.messages.list" })).items.map((m: any) => m.text)).toEqual(["대기 중"]);
+	});
+
+	test("a chat opened during a TUI turn is shown as running", async () => {
+		const bridge = await useBridge();
+		const { client } = await bridge.pairedClient();
+		const sid = (await client.request("session.new", {})).sessionId;
+		expect((await client.request("session.open", { sessionId: sid, afterSeq: 0 })).running).toBe(false);
+		await client.request("sdk.control", { sessionId: sid, op: "turn.steer", input: { text: "terminal turn" } });
+		await client.waitFor(e => e.ev === "session.status" && e.p.sessionId === sid && e.p.running);
+		const snap = await client.request("session.open", { sessionId: sid, afterSeq: 0 });
+		expect(snap.running).toBe(true);
 	});
 
 	test("session.interrupt leaves a phone prompt queued behind a TUI turn alone, photo included", async () => {

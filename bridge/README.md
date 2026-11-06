@@ -42,7 +42,7 @@ npm 패키지 `gjcm-bridge`이며 [Bun](https://bun.sh)으로만 실행됩니다
 
 `sdk.query`/`sdk.control`은 gjc `_gjc/sdk/query|control` 패스스루이며(단, `turn.btw`는 브리지가 세션 호스트에 맞는 연산으로 바꿔 보냅니다. 아래 [gjc 요구 사항](#gjc-요구-사항) 참고) `src/hub.ts`의 `SDK_QUERIES`/`SDK_CONTROLS` 허용 목록 밖의 op는 -32601로 거부합니다. `context.get` 응답의 `systemPrompt` 본문(~40KB)은 잘라내고 `systemPromptChars`만 보냅니다.
 
-오류 코드: -32002 모르는 세션, -32003 실행 중, -32020 SDK op 실패(gjc 메시지 또는 브리지 진단: `host_outdated` 등), -32601 허용 안 됨, -32010..-32014 업로드.
+오류 코드: -32002 모르는 세션, -32003 실행 중(끼어들기가 턴을 다시 시작하는 동안 들어온 프롬프트 포함), -32020 SDK op 실패(gjc 메시지 또는 브리지 진단: `host_outdated` 등), -32601 허용 안 됨, -32602 잘못된 요청(`prompt_too_large`: 메시지가 gjc 0.19.3의 프롬프트 한도 256KiB를 넘음. 앱은 1.0.3부터 사진을 합쳐 180KB 안으로, 글이 길면 그만큼 더 작게 다시 인코딩합니다), -32010..-32014 업로드.
 
 ## 세션 목록과 재개
 

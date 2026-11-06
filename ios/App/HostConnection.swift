@@ -151,7 +151,8 @@ final class HostConnection {
                 waitingKnown = true
             }
             await refreshSessions()
-            for chat in chats.values where chat.isVisible { await chat.open(using: client) }
+            // A chat holding a photo message stays subscribed after it is left (see ChatModel.leave).
+            for chat in chats.values where chat.isVisible || chat.heldPhotoMessage != nil { await chat.open(using: client) }
         }
     }
 

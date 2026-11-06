@@ -19,6 +19,7 @@ import dev.gajae.gjcmobile.core.SequencedUpdate
 import dev.gajae.gjcmobile.core.SessionStatus
 import dev.gajae.gjcmobile.core.SessionTranscript
 import dev.gajae.gjcmobile.core.TranscriptItem
+import dev.gajae.gjcmobile.core.bool
 import dev.gajae.gjcmobile.core.get
 import dev.gajae.gjcmobile.core.promptBlocks
 import dev.gajae.gjcmobile.core.str
@@ -90,6 +91,8 @@ class ChatModel(
     var heldPhotoMessage by mutableStateOf<HeldPhotoMessage?>(null); private set
     /** A turn ended while something else of this chat was in flight; the held message is tried once that settles. */
     private var heldWakePending = false
+    /** The held message is on its way (taken out of [heldPhotoMessage] until the bridge answers). */
+    private var heldInFlight = false
     var errorMessage by mutableStateOf<String?>(null)
     var isVisible = false
 
@@ -155,6 +158,11 @@ class ChatModel(
         publish()
         // `running` covers turns started anywhere (the bridge's own and the terminal's), so this catches the end of
         // either; the bridge's -32003 holds the message again if another turn of this phone got in first.
+        val kind = update.update["sessionUpdate"].str
+        if (heldInFlight && (kind == "x_gjcm_turn_end" || kind == "x_gjcm_agent_exit" || update.update["_meta"]["running"].bool == false)) {
+            // A turn end while the held message is on its way: if the bridge refuses it as busy, try again.
+            heldWakePending = true
+        }
         sendHeldPhotoMessageIfIdle()
     }
 
@@ -176,7 +184,7 @@ class ChatModel(
         isVisible = false
         // Without the subscription the end of the turn would not arrive and the held message would wait for the
         // chat to be opened again.
-        if (heldPhotoMessage != null) return
+        if (heldPhotoMessage != null || heldInFlight) return
         val client = connection.connectedClient ?: return
         scope.launch { runCatching { client.closeSession(sessionId) } }
     }
@@ -314,6 +322,7 @@ class ChatModel(
         }
         val client = connection.connectedClient ?: return
         heldPhotoMessage = null
+        heldInFlight = true
         try {
             prompt(message, client)
         } catch (e: BridgeException.Remote) {
@@ -330,6 +339,7 @@ class ChatModel(
             restore(message)
             show(e)
         } finally {
+            heldInFlight = false
             // A chat left with the message held kept its subscription for the turn end only (see [leave]).
             if (!isVisible) leave()
         }

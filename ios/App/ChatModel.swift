@@ -68,6 +68,8 @@ final class ChatModel: Identifiable {
     private(set) var heldPhotoMessage: HeldPhotoMessage?
     /// A turn ended while something else of this chat was in flight; the held message is tried once that settles.
     @ObservationIgnored private var heldWakePending = false
+    /// The held message is on its way (taken out of `heldPhotoMessage` until the bridge answers).
+    @ObservationIgnored private var heldInFlight = false
     var hasQueuedSteer: Bool { queued.contains { !$0.followUp } }
     var infoSheet: InfoSheet?
     var configPicker: ConfigTarget?
@@ -173,6 +175,11 @@ final class ChatModel: Identifiable {
         }
         // `running` covers turns started anywhere (the bridge's own and the terminal's), so this catches the end of
         // either; the bridge's -32003 holds the message again if another turn of this phone got in first.
+        let kind = update.update["sessionUpdate"]?.string
+        if heldInFlight, kind == "x_gjcm_turn_end" || kind == "x_gjcm_agent_exit" || update.update["_meta"]?["running"]?.bool == false {
+            // A turn end while the held message is on its way: if the bridge refuses it as busy, try again.
+            heldWakePending = true
+        }
         sendHeldPhotoMessageIfIdle()
     }
 
@@ -195,7 +202,7 @@ final class ChatModel: Identifiable {
         isVisible = false
         // Without the subscription the end of the turn would not arrive and the held message would wait for the
         // chat to be opened again.
-        guard heldPhotoMessage == nil, let client = connection?.connectedClient else { return }
+        guard heldPhotoMessage == nil, !heldInFlight, let client = connection?.connectedClient else { return }
         Task { try? await client.closeSession(sessionId) }
     }
 
@@ -344,8 +351,12 @@ final class ChatModel: Identifiable {
             return
         }
         heldPhotoMessage = nil
-        // A chat left with the message held kept its subscription for the turn end only (see `leave`).
-        defer { if !isVisible { leave() } }
+        heldInFlight = true
+        defer {
+            heldInFlight = false
+            // A chat left with the message held kept its subscription for the turn end only (see `leave`).
+            if !isVisible { leave() }
+        }
         do {
             try await prompt(message, using: client)
         } catch BridgeError.remote(code: -32003, _, _) {

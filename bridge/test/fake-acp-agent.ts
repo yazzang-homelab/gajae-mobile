@@ -34,6 +34,15 @@ const cancellable = new Map<string, () => void>();
 // them here, so the bridge's clean-up path is exercised.
 const steers = new Map<string, { id: string; text: string; mode: "steer"; label: "Steer" }[]>();
 let nextSteer = 1;
+// Sessions with a turn typed in the TUI ("terminal turn" … "terminal done"), which no ACP prompt owns.
+const terminalTurns = new Set<string>();
+// ACP prompts that arrived during a terminal turn. Like gjc 0.19.3 (measured 2026-11-06 on pve3): such a prompt waits
+// in the session queue, listed by queue.messages.list as a steer, and reaches the model at the turn's next step.
+// gjc echoes its blocks as soon as it receives the prompt (not when the model takes it) and reports no
+// `running: false` until the prompt settles.
+// session/cancel does not stop the terminal turn; it purges the queued prompt, which then fails as
+// "Prompt submission failed." ("Queued prompt was removed before consumption" in gjc's log).
+const queuedPrompts = new Map<string, { steerId: string; blocks: any[]; settle: (outcome: "consumed" | "removed") => void }>();
 // gjc's SDK permission policy; every ACP attachment (session/new, session/load) resets it to prompt.
 const permissionModes = new Map<string, string>();
 
@@ -112,6 +121,17 @@ async function handle(msg: any) {
 		case "session/prompt": {
 			const sid = params.sessionId;
 			const texts = params.prompt.filter((b: any) => b.type === "text").map((b: any) => b.text);
+			if (terminalTurns.has(sid)) {
+				const steerId = `steer:${nextSteer++}`;
+				steers.set(sid, [...(steers.get(sid) ?? []), { id: steerId, text: texts.join("\n"), mode: "steer", label: "Steer" }]);
+				for (const block of params.prompt) update(sid, { sessionUpdate: "user_message_chunk", content: block });
+				const outcome = await new Promise<"consumed" | "removed">(settle => queuedPrompts.set(sid, { steerId, blocks: params.prompt, settle }));
+				if (outcome === "removed") return write({ jsonrpc: "2.0", id, error: { code: -32603, message: "Prompt submission failed." } });
+				update(sid, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: `받은 블록: ${params.prompt.map((b: any) => b.type).join(",")}` } });
+				reply({ stopReason: "end_turn" });
+				update(sid, { sessionUpdate: "session_info_update", _meta: { gjcPhase: "idle", running: false } });
+				return;
+			}
 			sessions.get(sid)?.push(texts.join("\n"));
 			persist();
 			saveTranscript(sid, sessionCwds.get(sid) ?? "/tmp");
@@ -157,6 +177,12 @@ async function handle(msg: any) {
 			for (const s of queued.filter(s => s.text.startsWith("boundary")))
 				update(params.sessionId, { sessionUpdate: "user_message_chunk", content: { type: "text", text: s.text } });
 			steers.set(params.sessionId, queued.filter(s => !s.text.startsWith("boundary")));
+			const waiting = queuedPrompts.get(params.sessionId);
+			if (waiting) {
+				queuedPrompts.delete(params.sessionId);
+				steers.set(params.sessionId, (steers.get(params.sessionId) ?? []).filter(s => s.id !== waiting.steerId));
+				waiting.settle("removed");
+			}
 			cancellable.get(params.sessionId)?.();
 			cancellable.delete(params.sessionId);
 			return;
@@ -213,11 +239,22 @@ async function handle(msg: any) {
 				const text = String(params.input?.text ?? "");
 				// "terminal turn" stands for a turn typed in the TUI: gjc reports it working, but no ACP prompt owns it.
 				if (text === "terminal turn") {
+					terminalTurns.add(params.sessionId);
 					update(params.sessionId, { sessionUpdate: "session_info_update", _meta: { gjcPhase: "working", running: true } });
 					return reply({ accepted: true });
 				}
 				// "terminal done" ends that TUI turn.
 				if (text === "terminal done") {
+					terminalTurns.delete(params.sessionId);
+					// A prompt queued behind the terminal turn reaches the model inside it, images included; the prompt
+					// settles with that turn and only then does gjc report idle.
+					const waiting = queuedPrompts.get(params.sessionId);
+					if (waiting) {
+						queuedPrompts.delete(params.sessionId);
+						steers.set(params.sessionId, (steers.get(params.sessionId) ?? []).filter(s => s.id !== waiting.steerId));
+						waiting.settle("consumed");
+						return reply({ accepted: true });
+					}
 					update(params.sessionId, { sessionUpdate: "session_info_update", _meta: { gjcPhase: "idle", running: false } });
 					return reply({ accepted: true });
 				}

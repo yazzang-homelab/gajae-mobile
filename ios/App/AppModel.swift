@@ -55,7 +55,7 @@ final class AppModel {
                 host.preferredCwd = hosts.first { $0.hostId == offer.hostId }?.preferredCwd
                 if let info = try? await client.hostInfo() { host.name = info.hostName }
                 update(host: host)
-                connection(for: host).adopt(client: client, endpoint: endpoint)
+                connection(for: host).adopt(client: client, endpoint: endpoint, host: host)
                 return host
             } catch let error as BridgeError {
                 // A rejected pairing will not succeed on another endpoint either.

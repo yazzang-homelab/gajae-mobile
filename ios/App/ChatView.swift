@@ -325,7 +325,7 @@ enum ImagePreparer {
         guard !photos.isEmpty else { return attachments }
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let budget = AttachmentLimits.inlineImageBudget(text: trimmed, images: photos.count, files: attachments.count - photos.count)
-        else { throw AttachmentError.textCrowdsOutPhotos }
+        else { throw AttachmentLimits.noRoomError(images: photos.count, files: attachments.count - photos.count) }
         let targets = AttachmentLimits.inlineImageTargets(photos.map { attachments[$0].byteCount }, budget: budget)
         var fitted = attachments
         for (index, target) in zip(photos, targets) {

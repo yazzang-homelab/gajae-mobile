@@ -76,10 +76,16 @@ public enum AttachmentLimits {
     /// What the photos of one message may take together next to its text: `maxInlineImageBytes`, less what a long
     /// text takes of `promptBytesLimit`. `nil` when the text leaves too little room for `images` photos.
     public static func inlineImageBudget(text: String, images: Int, files: Int) -> Int? {
-        // JSON of the blocks: the text escaped, ~60 bytes of block and array per photo, a stored path per file.
-        let room = promptBytesLimit - jsonStringBytes(text) - 64 - images * 64 - files * 512
+        // JSON of the blocks: the text escaped, ~60 bytes of block and array per photo, a stored path per file
+        // (percent-encoded, so a Korean file name takes three times its length).
+        let room = promptBytesLimit - jsonStringBytes(text) - 64 - images * 64 - files * 2048
         let budget = min(maxInlineImageBytes, room / 4 * 3)
         return budget >= images * minInlineImageBytes ? budget : nil
+    }
+
+    /// Why `inlineImageBudget` gave no room: the photos alone are too many, or the text crowds them out.
+    public static func noRoomError(images: Int, files: Int) -> AttachmentError {
+        inlineImageBudget(text: "", images: images, files: files) == nil ? .tooManyPhotos : .textCrowdsOutPhotos
     }
 
     /// The UTF-8 length of `text` as a JSON string body, the way the bridge measures it.
@@ -120,6 +126,8 @@ public enum AttachmentError: Error, Equatable, LocalizedError {
     case inlineImagesTooLarge(bytes: Int, limit: Int)
     /// The text leaves too little of gjc's prompt limit for the photos sent with it.
     case textCrowdsOutPhotos
+    /// More photos than fit one prompt at a readable size, whatever the text.
+    case tooManyPhotos
     /// A photo that could not be decoded, or not re-encoded small enough even at the smallest edge.
     case photoCannotShrink(name: String)
 
@@ -131,6 +139,8 @@ public enum AttachmentError: Error, Equatable, LocalizedError {
             return "사진이 모두 합쳐 \(bytes / 1000)KB라 한 번에 보낼 수 있는 \(limit / 1000)KB를 넘습니다. 사진 수를 줄이세요."
         case .textCrowdsOutPhotos:
             return "글이 길어 사진을 함께 보낼 수 없습니다. 글을 줄이거나 사진을 따로 보내세요."
+        case .tooManyPhotos:
+            return "사진이 많아 한 번에 보낼 수 없습니다. 사진 수를 줄이세요."
         case let .photoCannotShrink(name):
             return "\(name): 한 번에 보낼 수 있는 크기로 줄이지 못했습니다. 사진 수를 줄이세요."
         }
@@ -177,7 +187,7 @@ public extension BridgeClient {
         }
         if !images.isEmpty {
             guard let budget = AttachmentLimits.inlineImageBudget(text: trimmed, images: images.count, files: attachments.count - images.count)
-            else { throw AttachmentError.textCrowdsOutPhotos }
+            else { throw AttachmentLimits.noRoomError(images: images.count, files: attachments.count - images.count) }
             let inlineBytes = images.reduce(0, +)
             guard inlineBytes <= budget else { throw AttachmentError.inlineImagesTooLarge(bytes: inlineBytes, limit: budget) }
         }

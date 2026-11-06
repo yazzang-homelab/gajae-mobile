@@ -578,6 +578,17 @@ describe("sessions over the bridge", () => {
 		expect((await client.request("sdk.query", { sessionId: sid, op: "queue.messages.list" })).items.map((m: any) => m.text)).toEqual(["대기 중"]);
 	});
 
+	test("a chat opened during a TUI turn is shown as running", async () => {
+		const bridge = await useBridge();
+		const { client } = await bridge.pairedClient();
+		const sid = (await client.request("session.new", {})).sessionId;
+		expect((await client.request("session.open", { sessionId: sid, afterSeq: 0 })).running).toBe(false);
+		await client.request("sdk.control", { sessionId: sid, op: "turn.steer", input: { text: "terminal turn" } });
+		await client.waitFor(e => e.ev === "session.status" && e.p.sessionId === sid && e.p.running);
+		const snap = await client.request("session.open", { sessionId: sid, afterSeq: 0 });
+		expect(snap.running).toBe(true);
+	});
+
 	test("session.interrupt leaves a phone prompt queued behind a TUI turn alone, photo included", async () => {
 		// Measured 2026-11-06 on pve3 with gjc 0.19.3: a photo+text sent while a TUI turn ran waited in gjc's queue as a
 		// steer; 끼어들기's cancel left the TUI turn running but purged that prompt ("Prompt submission failed."), and

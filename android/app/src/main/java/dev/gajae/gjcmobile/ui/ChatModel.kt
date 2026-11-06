@@ -47,7 +47,14 @@ class ChatModel(
     private var transcriptTitle by mutableStateOf<String?>(null)
     var permissions by mutableStateOf<List<PermissionRequest>>(emptyList()); private set
     var loading by mutableStateOf(false); private set
-    var sending by mutableStateOf(false); private set
+    /** A send, steer, 끼어들기 or control in flight. Turning false re-checks a held photo message a turn end skipped. */
+    private var sendingState by mutableStateOf(false)
+    var sending: Boolean
+        get() = sendingState
+        private set(value) {
+            sendingState = value
+            if (!value && heldWakePending) sendHeldPhotoMessageIfIdle()
+        }
     var uploadProgress by mutableStateOf<Double?>(null); private set
     /** Steers and follow-ups this phone sent during the current turn. */
     private var sentQueue by mutableStateOf<List<QueuedMessage>>(emptyList())
@@ -81,6 +88,8 @@ class ChatModel(
     var attachments by mutableStateOf<List<PendingAttachment>>(emptyList())
     /** Sent by the phone once no turn runs; see [steer]. Kept in memory only. */
     var heldPhotoMessage by mutableStateOf<HeldPhotoMessage?>(null); private set
+    /** A turn ended while something else of this chat was in flight; the held message is tried once that settles. */
+    private var heldWakePending = false
     var errorMessage by mutableStateOf<String?>(null)
     var isVisible = false
 
@@ -287,20 +296,32 @@ class ChatModel(
 
     /** Sends the held message once no turn runs and nothing else of this chat is in flight (a send, a 끼어들기). */
     private fun sendHeldPhotoMessageIfIdle() {
-        if (heldPhotoMessage == null || running || sending || !connected) return
+        if (heldPhotoMessage == null || running || !connected) return
+        if (sending) {
+            heldWakePending = true
+            return
+        }
+        heldWakePending = false
         scope.launch { sendHeldPhotoMessage() }
     }
 
     private suspend fun sendHeldPhotoMessage() {
         val message = heldPhotoMessage ?: return
-        if (running || sending) return
+        if (running) return
+        if (sending) {
+            heldWakePending = true
+            return
+        }
         val client = connection.connectedClient ?: return
         heldPhotoMessage = null
         try {
             prompt(message, client)
         } catch (e: BridgeException.Remote) {
             if (e.code == -32003) {
-                heldPhotoMessage = message // another turn of this phone started first; it goes out when that one ends
+                // Another turn of this phone started first; it goes out when that one ends. Tried again right away
+                // only when a turn end arrived while this one was in flight, so a busy bridge is not retried in a loop.
+                heldPhotoMessage = message
+                if (heldWakePending) sendHeldPhotoMessageIfIdle()
             } else {
                 restore(message)
                 show(e)
@@ -308,6 +329,9 @@ class ChatModel(
         } catch (e: Exception) {
             restore(message)
             show(e)
+        } finally {
+            // A chat left with the message held kept its subscription for the turn end only (see [leave]).
+            if (!isVisible) leave()
         }
     }
 
@@ -353,7 +377,6 @@ class ChatModel(
             show(e)
         } finally {
             sending = false
-            sendHeldPhotoMessageIfIdle()
         }
     }
 

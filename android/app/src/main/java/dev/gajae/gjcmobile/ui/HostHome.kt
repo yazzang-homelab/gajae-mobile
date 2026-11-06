@@ -67,7 +67,6 @@ import androidx.compose.ui.unit.dp
 import dev.gajae.gjcmobile.R
 import dev.gajae.gjcmobile.core.AttachmentLimits
 import dev.gajae.gjcmobile.core.PhotoCannotShrink
-import dev.gajae.gjcmobile.core.TextCrowdsOutPhotos
 import dev.gajae.gjcmobile.core.AttachmentTooLarge
 import dev.gajae.gjcmobile.core.PendingAttachment
 import kotlinx.coroutines.Dispatchers
@@ -373,7 +372,7 @@ private suspend fun loadImage(context: Context, uri: Uri): PendingAttachment = w
 internal suspend fun fitInlinePhotos(attachments: List<PendingAttachment>, text: String): List<PendingAttachment> = withContext(Dispatchers.Default) {
     val photos = attachments.indices.filter { attachments[it].isImage }
     if (photos.isEmpty()) return@withContext attachments
-    val budget = AttachmentLimits.inlineImageBudget(text.trim(), photos.size, attachments.size - photos.size) ?: throw TextCrowdsOutPhotos()
+    val budget = AttachmentLimits.inlineImageBudget(text.trim(), photos.size, attachments.size - photos.size) ?: throw AttachmentLimits.noRoomError(photos.size, attachments.size - photos.size)
     val targets = AttachmentLimits.inlineImageTargets(photos.map { attachments[it].data.size }, budget)
     val fitted = attachments.toMutableList()
     for ((index, target) in photos.zip(targets)) {

@@ -33,7 +33,15 @@ final class ChatModel: Identifiable {
     private(set) var permissions: [PermissionRequest] = []
     private(set) var loading = false
     private(set) var loadStartedAt: Date?
-    private(set) var sending = false
+    /// A send, steer, 끼어들기 or control in flight. Turning false re-checks a held photo message a turn end skipped.
+    private(set) var sending: Bool {
+        get { sendingState }
+        set {
+            sendingState = newValue
+            if !newValue, heldWakePending { sendHeldPhotoMessageIfIdle() }
+        }
+    }
+    private var sendingState = false
     private(set) var uploadProgress: Double?
     var draft = ""
     var attachments: [PendingAttachment] = []
@@ -58,6 +66,8 @@ final class ChatModel: Identifiable {
     var queued: [QueuedMessage] { QueuedMessages.merge(sent: sentQueue, host: hostQueue, now: hostQueueAt) }
     /// Sent by the phone once no turn runs; see `steer(followUp:)`. Kept in memory only.
     private(set) var heldPhotoMessage: HeldPhotoMessage?
+    /// A turn ended while something else of this chat was in flight; the held message is tried once that settles.
+    @ObservationIgnored private var heldWakePending = false
     var hasQueuedSteer: Bool { queued.contains { !$0.followUp } }
     var infoSheet: InfoSheet?
     var configPicker: ConfigTarget?
@@ -318,17 +328,31 @@ final class ChatModel: Identifiable {
 
     /// Sends the held message once no turn runs and nothing else of this chat is in flight (a send, a 끼어들기).
     private func sendHeldPhotoMessageIfIdle() {
-        guard heldPhotoMessage != nil, !running, !sending, connected else { return }
+        guard heldPhotoMessage != nil, !running, connected else { return }
+        guard !sending else {
+            heldWakePending = true
+            return
+        }
+        heldWakePending = false
         Task { await sendHeldPhotoMessage() }
     }
 
     private func sendHeldPhotoMessage() async {
-        guard let message = heldPhotoMessage, !running, !sending, let client = connection?.connectedClient else { return }
+        guard let message = heldPhotoMessage, !running, let client = connection?.connectedClient else { return }
+        guard !sending else {
+            heldWakePending = true
+            return
+        }
         heldPhotoMessage = nil
+        // A chat left with the message held kept its subscription for the turn end only (see `leave`).
+        defer { if !isVisible { leave() } }
         do {
             try await prompt(message, using: client)
         } catch BridgeError.remote(code: -32003, _, _) {
-            heldPhotoMessage = message // another turn of this phone started first; it goes out when that one ends
+            // Another turn of this phone started first; it goes out when that one ends. Tried again right away only
+            // when a turn end arrived while this one was in flight, so a busy bridge is not retried in a loop.
+            heldPhotoMessage = message
+            if heldWakePending { sendHeldPhotoMessageIfIdle() }
         } catch {
             restore(message)
             show(error)
@@ -355,10 +379,7 @@ final class ChatModel: Identifiable {
     func interrupt() async {
         guard running, hasQueuedSteer, let client = connection?.connectedClient else { return }
         sending = true
-        defer {
-            sending = false
-            sendHeldPhotoMessageIfIdle()
-        }
+        defer { sending = false }
         do {
             _ = try await reopening(client) { try await client.interrupt(sessionId) }
             dropSteers()

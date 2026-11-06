@@ -649,7 +649,9 @@ export class SessionHub {
 			sessionId: state.sessionId,
 			cwd: state.cwd,
 			configOptions: state.configOptions,
-			running: state.running,
+			// A turn started in the terminal counts too, as it does in the live `_meta.running` and session.status:
+			// a phone opening the chat then steers it, and a photo message it holds waits for that turn's end.
+			running: isActive(state),
 			seq: state.seq,
 			reset,
 			updates: reset ? state.buffer.slice() : state.buffer.filter(u => u.seq > afterSeq),

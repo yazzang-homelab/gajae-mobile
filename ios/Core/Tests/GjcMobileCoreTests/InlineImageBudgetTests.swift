@@ -64,6 +64,13 @@ final class InlineImageBudgetTests: XCTestCase {
         }
     }
 
+    func testTooManyPhotosAreToldApartFromATooLongText() {
+        // 18 photos of 10 KB fill the 180 KB budget; a 19th leaves each too little to stay readable.
+        XCTAssertNotNil(AttachmentLimits.inlineImageBudget(text: "", images: 18, files: 0))
+        XCTAssertEqual(AttachmentLimits.noRoomError(images: 19, files: 0), .tooManyPhotos)
+        XCTAssertEqual(AttachmentLimits.noRoomError(images: 1, files: 0), .textCrowdsOutPhotos)
+    }
+
     func testATextThatLeavesNoRoomRefusesThePhotos() async throws {
         let text = String(repeating: "a", count: 255_000)
         XCTAssertNil(AttachmentLimits.inlineImageBudget(text: text, images: 1, files: 0))

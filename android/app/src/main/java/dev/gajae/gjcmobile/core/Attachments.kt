@@ -32,11 +32,16 @@ object AttachmentLimits {
      * text takes of [PROMPT_BYTES_LIMIT]. `null` when the text leaves too little room for [images] photos.
      */
     fun inlineImageBudget(text: String, images: Int, files: Int): Int? {
-        // JSON of the blocks: the text escaped, ~60 bytes of block and array per photo, a stored path per file.
-        val room = PROMPT_BYTES_LIMIT - jsonStringBytes(text) - 64 - images * 64 - files * 512
+        // JSON of the blocks: the text escaped, ~60 bytes of block and array per photo, a stored path per file
+        // (percent-encoded, so a Korean file name takes three times its length).
+        val room = PROMPT_BYTES_LIMIT - jsonStringBytes(text) - 64 - images * 64 - files * 2048
         val budget = minOf(MAX_INLINE_IMAGE_BYTES, room / 4 * 3)
         return if (budget >= images * MIN_INLINE_IMAGE_BYTES) budget else null
     }
+
+    /** Why [inlineImageBudget] gave no room: the photos alone are too many, or the text crowds them out. */
+    fun noRoomError(images: Int, files: Int): Exception =
+        if (inlineImageBudget("", images, files) == null) TooManyPhotos() else TextCrowdsOutPhotos()
 
     /** The UTF-8 length of [text] as a JSON string body, the way the bridge measures it. */
     internal fun jsonStringBytes(text: String): Int {
@@ -89,6 +94,9 @@ class InlineImagesTooLarge(val bytes: Int, val limit: Int) :
 /** The text leaves too little of gjc's prompt limit for the photos sent with it. */
 class TextCrowdsOutPhotos : Exception("글이 길어 사진을 함께 보낼 수 없습니다. 글을 줄이거나 사진을 따로 보내세요.")
 
+/** More photos than fit one prompt at a readable size, whatever the text. */
+class TooManyPhotos : Exception("사진이 많아 한 번에 보낼 수 없습니다. 사진 수를 줄이세요.")
+
 /** A photo that could not be decoded, or not re-encoded small enough even at the smallest edge. */
 class PhotoCannotShrink(name: String) : Exception("$name: 한 번에 보낼 수 있는 크기로 줄이지 못했습니다. 사진 수를 줄이세요.")
 
@@ -139,7 +147,7 @@ suspend fun BridgeClient.upload(data: ByteArray, name: String, mimeType: String,
 suspend fun BridgeClient.promptBlocks(text: String, attachments: List<PendingAttachment>, sessionId: String, progress: (Double) -> Unit = {}): List<JsonElement> {
     val images = attachments.filter { it.isImage }
     if (images.isNotEmpty()) {
-        val budget = AttachmentLimits.inlineImageBudget(text.trim(), images.size, attachments.size - images.size) ?: throw TextCrowdsOutPhotos()
+        val budget = AttachmentLimits.inlineImageBudget(text.trim(), images.size, attachments.size - images.size) ?: throw AttachmentLimits.noRoomError(images.size, attachments.size - images.size)
         val inlineBytes = images.sumOf { it.data.size }
         if (inlineBytes > budget) throw InlineImagesTooLarge(inlineBytes, budget)
     }

@@ -68,6 +68,14 @@ class InlineImageBudgetTest {
     }
 
     @Test
+    fun tooManyPhotosAreToldApartFromATooLongText() {
+        // 18 photos of 10 KB fill the 180 KB budget; a 19th leaves each too little to stay readable.
+        assertTrue(AttachmentLimits.inlineImageBudget("", images = 18, files = 0) != null)
+        assertTrue(AttachmentLimits.noRoomError(images = 19, files = 0) is TooManyPhotos)
+        assertTrue(AttachmentLimits.noRoomError(images = 1, files = 0) is TextCrowdsOutPhotos)
+    }
+
+    @Test
     fun aTextThatLeavesNoRoomRefusesThePhotos() {
         val text = "a".repeat(255_000)
         assertNull(AttachmentLimits.inlineImageBudget(text, images = 1, files = 0))

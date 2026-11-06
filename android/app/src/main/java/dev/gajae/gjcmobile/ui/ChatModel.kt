@@ -323,6 +323,7 @@ class ChatModel(
         val client = connection.connectedClient ?: return
         heldPhotoMessage = null
         heldInFlight = true
+        var retry = false
         try {
             prompt(message, client)
         } catch (e: BridgeException.Remote) {
@@ -330,7 +331,7 @@ class ChatModel(
                 // Another turn of this phone started first; it goes out when that one ends. Tried again right away
                 // only when a turn end arrived while this one was in flight, so a busy bridge is not retried in a loop.
                 heldPhotoMessage = message
-                if (heldWakePending) sendHeldPhotoMessageIfIdle()
+                retry = heldWakePending
             } else {
                 restore(message)
                 show(e)
@@ -343,6 +344,8 @@ class ChatModel(
             // A chat left with the message held kept its subscription for the turn end only (see [leave]).
             if (!isVisible) leave()
         }
+        // After the finally: on Main.immediate the retry runs at once, and the finally above must not clear its flag.
+        if (retry) sendHeldPhotoMessageIfIdle()
     }
 
     /** Puts the held message back into the composer instead of sending it. */

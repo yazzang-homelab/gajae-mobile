@@ -84,23 +84,37 @@ final class HostConnection {
         status = .idle
     }
 
-    /// Takes over a client that was just created by pairing.
-    func adopt(client: BridgeClient, endpoint: String) {
+    /// Takes over a client that was just created by pairing, together with the host record that pairing produced.
+    /// Re-pairing a known host may bring new endpoints, a new name or a new key, so the old record (and any retry
+    /// loop still dialing it) must not outlive the pairing.
+    func adopt(client: BridgeClient, endpoint: String, host paired: PairedHost) {
+        disconnect()
+        host = paired
         attach(client, endpoint: endpoint)
     }
 
     private func connectLoop() async {
-        defer { connectTask = nil }
+        // A cancelled loop may still be finishing after a newer one started; it must not clear that one's handle.
+        defer { if !Task.isCancelled { connectTask = nil } }
         while !Task.isCancelled {
             status = .connecting
             do {
                 let (client, endpoint) = try await BridgeClient.connectAny(host: host, device: device, deviceName: deviceName)
+                // Cancelled meanwhile (disconnect, or a pairing adopted its own client): do not replace that client.
+                guard !Task.isCancelled else {
+                    await client.close()
+                    return
+                }
                 attach(client, endpoint: endpoint)
                 return
             } catch {
+                // A cancelled loop (the dial itself does not stop on cancellation) must not overwrite the state of
+                // whatever replaced it, e.g. the client a re-pairing just adopted.
+                guard !Task.isCancelled else { return }
                 status = .failed((error as? LocalizedError)?.errorDescription ?? error.localizedDescription)
                 if case BridgeError.rejected = error { return } // unpaired: retrying cannot help
                 try? await Task.sleep(for: retryDelay)
+                guard !Task.isCancelled else { return }
                 retryDelay = min(retryDelay * 2, .seconds(30))
             }
         }
@@ -120,7 +134,7 @@ final class HostConnection {
         eventTask?.cancel()
         eventTask = Task { [weak self] in
             for await event in client.events {
-                guard let self else { return }
+                guard let self, !Task.isCancelled else { return }
                 self.handle(event)
             }
         }
@@ -137,7 +151,8 @@ final class HostConnection {
                 waitingKnown = true
             }
             await refreshSessions()
-            for chat in chats.values where chat.isVisible { await chat.open(using: client) }
+            // A chat holding a photo message stays subscribed after it is left (see ChatModel.leave).
+            for chat in chats.values where chat.isVisible || chat.heldPhotoMessage != nil { await chat.open(using: client) }
         }
     }
 

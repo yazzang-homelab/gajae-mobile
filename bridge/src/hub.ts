@@ -103,6 +103,21 @@ interface SessionState {
 	running: boolean;
 	/** Settles when the bridge-started `session/prompt` in flight resolves or rejects. */
 	turn?: Promise<void>;
+	/**
+	 * Whether that prompt went in while a turn started elsewhere (the TUI) was running. gjc then queues it as a
+	 * steer of that turn instead of starting a turn the bridge owns. Held until the prompt settles: gjc 0.19.3
+	 * reports no `running: false` while an ACP prompt waits (acp-agent phase owner), so the bridge cannot see
+	 * when a TUI turn that ended without taking it promotes it to a run of its own; 끼어들기 is refused there too.
+	 */
+	turnBehindHost?: boolean;
+	/** The text of that prompt when it carries attachments: still listed by gjc's queue means it waits there. */
+	turnAttachmentText?: string;
+	/**
+	 * Set by `interrupt()` from its cancel until its replacement prompt has started. Another prompt in that window
+	 * (a phone sending a held photo message as the cancelled turn ends) would take the turn the waiting steers are
+	 * meant for, and the replacement would fail -32003 after gjc's queue had already been emptied of them.
+	 */
+	interrupting?: boolean;
 	/** gjc's own phase flag (session_info_update _meta.running): also true for turns started elsewhere. */
 	hostRunning: boolean;
 	throughput: Throughput;
@@ -634,7 +649,9 @@ export class SessionHub {
 			sessionId: state.sessionId,
 			cwd: state.cwd,
 			configOptions: state.configOptions,
-			running: state.running,
+			// A turn started in the terminal counts too, as it does in the live `_meta.running` and session.status:
+			// a phone opening the chat then steers it, and a photo message it holds waits for that turn's end.
+			running: isActive(state),
 			seq: state.seq,
 			reset,
 			updates: reset ? state.buffer.slice() : state.buffer.filter(u => u.seq > afterSeq),
@@ -678,22 +695,33 @@ export class SessionHub {
 		throw new AcpError(-32020, message, { code: response.error?.code ?? "internal" });
 	}
 
-	async prompt(params: { sessionId: string; prompt: unknown[] }): Promise<{ accepted: true }> {
+	async prompt(params: { sessionId: string; prompt: unknown[] }, interrupting = false): Promise<{ accepted: true }> {
 		const acp = await this.agent();
 		const state = this.#sessions.get(params.sessionId);
 		if (!state?.loaded) throw new AcpError(-32002, "Session is not open; call session.open first");
-		if (state.running) throw new AcpError(-32003, "A turn is already running in this session");
+		if (state.running || (state.interrupting && !interrupting))
+			throw new AcpError(-32003, "A turn is already running in this session");
 		if (!Array.isArray(params.prompt) || params.prompt.length === 0) throw new AcpError(-32602, "prompt must be a non-empty block array");
+		const promptBytes = Buffer.byteLength(JSON.stringify(params.prompt));
+		if (promptBytes > PROMPT_BYTES_LIMIT) throw promptTooLarge(params.prompt, promptBytes);
 		state.running = true;
+		state.turnBehindHost = state.hostRunning;
+		state.turnAttachmentText = params.prompt.some(block => (block as { type?: unknown } | null)?.type !== "text")
+			? promptText(params.prompt) || undefined
+			: undefined;
 		this.#track(state, { sessionUpdate: "x_gjcm_turn_start" });
 		state.turn = acp.request("session/prompt", { sessionId: params.sessionId, prompt: params.prompt }).then(
 			result => {
 				state.running = false;
+				state.turnBehindHost = false;
+				state.turnAttachmentText = undefined;
 				this.#append(state, { sessionUpdate: TURN_END, stopReason: result?.stopReason ?? "end_turn" });
 				this.#maybeRecycle();
 			},
 			error => {
 				state.running = false;
+				state.turnBehindHost = false;
+				state.turnAttachmentText = undefined;
 				if (String(error?.message ?? error).includes(STALE_ATTACHMENT)) state.loaded = false;
 				this.#append(state, { sessionUpdate: TURN_END, stopReason: "error", error: String(error?.message ?? error) });
 				this.#maybeRecycle();
@@ -730,17 +758,49 @@ export class SessionHub {
 	 * the run it owns. Measured 2026-10-26 on a TUI turn: `session/cancel` had no effect (10s, then -32004),
 	 * `turn.abort` answered `no_active_turn`, `turn.abort{mode:"terminal"}` `terminal_no_effect`, and the operator
 	 * variant is reserved to gjc's Broker route. Such a turn is refused at once instead.
+	 *
+	 * The same holds when the bridge's own prompt went in during such a turn: gjc queues it as a steer of that turn
+	 * (it is listed by `queue.messages.list`), and `session/cancel` leaves the TUI turn running but purges the queued
+	 * prompt, failing it as "Prompt submission failed.". Measured 2026-11-06 on pve3 with gjc 0.19.3: a phone's
+	 * photo+text was lost that way and only its text came back from the queue. It is refused too; gjc delivers it,
+	 * attachments included, at the turn's next step, or runs it as a turn of its own once the TUI turn ends without
+	 * taking it. In that last case 끼어들기 stays refused for the rest of that turn (see [SessionState.turnBehindHost]).
 	 */
 	async interrupt(params: { sessionId: string }): Promise<{ accepted: true; text: string }> {
 		const state = this.#sessions.get(params.sessionId);
 		if (!state?.loaded) throw new AcpError(-32002, "Session is not open; call session.open first");
 		const steers = await this.#queuedSteers(params.sessionId);
 		if (steers.length === 0) throw noPendingSteer();
+		const ownPromptQueued =
+			state.running &&
+			(state.turnBehindHost === true ||
+				(state.turnAttachmentText !== undefined && steers.some(s => s.text.trim() === state.turnAttachmentText)));
 		if (!state.running && state.hostRunning)
 			throw new AcpError(-32004, "터미널에서 시작한 턴은 앱에서 멈출 수 없습니다. 지시는 대기열에 있고 턴의 다음 단계에서 전달됩니다.", {
 				code: "host_turn",
 			});
+		if (ownPromptQueued)
+			throw new AcpError(
+				-32004,
+				"보낸 메시지가 터미널에서 시작한 턴 뒤에서 기다리고 있어 끼어들 수 없습니다. 메시지는 첨부와 함께 그 턴에 전달됩니다.",
+				{ code: "host_turn" },
+			);
+		if (state.interrupting) throw new AcpError(-32003, "끼어들기가 이미 진행 중입니다.");
 		const mark = state.seq;
+		state.interrupting = true;
+		try {
+			return await this.#interruptAndResend(state, steers, mark);
+		} finally {
+			state.interrupting = false;
+		}
+	}
+
+	async #interruptAndResend(
+		state: SessionState,
+		steers: { id: string; text: string }[],
+		mark: number,
+	): Promise<{ accepted: true; text: string }> {
+		const params = { sessionId: state.sessionId };
 		if (isActive(state)) {
 			await this.cancel({ sessionId: params.sessionId });
 			if (!(await this.#settled(state, INTERRUPT_SETTLE_TIMEOUT_MS)))
@@ -759,7 +819,7 @@ export class SessionHub {
 		const waiting = steers.filter(s => !delivered.includes(s.text));
 		if (waiting.length === 0) throw noPendingSteer();
 		const text = waiting.map(s => s.text).join("\n\n");
-		await this.prompt({ sessionId: params.sessionId, prompt: [{ type: "text", text }] });
+		await this.prompt({ sessionId: params.sessionId, prompt: [{ type: "text", text }] }, true);
 		return { accepted: true, text };
 	}
 
@@ -1029,6 +1089,27 @@ export const MODEL_ROLE_TARGETS = [
 ] as const;
 const CONFIG_FLUSH_TIMEOUT_MS = 5000;
 const INTERRUPT_SETTLE_TIMEOUT_MS = 10_000;
+/**
+ * gjc's ACP refuses a prompt whose SDK frame passes 256 KiB (`MAX_PROMPT_FRAME_BYTES`, gjc 0.19.3) with an English
+ * message the phone shows as is ("ACP prompt is 326 KiB, over the 256 KiB transport limit..."). The frame carries the
+ * same text and base64 images as the prompt blocks plus a ~200-byte envelope, so the blocks are held to that limit
+ * minus a margin and refused here, before a turn is started, in Korean.
+ */
+const PROMPT_BYTES_LIMIT = 256 * 1024 - 1024;
+
+/** Says which part to cut: since app 1.0.3 photos are re-encoded to fit, so what is left over is mostly text. */
+function promptTooLarge(prompt: unknown[], bytes: number): AcpError {
+	const textBytes = prompt.reduce<number>((sum, block) => {
+		const text = (block as { type?: unknown; text?: unknown } | null)?.text;
+		return typeof text === "string" ? sum + Buffer.byteLength(text) : sum;
+	}, 0);
+	const kib = (n: number) => Math.ceil(n / 1024);
+	return new AcpError(
+		-32602,
+		`메시지가 ${kib(bytes)}KiB(글 ${kib(textBytes)}KiB, 사진 등 ${kib(Math.max(0, bytes - textBytes))}KiB)라 gjc가 한 번에 받는 256KiB를 넘습니다. 글이나 사진을 줄이세요.`,
+		{ code: "prompt_too_large", bytes, limit: PROMPT_BYTES_LIMIT },
+	);
+}
 const MODEL_SELECTOR = /^[\w.@-]+(\/[\w.@:+-]+)+$/;
 
 interface AgentConfig {
@@ -1115,6 +1196,16 @@ export function supportedConfigOptions(options: unknown[]): unknown[] {
 		const choices = o.options.filter(choice => (choice as { value?: unknown })?.value !== "plan");
 		return choices.length > 1 ? [{ ...o, options: choices }] : [];
 	});
+}
+
+/** The text blocks of a prompt as gjc's queue lists it (attachments carry no text). */
+function promptText(prompt: unknown[]): string {
+	return prompt
+		.map(block => (block as { type?: unknown; text?: unknown } | null))
+		.filter(block => block?.type === "text" && typeof block.text === "string")
+		.map(block => block!.text as string)
+		.join("\n")
+		.trim();
 }
 
 function noPendingSteer(): AcpError {

@@ -248,7 +248,7 @@ fun ChatScreen(model: AppModel, chat: ChatModel) {
             onAttach = { chat.attachments = chat.attachments + it },
             onRemove = { a -> chat.attachments = chat.attachments.filter { it.id != a.id } },
             onError = { chat.errorMessage = it },
-            attachEnabled = !chat.running,
+            attachEnabled = true,
             canSend = chat.canSend,
             busy = chat.sending,
             onSend = { chat.launchSubmit() },
@@ -260,6 +260,16 @@ fun ChatScreen(model: AppModel, chat: ChatModel) {
                         "전달 대기 ${chat.queued.size}건: ${chat.queued.last().text}",
                         style = MaterialTheme.typography.labelMedium, color = Palette.muted, maxLines = 1, overflow = TextOverflow.Ellipsis,
                     )
+                }
+                chat.heldPhotoMessage?.let { held ->
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text(
+                            "턴이 끝나면 보냄: 첨부 ${held.attachments.size}개 ${held.text}",
+                            style = MaterialTheme.typography.labelMedium, color = Palette.muted, maxLines = 1, overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.weight(1f),
+                        )
+                        TextButton(onClick = { chat.cancelHeldPhotoMessage() }) { Text("취소") }
+                    }
                 }
                 chat.uploadProgress?.takeIf { it < 1 }?.let { LinearProgressIndicator(progress = { it.toFloat() }, color = Palette.strawGold, modifier = Modifier.fillMaxWidth()) }
             },

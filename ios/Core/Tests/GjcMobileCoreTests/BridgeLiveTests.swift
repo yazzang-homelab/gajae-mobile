@@ -107,6 +107,17 @@ final class BridgeLiveTests: XCTestCase {
         XCTAssertEqual(attachments.count, 2)
         guard case let .tool(call) = transcript.items[1].kind else { return XCTFail("tool row") }
         XCTAssertEqual(call.status, "completed")
+
+        // A message over gjc's frame limit (an older app's 5 MB photo) is refused with a reason the app can act on.
+        let photo = Data(repeating: 0xFF, count: 200_000) // ~267 KiB as base64
+        do {
+            try await client.prompt(opened.sessionId, blocks: [.text("봐"), .image(data: photo, mimeType: "image/jpeg")])
+            XCTFail("expected the oversized prompt to be refused")
+        } catch let BridgeError.remote(code, message, reason) {
+            XCTAssertEqual(code, -32602)
+            XCTAssertEqual(reason, "prompt_too_large")
+            XCTAssertTrue(message.contains("256KiB"), message)
+        }
         await client.close()
     }
 }

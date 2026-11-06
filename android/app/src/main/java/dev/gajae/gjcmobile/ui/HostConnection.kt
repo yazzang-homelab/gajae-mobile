@@ -15,7 +15,9 @@ import dev.gajae.gjcmobile.core.SessionSummary
 import dev.gajae.gjcmobile.widget.WidgetStore
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.time.Instant
@@ -81,21 +83,37 @@ class HostConnection(
         status = Status.Idle
     }
 
-    /** Takes over a client that was just created by pairing. */
-    fun adopt(client: BridgeClient, endpoint: String) = attach(client, endpoint)
+    /**
+     * Takes over a client that was just created by pairing, together with the host record that pairing produced.
+     * Re-pairing a known host may bring new endpoints, a new name or a new key, so the old record (and any retry
+     * loop still dialing it) must not outlive the pairing.
+     */
+    fun adopt(client: BridgeClient, endpoint: String, paired: PairedHost) {
+        disconnect()
+        host = paired
+        attach(client, endpoint)
+    }
 
     private suspend fun connectLoop() {
         while (scope.isActive) {
             status = Status.Connecting
             try {
                 val (client, endpoint) = BridgeClient.connectAny(host, device, deviceName)
+                // Cancelled meanwhile (disconnect, or a pairing adopted its own client): do not replace that client.
+                if (!currentCoroutineContext().isActive) {
+                    client.close()
+                    return
+                }
                 attach(client, endpoint)
                 return
             } catch (e: BridgeException.Rejected) {
+                // A cancelled loop must not overwrite the state of whatever replaced it (e.g. an adopted pairing).
+                currentCoroutineContext().ensureActive()
                 status = Status.Failed(e.userMessage())
                 return // unpaired: retrying cannot help
             } catch (e: Exception) {
                 if (e is kotlinx.coroutines.CancellationException) throw e
+                currentCoroutineContext().ensureActive()
                 status = Status.Failed(e.userMessage())
                 delay(retryDelayMs)
                 retryDelayMs = minOf(retryDelayMs * 2, 30_000)
@@ -129,7 +147,8 @@ class HostConnection(
                 waitingKnown = true
             }
             refreshSessions()
-            chats.values.filter { it.isVisible }.forEach { it.open(client) }
+            // A chat holding a photo message stays subscribed after it is left (see ChatModel.leave).
+            chats.values.filter { it.isVisible || it.heldPhotoMessage != null }.forEach { it.open(client) }
         }
     }
 

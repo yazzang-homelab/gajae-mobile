@@ -23,6 +23,8 @@ export class BridgeClientError extends Error {
 	constructor(
 		readonly code: string | number,
 		message: string,
+		/** The JSON-RPC error's `data` (`{ code: "host_turn" }` and the like), when the bridge sent one. */
+		readonly data?: unknown,
 	) {
 		super(message);
 	}
@@ -142,7 +144,7 @@ export class BridgeClient {
 			const pending = this.#pending.get(message.id);
 			if (!pending) return;
 			this.#pending.delete(message.id);
-			if (message.e) pending.reject(new BridgeClientError(message.e.code, message.e.message));
+			if (message.e) pending.reject(new BridgeClientError(message.e.code, message.e.message, message.e.data));
 			else pending.resolve(message.r);
 			return;
 		}

@@ -9,6 +9,12 @@ struct InfoSheet: Identifiable, Equatable {
     let topic: InfoTopic
 }
 
+/// A message with photos the phone holds until the running turn ends (gjc's `turn.steer` takes text only).
+struct HeldPhotoMessage: Equatable {
+    let text: String
+    let attachments: [PendingAttachment]
+}
+
 /// A slash action that needs a yes before it runs (`/clear`, `/goal drop`, `/drop`, `/session delete`).
 struct PendingConfirmation: Identifiable, Equatable {
     let id = UUID()
@@ -27,7 +33,15 @@ final class ChatModel: Identifiable {
     private(set) var permissions: [PermissionRequest] = []
     private(set) var loading = false
     private(set) var loadStartedAt: Date?
-    private(set) var sending = false
+    /// A send, steer, 끼어들기 or control in flight. Turning false re-checks a held photo message a turn end skipped.
+    private(set) var sending: Bool {
+        get { sendingState }
+        set {
+            sendingState = newValue
+            if !newValue, heldWakePending { sendHeldPhotoMessageIfIdle() }
+        }
+    }
+    private var sendingState = false
     private(set) var uploadProgress: Double?
     var draft = ""
     var attachments: [PendingAttachment] = []
@@ -50,6 +64,12 @@ final class ChatModel: Identifiable {
     private var hostQueueAt: TimeInterval = 0
     /// What waits on the running turn; `followUp` ones wait for the turn to end.
     var queued: [QueuedMessage] { QueuedMessages.merge(sent: sentQueue, host: hostQueue, now: hostQueueAt) }
+    /// Sent by the phone once no turn runs; see `steer(followUp:)`. Kept in memory only.
+    private(set) var heldPhotoMessage: HeldPhotoMessage?
+    /// A turn ended while something else of this chat was in flight; the held message is tried once that settles.
+    @ObservationIgnored private var heldWakePending = false
+    /// The held message is on its way (taken out of `heldPhotoMessage` until the bridge answers).
+    @ObservationIgnored private var heldInFlight = false
     var hasQueuedSteer: Bool { queued.contains { !$0.followUp } }
     var infoSheet: InfoSheet?
     var configPicker: ConfigTarget?
@@ -84,7 +104,6 @@ final class ChatModel: Identifiable {
     private var trimmedDraft: String { draft.trimmingCharacters(in: .whitespacesAndNewlines) }
     var canSend: Bool {
         guard !sending, connected else { return false }
-        if running { return !trimmedDraft.isEmpty && attachments.isEmpty }
         return !trimmedDraft.isEmpty || !attachments.isEmpty
     }
 
@@ -125,7 +144,7 @@ final class ChatModel: Identifiable {
     private func reopening<T>(_ client: BridgeClient, _ body: () async throws -> T) async throws -> T {
         do {
             return try await body()
-        } catch BridgeError.remote(code: -32002, _) {
+        } catch BridgeError.remote(code: -32002, _, _) {
             let snapshot = try await client.openSession(sessionId, cwd: cwd, afterSeq: transcript.lastSeq)
             apply(snapshot: snapshot)
             return try await body()
@@ -139,6 +158,7 @@ final class ChatModel: Identifiable {
     func apply(snapshot: OpenSnapshot) {
         transcript.apply(snapshot: snapshot)
         permissions = snapshot.permissions
+        sendHeldPhotoMessageIfIdle()
     }
 
     func apply(_ update: SequencedUpdate) {
@@ -153,6 +173,14 @@ final class ChatModel: Identifiable {
         default:
             break
         }
+        // `running` covers turns started anywhere (the bridge's own and the terminal's), so this catches the end of
+        // either; the bridge's -32003 holds the message again if another turn of this phone got in first.
+        let kind = update.update["sessionUpdate"]?.string
+        if heldInFlight, kind == "x_gjcm_turn_end" || kind == "x_gjcm_agent_exit" || update.update["_meta"]?["running"]?.bool == false {
+            // A turn end while the held message is on its way: if the bridge refuses it as busy, try again.
+            heldWakePending = true
+        }
+        sendHeldPhotoMessageIfIdle()
     }
 
     func apply(status: SessionStatus) {
@@ -172,7 +200,9 @@ final class ChatModel: Identifiable {
 
     func leave() {
         isVisible = false
-        guard let client = connection?.connectedClient else { return }
+        // Without the subscription the end of the turn would not arrive and the held message would wait for the
+        // chat to be opened again.
+        guard heldPhotoMessage == nil, !heldInFlight, let client = connection?.connectedClient else { return }
         Task { try? await client.closeSession(sessionId) }
     }
 
@@ -212,29 +242,51 @@ final class ChatModel: Identifiable {
 
     private func send() async {
         guard canSend, let client = connection?.connectedClient else { return }
-        sending = true
-        errorMessage = nil
-        let text = draft
-        let files = attachments
-        defer {
-            sending = false
-            uploadProgress = nil
-        }
+        let message = HeldPhotoMessage(text: draft, attachments: attachments)
         do {
-            let blocks = try await client.promptBlocks(text: text, attachments: files, sessionId: sessionId) { fraction in
-                Task { @MainActor [weak self] in self?.uploadProgress = fraction }
-            }
-            try await reopening(client) { try await client.prompt(sessionId, blocks: blocks) }
-            transcript.markRunning()
-            draft = ""
-            attachments = []
+            try await prompt(message, using: client)
+            clearSent(message)
         } catch {
             show(error)
         }
     }
 
+    /// Clears what was sent from the composer, keeping what was typed or attached while it was being sent.
+    private func clearSent(_ message: HeldPhotoMessage) {
+        if trimmedDraft == message.text.trimmingCharacters(in: .whitespacesAndNewlines) { draft = "" }
+        let sent = Set(message.attachments.map(\.id))
+        attachments.removeAll { sent.contains($0.id) }
+    }
+
+    /// Sends text + attachments as a prompt, its photos re-encoded to fit gjc's inline budget together.
+    private func prompt(_ message: HeldPhotoMessage, using client: BridgeClient) async throws {
+        sending = true
+        errorMessage = nil
+        defer {
+            sending = false
+            uploadProgress = nil
+        }
+        let files = message.attachments
+        let text = message.text
+        let fitted = try await Task.detached(priority: .userInitiated) { try ImagePreparer.fitInline(files, text: text) }.value
+        let blocks = try await client.promptBlocks(text: message.text, attachments: fitted, sessionId: sessionId) { fraction in
+            Task { @MainActor [weak self] in self?.uploadProgress = fraction }
+        }
+        try await reopening(client) { try await client.prompt(sessionId, blocks: blocks) }
+        transcript.markRunning()
+    }
+
     /// `turn.steer` reaches the model at its next step; `turn.follow_up` waits for the turn to end.
+    ///
+    /// Both take text only, so a message with photos goes in as a prompt instead. During a turn started in the
+    /// terminal gjc queues that prompt and delivers it, photos included, at the turn's next step (or as a turn of its
+    /// own once that turn ends). During this phone's own turn the bridge refuses a second prompt (-32003), so the
+    /// message waits here and goes out once no turn runs; "턴이 끝나면 보내기" holds it here right away.
     func steer(followUp: Bool) async {
+        guard attachments.isEmpty else {
+            await sendPhotosDuringTurn(holdUntilTurnEnd: followUp)
+            return
+        }
         let text = trimmedDraft
         guard running, !text.isEmpty, let client = connection?.connectedClient else { return }
         sending = true
@@ -251,6 +303,89 @@ final class ChatModel: Identifiable {
         }
     }
 
+    private func sendPhotosDuringTurn(holdUntilTurnEnd: Bool) async {
+        guard running, let client = connection?.connectedClient else { return }
+        guard heldPhotoMessage == nil else {
+            errorMessage = "턴이 끝나면 보낼 사진 메시지가 이미 있습니다. 그 메시지가 나간 뒤 다시 보내세요."
+            return
+        }
+        let message = HeldPhotoMessage(text: trimmedDraft, attachments: attachments)
+        if holdUntilTurnEnd {
+            hold(message)
+            return
+        }
+        do {
+            try await prompt(message, using: client)
+            clearSent(message)
+            transcript.appendNotice("사진 메시지를 진행 중인 턴에 넣었습니다. 턴의 다음 단계나 턴이 끝난 뒤 전달됩니다.")
+        } catch BridgeError.remote(code: -32003, _, _) {
+            hold(message)
+        } catch {
+            show(error)
+        }
+    }
+
+    private func hold(_ message: HeldPhotoMessage) {
+        heldPhotoMessage = message
+        clearSent(message)
+        transcript.appendNotice("사진이 있는 메시지는 이 폰이 들고 있다가 턴이 끝나면 보냅니다. 앱을 닫으면 보내지 않습니다.")
+        // The turn may have ended while the message was on its way.
+        sendHeldPhotoMessageIfIdle()
+    }
+
+    /// Sends the held message once no turn runs and nothing else of this chat is in flight (a send, a 끼어들기).
+    private func sendHeldPhotoMessageIfIdle() {
+        guard heldPhotoMessage != nil, !running, connected else { return }
+        guard !sending else {
+            heldWakePending = true
+            return
+        }
+        heldWakePending = false
+        Task { await sendHeldPhotoMessage() }
+    }
+
+    private func sendHeldPhotoMessage() async {
+        guard let message = heldPhotoMessage, !running, let client = connection?.connectedClient else { return }
+        guard !sending else {
+            heldWakePending = true
+            return
+        }
+        heldPhotoMessage = nil
+        heldInFlight = true
+        defer {
+            heldInFlight = false
+            // A chat left with the message held kept its subscription for the turn end only (see `leave`).
+            if !isVisible { leave() }
+        }
+        do {
+            try await prompt(message, using: client)
+        } catch BridgeError.remote(code: -32003, _, _) {
+            // Another turn of this phone started first; it goes out when that one ends. Tried again right away only
+            // when a turn end arrived while this one was in flight, so a busy bridge is not retried in a loop.
+            heldPhotoMessage = message
+            if heldWakePending { sendHeldPhotoMessageIfIdle() }
+        } catch {
+            restore(message)
+            show(error)
+        }
+    }
+
+    /// Puts the held message back into the composer instead of sending it.
+    func cancelHeldPhotoMessage() {
+        guard let message = heldPhotoMessage else { return }
+        heldPhotoMessage = nil
+        restore(message)
+    }
+
+    private func restore(_ message: HeldPhotoMessage) {
+        if trimmedDraft.isEmpty {
+            draft = message.text
+        } else if !message.text.isEmpty {
+            draft = message.text + "\n" + draft
+        }
+        attachments = message.attachments + attachments
+    }
+
     /// "끼어들기": the TUI's Esc with a steer waiting — stop the turn now and send the waiting steers.
     func interrupt() async {
         guard running, hasQueuedSteer, let client = connection?.connectedClient else { return }
@@ -260,9 +395,12 @@ final class ChatModel: Identifiable {
             _ = try await reopening(client) { try await client.interrupt(sessionId) }
             dropSteers()
             transcript.appendNotice("진행 중인 턴을 중단하고 대기 중인 지시를 바로 보냈습니다.")
-        } catch BridgeError.remote(code: -32005, _) {
+        } catch BridgeError.remote(code: -32005, _, _) {
             dropSteers()
             transcript.appendNotice("대기 중인 지시는 이미 모델에 전달됐습니다.")
+        } catch let BridgeError.remote(code: -32004, message, .some("host_turn")) {
+            // Not a failure: the turn keeps running and the waiting steers reach it at its next step.
+            transcript.appendNotice(message)
         } catch {
             show(error)
         }
@@ -275,6 +413,11 @@ final class ChatModel: Identifiable {
 
     func cancel() async {
         guard let client = connection?.connectedClient else { return }
+        // Stopping the turn is no cue to start the next one: the held message goes back to the composer.
+        if heldPhotoMessage != nil {
+            cancelHeldPhotoMessage()
+            transcript.appendNotice("턴을 멈춰서 보내려던 사진 메시지를 입력창으로 돌려놓았습니다.")
+        }
         try? await client.cancel(sessionId)
     }
 

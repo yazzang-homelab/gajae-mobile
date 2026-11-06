@@ -65,6 +65,13 @@ class BridgeClientTest {
                     put("id", req["id"].int!!)
                     put("e", buildJsonObject { put("code", -32005); put("message", "nothing queued") })
                 }
+                "session.prompt" -> buildJsonObject {
+                    put("id", req["id"].int!!)
+                    put("e", buildJsonObject {
+                        put("code", -32004); put("message", "터미널 턴")
+                        put("data", buildJsonObject { put("code", "host_turn") })
+                    })
+                }
                 "permission.list" -> parseJson(
                     """{"id":${req["id"].int},"r":{"requests":[{"requestId":"r1","sessionId":"s2","toolCall":{"title":"ask"},"options":[]}]}}""",
                 )
@@ -94,6 +101,13 @@ class BridgeClientTest {
                 fail("expected remote error")
             } catch (e: BridgeException.Remote) {
                 assertEquals(-32005, e.code)
+                assertEquals("an error without data has no reason", null, e.reason)
+            }
+            try {
+                client.request("session.prompt")
+                fail("expected remote error")
+            } catch (e: BridgeException.Remote) {
+                assertEquals(-32004 to "host_turn", e.code to e.reason)
             }
             val status = client.events.first() as BridgeEvent.Status
             assertEquals(SessionStatus("s1", true, 42.5), status.status)

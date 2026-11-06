@@ -91,7 +91,8 @@ sealed class BridgeException(message: String) : Exception(message) {
             else -> "$detail ($code)"
         },
     )
-    class Remote(val code: Int, detail: String) : BridgeException(detail)
+    /** A JSON-RPC error from the bridge; [reason] is its `data.code` (`host_turn`, `prompt_too_large`, ...) when sent. */
+    class Remote(val code: Int, detail: String, val reason: String? = null) : BridgeException(detail)
     class ProtocolViolation(detail: String) : BridgeException("브리지 프로토콜 오류: $detail")
     class Disconnected : BridgeException("호스트와 연결이 끊겼습니다.")
     class NoReachableEndpoint : BridgeException("호스트에 연결할 수 없습니다. 같은 네트워크 또는 Tailscale에 연결돼 있는지 확인하세요.")
@@ -162,7 +163,7 @@ class BridgeClient private constructor(private val transport: FrameTransport) {
             val deferred = pending.remove(id) ?: return
             val error = message["e"]
             if (error != null) {
-                deferred.completeExceptionally(BridgeException.Remote(error["code"].int ?: -1, error["message"].str ?: "error"))
+                deferred.completeExceptionally(BridgeException.Remote(error["code"].int ?: -1, error["message"].str ?: "error", error["data"]["code"].str))
             } else {
                 deferred.complete(message["r"] ?: JsonNull)
             }

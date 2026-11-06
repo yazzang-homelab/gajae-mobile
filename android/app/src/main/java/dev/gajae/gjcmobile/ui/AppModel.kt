@@ -78,7 +78,7 @@ class AppModel(application: Application) : AndroidViewModel(application) {
                 var host = PairedHost(offer).copy(lastEndpoint = endpoint, preferredCwd = saved)
                 runCatching { client.hostInfo() }.getOrNull()?.let { host = host.copy(name = it.hostName) }
                 update(host)
-                connection(host).adopt(client, endpoint)
+                connection(host).adopt(client, endpoint, host)
                 selectedHostId = host.hostId
                 return host
             } catch (e: BridgeException.Rejected) {

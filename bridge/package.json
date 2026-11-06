@@ -1,6 +1,6 @@
 {
   "name": "gjcm-bridge",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "type": "module",
   "description": "Host bridge that exposes gjc --mode=acp to the Gajae Code mobile apps over an end-to-end encrypted WebSocket",
   "bin": {

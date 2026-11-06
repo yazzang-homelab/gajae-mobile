@@ -103,6 +103,15 @@ interface SessionState {
 	running: boolean;
 	/** Settles when the bridge-started `session/prompt` in flight resolves or rejects. */
 	turn?: Promise<void>;
+	/**
+	 * Whether that prompt went in while a turn started elsewhere (the TUI) was running. gjc then queues it as a
+	 * steer of that turn instead of starting a turn the bridge owns. Held until the prompt settles: gjc 0.19.3
+	 * reports no `running: false` while an ACP prompt waits (acp-agent phase owner), so the bridge cannot see
+	 * when a TUI turn that ended without taking it promotes it to a run of its own; 끼어들기 is refused there too.
+	 */
+	turnBehindHost?: boolean;
+	/** The text of that prompt when it carries attachments: still listed by gjc's queue means it waits there. */
+	turnAttachmentText?: string;
 	/** gjc's own phase flag (session_info_update _meta.running): also true for turns started elsewhere. */
 	hostRunning: boolean;
 	throughput: Throughput;
@@ -685,15 +694,23 @@ export class SessionHub {
 		if (state.running) throw new AcpError(-32003, "A turn is already running in this session");
 		if (!Array.isArray(params.prompt) || params.prompt.length === 0) throw new AcpError(-32602, "prompt must be a non-empty block array");
 		state.running = true;
+		state.turnBehindHost = state.hostRunning;
+		state.turnAttachmentText = params.prompt.some(block => (block as { type?: unknown } | null)?.type !== "text")
+			? promptText(params.prompt) || undefined
+			: undefined;
 		this.#track(state, { sessionUpdate: "x_gjcm_turn_start" });
 		state.turn = acp.request("session/prompt", { sessionId: params.sessionId, prompt: params.prompt }).then(
 			result => {
 				state.running = false;
+				state.turnBehindHost = false;
+				state.turnAttachmentText = undefined;
 				this.#append(state, { sessionUpdate: TURN_END, stopReason: result?.stopReason ?? "end_turn" });
 				this.#maybeRecycle();
 			},
 			error => {
 				state.running = false;
+				state.turnBehindHost = false;
+				state.turnAttachmentText = undefined;
 				if (String(error?.message ?? error).includes(STALE_ATTACHMENT)) state.loaded = false;
 				this.#append(state, { sessionUpdate: TURN_END, stopReason: "error", error: String(error?.message ?? error) });
 				this.#maybeRecycle();
@@ -730,16 +747,33 @@ export class SessionHub {
 	 * the run it owns. Measured 2026-10-26 on a TUI turn: `session/cancel` had no effect (10s, then -32004),
 	 * `turn.abort` answered `no_active_turn`, `turn.abort{mode:"terminal"}` `terminal_no_effect`, and the operator
 	 * variant is reserved to gjc's Broker route. Such a turn is refused at once instead.
+	 *
+	 * The same holds when the bridge's own prompt went in during such a turn: gjc queues it as a steer of that turn
+	 * (it is listed by `queue.messages.list`), and `session/cancel` leaves the TUI turn running but purges the queued
+	 * prompt, failing it as "Prompt submission failed.". Measured 2026-11-06 on pve3 with gjc 0.19.3: a phone's
+	 * photo+text was lost that way and only its text came back from the queue. It is refused too; gjc delivers it,
+	 * attachments included, at the turn's next step, or runs it as a turn of its own once the TUI turn ends without
+	 * taking it. In that last case 끼어들기 stays refused for the rest of that turn (see [SessionState.turnBehindHost]).
 	 */
 	async interrupt(params: { sessionId: string }): Promise<{ accepted: true; text: string }> {
 		const state = this.#sessions.get(params.sessionId);
 		if (!state?.loaded) throw new AcpError(-32002, "Session is not open; call session.open first");
 		const steers = await this.#queuedSteers(params.sessionId);
 		if (steers.length === 0) throw noPendingSteer();
+		const ownPromptQueued =
+			state.running &&
+			(state.turnBehindHost === true ||
+				(state.turnAttachmentText !== undefined && steers.some(s => s.text.trim() === state.turnAttachmentText)));
 		if (!state.running && state.hostRunning)
 			throw new AcpError(-32004, "터미널에서 시작한 턴은 앱에서 멈출 수 없습니다. 지시는 대기열에 있고 턴의 다음 단계에서 전달됩니다.", {
 				code: "host_turn",
 			});
+		if (ownPromptQueued)
+			throw new AcpError(
+				-32004,
+				"보낸 메시지가 터미널에서 시작한 턴 뒤에서 기다리고 있어 끼어들 수 없습니다. 메시지는 첨부와 함께 그 턴에 전달됩니다.",
+				{ code: "host_turn" },
+			);
 		const mark = state.seq;
 		if (isActive(state)) {
 			await this.cancel({ sessionId: params.sessionId });
@@ -1115,6 +1149,16 @@ export function supportedConfigOptions(options: unknown[]): unknown[] {
 		const choices = o.options.filter(choice => (choice as { value?: unknown })?.value !== "plan");
 		return choices.length > 1 ? [{ ...o, options: choices }] : [];
 	});
+}
+
+/** The text blocks of a prompt as gjc's queue lists it (attachments carry no text). */
+function promptText(prompt: unknown[]): string {
+	return prompt
+		.map(block => (block as { type?: unknown; text?: unknown } | null))
+		.filter(block => block?.type === "text" && typeof block.text === "string")
+		.map(block => block!.text as string)
+		.join("\n")
+		.trim();
 }
 
 function noPendingSteer(): AcpError {

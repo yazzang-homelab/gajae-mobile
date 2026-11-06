@@ -543,6 +543,83 @@ describe("sessions over the bridge", () => {
 		expect((await client.request("sdk.query", { sessionId: sid, op: "queue.messages.list" })).items.map((m: any) => m.text)).toEqual(["대기 중"]);
 	});
 
+	test("session.interrupt leaves a phone prompt queued behind a TUI turn alone, photo included", async () => {
+		// Measured 2026-11-06 on pve3 with gjc 0.19.3: a photo+text sent while a TUI turn ran waited in gjc's queue as a
+		// steer; 끼어들기's cancel left the TUI turn running but purged that prompt ("Prompt submission failed."), and
+		// only its text was sent again.
+		const bridge = await useBridge();
+		const { client } = await bridge.pairedClient();
+		const sid = (await client.request("session.new", {})).sessionId;
+		await client.request("sdk.control", { sessionId: sid, op: "turn.steer", input: { text: "terminal turn" } });
+		await client.waitFor(e => e.ev === "session.status" && e.p.sessionId === sid && e.p.running);
+		const photo = { type: "image", mimeType: "image/png", data: "iVBORw0KGgo=" };
+		await client.request("session.prompt", { sessionId: sid, prompt: [photo, { type: "text", text: "이 사진 봐" }] });
+		const queued = async () => (await client.request("sdk.query", { sessionId: sid, op: "queue.messages.list" })).items.map((m: any) => m.text);
+		while ((await queued()).length === 0) await Bun.sleep(20);
+
+		const refused = await client.request("session.interrupt", { sessionId: sid }).catch((e: any) => e);
+		expect(refused.code).toBe(-32004);
+		expect(refused.message).toContain("터미널에서 시작한 턴 뒤에서 기다리고");
+		expect(await queued()).toEqual(["이 사진 봐"]);
+
+		// The TUI turn's next step takes the phone's own prompt, photo included, and the phone's turn ends cleanly:
+		// nothing was cancelled and nothing was sent again as text only.
+		await client.request("sdk.control", { sessionId: sid, op: "turn.steer", input: { text: "terminal done" } });
+		const end = await client.waitFor(turnEnd(sid));
+		expect(end.p.update.stopReason).toBe("end_turn");
+		const said = client.events
+			.filter(e => e.ev === "session.update" && e.p.sessionId === sid && e.p.update.sessionUpdate === "agent_message_chunk")
+			.map(e => e.p.update.content.text);
+		expect(said).toEqual(["받은 블록: image,text"]);
+		const texts = client.events
+			.filter(e => e.ev === "session.update" && e.p.sessionId === sid && e.p.update.sessionUpdate === "user_message_chunk")
+			.filter(e => e.p.update.content.type === "text")
+			.map(e => e.p.update.content.text);
+		expect(texts).toEqual(["이 사진 봐"]);
+	});
+
+	test("session.interrupt also refuses a text-only phone prompt queued behind a TUI turn instead of failing it", async () => {
+		const bridge = await useBridge();
+		const { client } = await bridge.pairedClient();
+		const sid = (await client.request("session.new", {})).sessionId;
+		await client.request("sdk.control", { sessionId: sid, op: "turn.steer", input: { text: "terminal turn" } });
+		await client.waitFor(e => e.ev === "session.status" && e.p.sessionId === sid && e.p.running);
+		await client.request("session.prompt", { sessionId: sid, prompt: [{ type: "text", text: "글만" }] });
+		const queued = async () => (await client.request("sdk.query", { sessionId: sid, op: "queue.messages.list" })).items.length;
+		while ((await queued()) === 0) await Bun.sleep(20);
+		const refused = await client.request("session.interrupt", { sessionId: sid }).catch((e: any) => e);
+		expect(refused.code).toBe(-32004);
+		await client.request("sdk.control", { sessionId: sid, op: "turn.steer", input: { text: "terminal done" } });
+		expect((await client.waitFor(turnEnd(sid))).p.update.stopReason).toBe("end_turn");
+	});
+
+	test("session.interrupt goes ahead on the bridge's own turn when a steer repeats the text of a text-only prompt", async () => {
+		const bridge = await useBridge();
+		const { client } = await bridge.pairedClient();
+		const sid = (await client.request("session.new", {})).sessionId;
+		await client.request("session.prompt", { sessionId: sid, prompt: [{ type: "text", text: "slow count" }] });
+		await client.waitFor(e => e.ev === "session.update" && e.p.update.sessionUpdate === "agent_message_chunk");
+		await client.request("sdk.control", { sessionId: sid, op: "turn.steer", input: { text: "slow count" } });
+		const res = await client.request("session.interrupt", { sessionId: sid });
+		expect(res.text).toBe("slow count");
+	});
+
+	test("session.interrupt refuses while the bridge's prompt with an attachment is still listed in gjc's queue", async () => {
+		// Backstop for a prompt with an attachment when the bridge missed a TUI turn's running flag (e.g. right after a
+		// reload): its text still listed in gjc's queue refuses 끼어들기. A bridge-owned turn whose steer repeats such a
+		// prompt's text is refused as well (accepted cost: nothing is lost, the stop button still works).
+		const bridge = await useBridge();
+		const { client } = await bridge.pairedClient();
+		const sid = (await client.request("session.new", {})).sessionId;
+		const photo = { type: "image", mimeType: "image/png", data: "iVBORw0KGgo=" };
+		await client.request("session.prompt", { sessionId: sid, prompt: [photo, { type: "text", text: "slow 사진" }] });
+		await client.waitFor(e => e.ev === "session.update" && e.p.update.sessionUpdate === "agent_message_chunk");
+		await client.request("sdk.control", { sessionId: sid, op: "turn.steer", input: { text: "slow 사진" } });
+		const refused = await client.request("session.interrupt", { sessionId: sid }).catch((e: any) => e);
+		expect(refused.code).toBe(-32004);
+		await client.request("session.cancel", { sessionId: sid });
+	});
+
 	test("an ask waiting in a TUI turn reaches the phone from the transcript and settles with the terminal's answer", async () => {
 		const bridge = await useBridge();
 		const { client } = await bridge.pairedClient();

@@ -13,7 +13,14 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { AcpError, AcpProcess, type AcpSpawnOptions } from "./acp";
-import { hostAskSettled, hostAskToolCall, scanTranscriptAsks } from "./host-asks";
+import {
+	hostAskSettled,
+	hostAskToolCall,
+	type RemoteAskCard,
+	remoteAskCard,
+	remoteAskRequests,
+	scanTranscriptAsks,
+} from "./host-asks";
 import { SavedSessionIndex } from "./saved-sessions";
 import { Throughput } from "./throughput";
 
@@ -90,6 +97,8 @@ export interface PendingPermission {
 	toolCall: unknown;
 	options: Array<{ optionId: string; name: string; kind: string }>;
 	resolve(outcome: PermissionOutcome): void;
+	/** A TUI ask answered through `ask.answer` (see `SessionHub.#syncRemoteAsks`), not a guarded tool: no mode answers it. */
+	hostAsk?: boolean;
 }
 
 interface SessionState {
@@ -139,6 +148,14 @@ interface SessionState {
 	hostAsks: Set<string>;
 	/** Transcript path and the size/mtime last scanned for [hostAsks]. */
 	hostAskScan?: { file: string; size: number; mtimeMs: number };
+	/** Cards for those asks by gjc's `ask.requests.list` id (see `#syncRemoteAsks`). */
+	remoteAsks: Map<string, PendingPermission>;
+	/** Ids answered or dismissed on a phone: never shown again, though a listing taken before may still carry them. */
+	remoteAsksDone: Set<string>;
+	/** In-flight `ask.requests.list` read; `again` when another was asked for meanwhile. */
+	remoteAskSync?: { again: boolean };
+	/** The session host has no `ask.requests.list` (gjc 0.19.3 and older): asks stay answerable in the terminal only. */
+	remoteAsksUnsupported?: boolean;
 }
 
 export interface SessionStatus {
@@ -450,6 +467,8 @@ export class SessionHub {
 				hostRunning: false,
 				throughput: new Throughput(),
 				queued: [],
+				remoteAsks: new Map(),
+				remoteAsksDone: new Set(),
 				configOptions: [],
 				permissionMode: "prompt",
 				hostAsks: new Set(),
@@ -600,6 +619,99 @@ export class SessionHub {
 			state.hostAsks.delete(id);
 			this.#append(state, hostAskSettled(id, result));
 		}
+		if (state.hostAsks.size === 0) this.#dropRemoteAsks(state);
+	}
+
+	/**
+	 * Makes the TUI's pending asks answerable on the phone where the session host lists them (`ask.requests.list`, newer
+	 * than gjc 0.19.3): each selector question becomes a permission card whose pick goes back as `ask.answer`. Runs on
+	 * the status tick while the transcript shows an unanswered ask, since every pick (a multi-select toggle, the next
+	 * question) gives the request a new id. A host without it leaves the read-only card from the transcript.
+	 */
+	#syncRemoteAsks(state: SessionState): void {
+		if (state.remoteAsksUnsupported || !state.loaded || state.hostAsks.size === 0) return;
+		if (state.remoteAskSync) {
+			state.remoteAskSync.again = true;
+			return;
+		}
+		const sync = { again: false };
+		state.remoteAskSync = sync;
+		void (async () => {
+			try {
+				do {
+					sync.again = false;
+					const acp = await this.agent();
+					let listed: ReturnType<typeof remoteAskRequests>;
+					try {
+						listed = remoteAskRequests(await this.#sdkRequest(acp, state, "query", "ask.requests.list", {}));
+					} catch (error) {
+						if (error instanceof AcpError && (error.data as { code?: unknown } | undefined)?.code === "host_outdated") state.remoteAsksUnsupported = true;
+						else console.error(`ask.requests.list failed for ${state.sessionId}: ${error instanceof Error ? error.message : String(error)}`);
+						return;
+					}
+					if (state.hostAsks.size === 0) return;
+					const live = new Set<string>();
+					for (const request of listed) {
+						if (request.sessionId !== undefined && request.sessionId !== state.sessionId) continue;
+						if (state.remoteAsksDone.has(request.id)) continue;
+						const card = remoteAskCard(request);
+						if (!card) continue;
+						live.add(request.id);
+						if (!state.remoteAsks.has(request.id)) this.#showRemoteAsk(state, request.id, request.question, card);
+					}
+					for (const id of [...state.remoteAsks.keys()]) if (!live.has(id)) this.#dropRemoteAsk(state, id);
+				} while (sync.again);
+			} finally {
+				state.remoteAskSync = undefined;
+			}
+		})();
+	}
+
+	#showRemoteAsk(state: SessionState, id: string, question: string, card: RemoteAskCard): void {
+		const requestId = `perm-${this.#nextPermission++}`;
+		// The ask row on the phone carries the transcript's tool call id; with several pending, the card stands alone.
+		const toolCallId = state.hostAsks.size === 1 ? [...state.hostAsks][0]! : `ask-${id}`;
+		const pending: PendingPermission = {
+			requestId,
+			sessionId: state.sessionId,
+			toolCall: { toolCallId, toolName: "ask", title: question, kind: "other", status: "pending", rawInput: { question } },
+			options: card.options,
+			hostAsk: true,
+			resolve: outcome => {
+				// Dismissing the card leaves the question to the terminal.
+				const answer = outcome.outcome === "selected" ? card.answers.get(outcome.optionId) : undefined;
+				this.#dropRemoteAsk(state, id);
+				if (answer) void this.#answerRemoteAsk(state, id, answer);
+			},
+		};
+		state.remoteAsks.set(id, pending);
+		this.#permissions.set(requestId, pending);
+		this.#broadcastAll("permission.request", publicPermission(pending));
+	}
+
+	#dropRemoteAsk(state: SessionState, id: string): void {
+		const shown = state.remoteAsks.get(id);
+		if (!shown) return;
+		state.remoteAsks.delete(id);
+		state.remoteAsksDone.add(id);
+		this.#permissions.delete(shown.requestId);
+		this.#broadcastAll("permission.resolved", { requestId: shown.requestId, sessionId: state.sessionId });
+		if (this.#recyclePending) setTimeout(() => this.#maybeRecycle(), 0);
+	}
+
+	#dropRemoteAsks(state: SessionState): void {
+		for (const id of [...state.remoteAsks.keys()]) this.#dropRemoteAsk(state, id);
+	}
+
+	async #answerRemoteAsk(state: SessionState, id: string, answer: { kind: "value"; value: string } | { kind: "control"; controlId: string }): Promise<void> {
+		try {
+			const acp = await this.agent();
+			await this.#sdkRequest(acp, state, "control", "ask.answer", { id, answer });
+		} catch (error) {
+			// A terminal answer that won the race, or a transition, makes the id stale: the next listing shows what is left.
+			console.error(`ask.answer failed for ${state.sessionId}: ${error instanceof Error ? error.message : String(error)}`);
+		}
+		this.#syncRemoteAsks(state);
 	}
 
 	/** One tick per second while any session is working, so list rows show a live rate and chats gjc's queue. */
@@ -609,6 +721,7 @@ export class SessionHub {
 			const active = [...this.#sessions.values()].filter(isActive);
 			for (const state of active) {
 				this.#sampleHostAsks(state);
+				this.#syncRemoteAsks(state);
 				void Promise.all([this.#sampleUsage(state), this.#sampleQueue(state)]).finally(() => this.#publishStatus(state));
 			}
 			if (active.length === 0) {
@@ -682,6 +795,10 @@ export class SessionHub {
 				// The replay carries a waiting ask as failed ("ends without a result"); show it again as pending.
 				state.hostAsks.clear();
 				state.hostAskScan = undefined;
+				// The cards went with the ACP process that listed them (or are listed again below); the host may be another build.
+				this.#dropRemoteAsks(state);
+				state.remoteAsksDone.clear();
+				state.remoteAsksUnsupported = undefined;
 				const result = await acp.request("session/load", {
 					sessionId: state.sessionId,
 					cwd: state.cwd,
@@ -769,7 +886,7 @@ export class SessionHub {
 		if (mode !== "prompt") {
 			const kind = mode === "allow" ? "allow_once" : "reject_once";
 			for (const pending of this.#permissions.values()) {
-				if (pending.sessionId !== state.sessionId) continue;
+				if (pending.sessionId !== state.sessionId || pending.hostAsk) continue;
 				const option = pending.options.find(o => o.kind === kind);
 				if (option) pending.resolve({ outcome: "selected", optionId: option.optionId });
 			}

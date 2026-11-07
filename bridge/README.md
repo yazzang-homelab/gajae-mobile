@@ -56,6 +56,7 @@ npm 패키지 `gjcm-bridge`이며 [Bun](https://bun.sh)으로만 실행됩니다
 ## gjc 요구 사항
 
 - BTW 사이드 질문([BTW.ko.md](../docs/BTW.ko.md))은 gjc 0.19.3 이상이 필요합니다. 브리지가 세션 호스트의 `runtime.capabilities`를 보고 로컬 패치 0004의 `turn.btw`가 있으면 그것을, 없으면 공식 `btw.ask`로 보냅니다. 0.19.3의 `btw.ask`는 이전 문답(`exchanges`)을 받아도 무시하므로 브리지가 질문 본문에 붙이고, `btwAskExchangesVersion` 1을 광고하는 호스트(상류 gajae-code#7583 포함 릴리스)에는 `exchanges`로 그대로 넘깁니다. 둘 다 없는 gjc에서는 `host_outdated`로 앱에 전달합니다.
+- 터미널 턴의 ask에 폰에서 답하려면 세션 호스트가 `ask.requests.list`/`ask.answer`(상류 gajae-code#7611)를 지원해야 합니다. 0.19.3 다음 릴리스부터이며, 지원하면 선택형 질문이 권한 카드로 오고 고른 답이 터미널 질문에 들어갑니다. 0.19.3에서는 질문이 읽기 전용으로만 보이고 답은 터미널에서 합니다.
 - `GJC_ACP_SESSION_READINESS_TIMEOUT_MS`(허용 범위 4000–60000ms, 그 밖은 22000으로 되돌아감)는 **공식 gjc(0.19.3과 dev 포함)가 읽지 않습니다.** 로컬 패치 `0002-acp-session-readiness-timeout-env.patch`를 넣은 빌드에서만 적용됩니다. 서비스 예시와 e2e 명령에 남아 있는 값은 그런 빌드를 위한 것이고, 공식 빌드에서는 아무 효과가 없습니다. 공식 빌드에서는 바쁜 호스트의 콜드 재개가 22초에서 실패할 수 있습니다.
 
 ## 외부망에서 접속하기

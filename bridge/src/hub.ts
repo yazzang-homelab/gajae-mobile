@@ -20,9 +20,11 @@ import {
 	remoteAskCard,
 	remoteAskRequests,
 	scanTranscriptAsks,
+	terminalAsk,
 } from "./host-asks";
 import { SavedSessionIndex } from "./saved-sessions";
 import { Throughput } from "./throughput";
+import { TmuxLauncher, type TmuxOptions, tuiCommand } from "./tmux";
 
 export const TURN_END = "x_gjcm_turn_end";
 
@@ -162,6 +164,8 @@ interface SessionState {
 	remoteAskSync?: { again: boolean };
 	/** The session host has no `ask.requests.list` (gjc 0.19.3 and older): asks stay answerable in the terminal only. */
 	remoteAsksUnsupported?: boolean;
+	/** Opened by this bridge in a tmux window, so gjc in the terminal hosts it (asks show only there). */
+	inTmux?: boolean;
 }
 
 export interface SessionStatus {
@@ -220,6 +224,9 @@ export interface HubOptions {
 	maxBufferedUpdates?: number;
 	maxBufferedBytes?: number;
 	version: string;
+	/** Opt-in: open new sessions as windows of this tmux session (see tmux.ts). */
+	tmux?: TmuxOptions;
+	log?: (line: string) => void;
 }
 
 export interface OpenSnapshot {
@@ -236,8 +243,9 @@ export interface OpenSnapshot {
 }
 
 export class SessionHub {
-	#options: Required<Omit<HubOptions, "acp">> & { acp: AcpSpawnOptions };
+	#options: Required<Omit<HubOptions, "acp" | "tmux" | "log">> & Pick<HubOptions, "acp" | "log">;
 	readonly #saved: SavedSessionIndex;
+	readonly #tmux?: TmuxLauncher;
 	#acp?: AcpProcess;
 	#starting?: Promise<AcpProcess>;
 	#agentInfo: unknown;
@@ -252,6 +260,7 @@ export class SessionHub {
 	constructor(options: HubOptions) {
 		this.#options = { maxBufferedUpdates: 5000, maxBufferedBytes: 48 * 1024 * 1024, ...options };
 		this.#saved = new SavedSessionIndex(options.agentDir);
+		if (options.tmux) this.#tmux = new TmuxLauncher(options.tmux, tuiCommand(options.acp.command));
 	}
 
 	// ── clients ──────────────────────────────────────────────────────────────
@@ -375,7 +384,7 @@ export class SessionHub {
 		if (method !== "session/update" || typeof params?.sessionId !== "string") return;
 		const state = this.#stateFor(params.sessionId);
 		if (this.#holdEcho(state, params.update)) return;
-		this.#append(state, params.update);
+		this.#append(state, state.inTmux ? terminalAsk(params.update) : params.update);
 		this.#lookForHandOver(state, params.update);
 	}
 
@@ -802,7 +811,21 @@ export class SessionHub {
 		const cwd = params.cwd || this.#options.defaultCwd;
 		// gjc answers a missing cwd with "Lifecycle worktree does not exist" after spawning a session host.
 		if (!isDirectory(cwd)) throw new AcpError(-32602, `호스트에 작업 디렉터리가 없습니다: ${cwd}`);
+		const tmuxSkipped = this.#tmux && (await this.#tmux.unavailable());
+		if (tmuxSkipped) this.#options.log?.(`tmux skipped (opening over ACP): ${tmuxSkipped.slice(0, 200)}`);
 		const result = await acp.request("session/new", { cwd, mcpServers: [] });
+		if (this.#tmux && !tmuxSkipped) {
+			// ACP lets go of the session it just wrote, and gjc in the window resumes it; the phone then attaches
+			// to that TUI host like to any terminal session.
+			await acp.request("session/close", { sessionId: result.sessionId });
+			try {
+				await this.#tmux.open(result.sessionId, cwd);
+			} catch (error) {
+				throw new AcpError(-32021, error instanceof Error ? error.message : String(error));
+			}
+			this.#stateFor(result.sessionId, cwd).inTmux = true;
+			return this.openSession(clientId, { sessionId: result.sessionId, cwd });
+		}
 		const state = this.#stateFor(result.sessionId, cwd);
 		state.loaded = true;
 		state.configOptions = supportedConfigOptions(result.configOptions ?? state.configOptions);

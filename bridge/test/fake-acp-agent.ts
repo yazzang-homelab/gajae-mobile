@@ -3,6 +3,24 @@
  * fixtures/acp-echo-permission.trace (real gjc 0.18.7 output).
  */
 import fs from "node:fs";
+import path from "node:path";
+
+// Launched by the bridge's tmux path as the TUI (`<agent> --resume <id>`): like gjc, publish the session's SDK
+// endpoint under <cwd>/.gjc/state/sdk with this process's pid and stay up. `--tui=exit` quits at once,
+// `--tui=silent` never publishes.
+const resumeAt = process.argv.indexOf("--resume");
+if (resumeAt >= 0) {
+	const mode = process.argv.find(arg => arg.startsWith("--tui="))?.slice("--tui=".length);
+	if (mode === "exit") process.exit(1);
+	if (mode !== "silent") {
+		const dir = path.join(process.cwd(), ".gjc", "state", "sdk");
+		fs.mkdirSync(dir, { recursive: true });
+		const sessionId = process.argv[resumeAt + 1];
+		fs.writeFileSync(path.join(dir, `${sessionId}.json`), JSON.stringify({ version: 1, sessionId, pid: process.pid }));
+	}
+	setInterval(() => {}, 60_000);
+	await new Promise(() => {});
+}
 
 // Sessions persist across restarts like ~/.gjc/agent/sessions does for real gjc.
 const stateFile = process.env.FAKE_ACP_STATE;
@@ -88,6 +106,13 @@ async function handle(msg: any) {
 			attached.add(sessionId);
 			permissionModes.delete(sessionId);
 			persist();
+			// Like gjc's ACP session host, publish the SDK endpoint (it stays behind after session/close). Only the
+			// tmux tests, whose cwd is a scratch dir, need it.
+			const sdkDir = path.join(params.cwd, ".gjc", "state", "sdk");
+			if (process.env.GJCM_TEST_TMUX) {
+				fs.mkdirSync(sdkDir, { recursive: true });
+				fs.writeFileSync(path.join(sdkDir, `${sessionId}.json`), JSON.stringify({ version: 1, sessionId, pid: process.pid }));
+			}
 			reply({ sessionId, configOptions });
 			update(sessionId, { sessionUpdate: "session_info_update", _meta: { gjcPhase: "idle" } });
 			return;
@@ -113,6 +138,10 @@ async function handle(msg: any) {
 			persist();
 			saveTranscript(sessionId, params.cwd);
 			return reply({ sessionId, configOptions });
+		}
+		case "session/close": {
+			attached.delete(params.sessionId);
+			return reply({});
 		}
 		case "session/delete": {
 			sessions.delete(params.sessionId);
@@ -188,6 +217,12 @@ async function handle(msg: any) {
 				return reply({ stopReason: "cancelled" });
 			}
 			const kinds = params.prompt.map((b: any) => b.type).join(",");
+			if (texts.join(" ") === "ask me") {
+				// What gjc sends for an ask of an ACP turn in a session the TUI hosts: a bare tool_call, answered in the terminal.
+				const rawInput = { questions: [{ id: "fruit", question: "사과와 배 중 하나를 고르세요", options: [{ label: "사과" }, { label: "배" }], recommended: 0 }] };
+				update(sid, { sessionUpdate: "tool_call", toolCallId: "ask1", title: "과일 선택", kind: "other", status: "pending", rawInput });
+				update(sid, { sessionUpdate: "tool_call_update", toolCallId: "ask1", status: "completed", content: [{ type: "content", content: { type: "text", text: "User selected: 배" } }] });
+			}
 			if (texts.join(" ").includes("tool")) {
 				const toolCall = { toolCallId: "t1", title: "echo hi", kind: "execute", status: "pending", rawInput: { command: "echo hi" } };
 				update(sid, { sessionUpdate: "tool_call", ...toolCall });

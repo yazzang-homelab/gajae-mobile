@@ -44,7 +44,7 @@ npm 패키지 `gjcm-bridge`이며 [Bun](https://bun.sh)으로만 실행됩니다
 
 `sdk.query`/`sdk.control`은 gjc `_gjc/sdk/query|control` 패스스루이며(단, `turn.btw`는 브리지가 세션 호스트에 맞는 연산으로 바꿔 보냅니다. 아래 [gjc 요구 사항](#gjc-요구-사항) 참고) `src/hub.ts`의 `SDK_QUERIES`/`SDK_CONTROLS` 허용 목록 밖의 op는 -32601로 거부합니다. `context.get` 응답의 `systemPrompt` 본문(~40KB)은 잘라내고 `systemPromptChars`만 보냅니다.
 
-오류 코드: -32002 모르는 세션, -32003 실행 중(끼어들기가 턴을 다시 시작하는 동안 들어온 프롬프트 포함), -32020 SDK op 실패(gjc 메시지 또는 브리지 진단: `host_outdated` 등), -32601 허용 안 됨, -32602 잘못된 요청(`prompt_too_large`: 메시지가 gjc 0.19.3의 프롬프트 한도 256KiB를 넘음. 앱은 1.0.3부터 사진을 합쳐 180KB 안으로, 글이 길면 그만큼 더 작게 다시 인코딩합니다), -32010..-32014 업로드.
+오류 코드: -32002 모르는 세션, -32003 실행 중(끼어들기가 턴을 다시 시작하는 동안 들어온 프롬프트 포함), -32020 SDK op 실패(gjc 메시지 또는 브리지 진단: `host_outdated` 등), -32021 tmux 창에서 gjc가 준비되지 않음(아래 [새 세션을 tmux 창으로 열기](#새-세션을-tmux-창으로-열기-옵트인)), -32601 허용 안 됨, -32602 잘못된 요청(`prompt_too_large`: 메시지가 gjc 0.19.3의 프롬프트 한도 256KiB를 넘음. 앱은 1.0.3부터 사진을 합쳐 180KB 안으로, 글이 길면 그만큼 더 작게 다시 인코딩합니다), -32010..-32014 업로드.
 
 ## 세션 목록과 재개
 
@@ -52,6 +52,21 @@ npm 패키지 `gjcm-bridge`이며 [Bun](https://bun.sh)으로만 실행됩니다
 - 재개(세션 호스트 기동, `session/load`)는 0.19.3 격리 환경 콜드 실측 2.7초입니다. 이전에 바쁜 호스트에서 약 36초가 걸린 기록이 있고, 공식 gjc의 준비 타임아웃은 22초로 고정입니다.
 - 최근 답변이 긴 세션(최근 이벤트 합계가 1 MiB 초과)은 0.19.3에서 `cursor_expired`로 재개가 실패합니다. 상류 [gajae-code#7564](https://github.com/Yeachan-Heo/gajae-code/pull/7564)가 dev에 들어가 0.19.3 다음 릴리스에서 고쳐집니다.
 - ACP 프로세스의 브로커 소켓이 장시간 운영 뒤 망가지면 `SDK request outcome is uncertain after the frame was sent`가 납니다. 실행 중인 턴과 대기 중인 권한 요청이 없을 때 브리지가 ACP 프로세스를 자동으로 재시작합니다.
+
+## 새 세션을 tmux 창으로 열기 (옵트인)
+
+`serve --tmux-session gjcm`을 주면 앱의 "새 세션"이 tmux 세션 `gjcm`의 창 하나로 열립니다. 창에는 평소처럼 gjc TUI가 뜨고, 폰은 그 세션에 붙습니다. PC에서는 `tmux attach -t gjcm`(또는 접속 중인 tmux에서 prefix+`s`)으로 폰에서 시작한 작업을 그대로 이어 봅니다. 세션 이름을 `main`처럼 쓰고 있는 세션으로 주면 그 세션에 창이 생깁니다.
+
+- **tmux 서버가 이미 떠 있을 때만** 이렇게 엽니다. 서버가 없으면 지금처럼 ACP로 열고 이유를 로그에 남깁니다(`tmux skipped (opening over ACP): …`). 브리지가 서버를 띄우면 그 서버가 브리지 systemd 유닛의 cgroup에 들어가 브리지를 재시작할 때 창이 전부 같이 죽기 때문입니다. 대상 세션(`gjcm`)이 없으면 첫 창과 함께 만듭니다. 브리지는 tmux의 기본 소켓(같은 사용자의 `/tmp/tmux-<uid>/default`)을 씁니다.
+- 동작: ACP `session/new`로 세션을 만들고(gjc가 이때 기록 파일을 바로 씀니다) `session/close`로 놓아 준 뒤, `tmux new-window -d`로 `<--gjc에서 --mode=acp를 뺀 명령> --resume <id>`를 띄웁니다. 그 창의 프로세스가 `<cwd>/.gjc/state/sdk/<id>.json` endpoint를 쓰면 `session/load`로 붙습니다. TUI에서 새로 시작한 세션은 첫 답변 전까지 기록 파일이 없어 ACP `session/load`가 `Saved ACP session does not exist`로 실패하므로 이 순서를 씁니다(0.19.3 실측). gjc `--tmux`는 TTY가 있어야 하고 새 tmux 세션을 만들기 때문에 쓰지 않습니다.
+- 30초 안에 endpoint가 없거나 창의 gjc가 바로 끝나면 만든 창을 지우고 앱에 -32021과 이유를 돌려줍니다.
+- 실측(pve3, 공식 gjc 0.19.3, 2026-11-07, ACP가 떠 있는 상태): `session.new` 14.8~15.0초(ACP 경로 5.7~5.9초). 늘어난 시간은 창의 gjc 기동(endpoint까지 약 6.3초)과 다시 붙기입니다. 이 기능의 가치는 속도가 아니라 PC에서 이어 보기입니다.
+- 이 세션은 TUI가 소유합니다. 같은 실측에서 확인한 차이:
+  - 앱에서 보낸 턴은 TUI 화면에도 그대로 보입니다.
+  - **ask는 터미널에서만 답할 수 있습니다.** gjc는 앱이 시작한 턴의 ask도 TUI에 띄우고 폰에는 답할 수 없는 `tool_call`만 보냅니다(`session/request_permission` 없음, `workflow.gates.list` 비어 있음). 브리지는 이 카드에 질문·선택지와 "터미널에서 답" 안내를 붙이고, 터미널에서 고른 답과 턴 끝은 폰에 옵니다. 이 안내는 브리지가 이번 실행에서 tmux로 연 세션에만 붙습니다.
+  - 앱이 시작한 턴은 앱에서 멈출 수 있습니다(`session.cancel` 후 약 0.4초에 `cancelled`). 터미널에서 친 턴은 앱의 멈춤이 효과가 없습니다(상류 [gajae-code#7566](https://github.com/Yeachan-Heo/gajae-code/issues/7566)).
+  - 앱에서 채팅을 닫거나 브리지를 멈춰도 tmux 창과 TUI는 남습니다. 창은 터미널에서 닫습니다.
+- Windows 호스트와 tmux를 쓰지 않는 호스트에서는 이 옵션을 주지 않습니다.
 
 ## gjc 요구 사항
 

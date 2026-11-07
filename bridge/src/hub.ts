@@ -689,7 +689,8 @@ export class SessionHub {
 		const pending: PendingPermission = {
 			requestId,
 			sessionId: state.sessionId,
-			toolCall: { toolCallId, toolName: "ask", title: question, kind: "other", status: "pending", rawInput: { question } },
+			// No rawInput: the question is the title, and the ask row above already lists it with its options.
+			toolCall: { toolCallId, toolName: "ask", title: question, kind: "other", status: "pending" },
 			options: card.options,
 			hostAsk: true,
 			resolve: outcome => {

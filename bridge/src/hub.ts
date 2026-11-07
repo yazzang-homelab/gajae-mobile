@@ -152,6 +152,12 @@ interface SessionState {
 	remoteAsks: Map<string, PendingPermission>;
 	/** Ids answered or dismissed on a phone: never shown again, though a listing taken before may still carry them. */
 	remoteAsksDone: Set<string>;
+	/** Questions (`questionId`) dismissed on a phone: left to the terminal, also once a terminal toggle gives them a new id. */
+	remoteAsksDismissed: Set<string>;
+	/** `ask.answer` calls in flight; a pending recycle waits for them. */
+	remoteAskAnswers: number;
+	/** The last `ask.requests.list` failure logged, so a lasting one is logged once. */
+	remoteAskError?: string;
 	/** In-flight `ask.requests.list` read; `again` when another was asked for meanwhile. */
 	remoteAskSync?: { again: boolean };
 	/** The session host has no `ask.requests.list` (gjc 0.19.3 and older): asks stay answerable in the terminal only. */
@@ -357,7 +363,7 @@ export class SessionHub {
 			if (!this.#starting) this.#recyclePending = false;
 			return;
 		}
-		if ([...this.#sessions.values()].some(s => s.running) || this.#permissions.size > 0) return;
+		if ([...this.#sessions.values()].some(s => s.running || s.remoteAskAnswers > 0) || this.#permissions.size > 0) return;
 		this.#onExit(acp, null);
 		this.#restartDelayMs = 0;
 		acp.kill();
@@ -469,6 +475,8 @@ export class SessionHub {
 				queued: [],
 				remoteAsks: new Map(),
 				remoteAsksDone: new Set(),
+				remoteAsksDismissed: new Set(),
+				remoteAskAnswers: 0,
 				configOptions: [],
 				permissionMode: "prompt",
 				hostAsks: new Set(),
@@ -645,21 +653,28 @@ export class SessionHub {
 					try {
 						listed = remoteAskRequests(await this.#sdkRequest(acp, state, "query", "ask.requests.list", {}));
 					} catch (error) {
+						const message = error instanceof Error ? error.message : String(error);
 						if (error instanceof AcpError && (error.data as { code?: unknown } | undefined)?.code === "host_outdated") state.remoteAsksUnsupported = true;
-						else console.error(`ask.requests.list failed for ${state.sessionId}: ${error instanceof Error ? error.message : String(error)}`);
+						else if (state.remoteAskError !== message) console.error(`ask.requests.list failed for ${state.sessionId}: ${message}`);
+						state.remoteAskError = message;
 						return;
 					}
+					state.remoteAskError = undefined;
 					if (state.hostAsks.size === 0) return;
 					const live = new Set<string>();
 					for (const request of listed) {
 						if (request.sessionId !== undefined && request.sessionId !== state.sessionId) continue;
 						if (state.remoteAsksDone.has(request.id)) continue;
+						if (request.questionId !== undefined && state.remoteAsksDismissed.has(request.questionId)) continue;
 						const card = remoteAskCard(request);
 						if (!card) continue;
 						live.add(request.id);
-						if (!state.remoteAsks.has(request.id)) this.#showRemoteAsk(state, request.id, request.question, card);
+						if (!state.remoteAsks.has(request.id)) this.#showRemoteAsk(state, request.id, request.questionId, request.question, card);
 					}
 					for (const id of [...state.remoteAsks.keys()]) if (!live.has(id)) this.#dropRemoteAsk(state, id);
+					// Dismissed questions the host no longer lists are done with.
+					const listedQuestions = new Set(listed.map(r => r.questionId));
+					for (const questionId of state.remoteAsksDismissed) if (!listedQuestions.has(questionId)) state.remoteAsksDismissed.delete(questionId);
 				} while (sync.again);
 			} finally {
 				state.remoteAskSync = undefined;
@@ -667,7 +682,7 @@ export class SessionHub {
 		})();
 	}
 
-	#showRemoteAsk(state: SessionState, id: string, question: string, card: RemoteAskCard): void {
+	#showRemoteAsk(state: SessionState, id: string, questionId: string | undefined, question: string, card: RemoteAskCard): void {
 		const requestId = `perm-${this.#nextPermission++}`;
 		// The ask row on the phone carries the transcript's tool call id; with several pending, the card stands alone.
 		const toolCallId = state.hostAsks.size === 1 ? [...state.hostAsks][0]! : `ask-${id}`;
@@ -680,6 +695,8 @@ export class SessionHub {
 			resolve: outcome => {
 				// Dismissing the card leaves the question to the terminal.
 				const answer = outcome.outcome === "selected" ? card.answers.get(outcome.optionId) : undefined;
+				if (!answer && questionId !== undefined) state.remoteAsksDismissed.add(questionId);
+				if (answer) state.remoteAskAnswers++;
 				this.#dropRemoteAsk(state, id);
 				if (answer) void this.#answerRemoteAsk(state, id, answer);
 			},
@@ -709,9 +726,16 @@ export class SessionHub {
 			await this.#sdkRequest(acp, state, "control", "ask.answer", { id, answer });
 		} catch (error) {
 			// A terminal answer that won the race, or a transition, makes the id stale: the next listing shows what is left.
-			console.error(`ask.answer failed for ${state.sessionId}: ${error instanceof Error ? error.message : String(error)}`);
+			// Anything else did not reach the question: show the card again if it is still listed.
+			if (!(error instanceof AcpError && (error.data as { code?: unknown } | undefined)?.code === "stale_request")) {
+				state.remoteAsksDone.delete(id);
+				console.error(`ask.answer failed for ${state.sessionId}: ${error instanceof Error ? error.message : String(error)}`);
+			}
+		} finally {
+			state.remoteAskAnswers--;
 		}
 		this.#syncRemoteAsks(state);
+		if (this.#recyclePending) setTimeout(() => this.#maybeRecycle(), 0);
 	}
 
 	/** One tick per second while any session is working, so list rows show a live rate and chats gjc's queue. */
@@ -798,6 +822,7 @@ export class SessionHub {
 				// The cards went with the ACP process that listed them (or are listed again below); the host may be another build.
 				this.#dropRemoteAsks(state);
 				state.remoteAsksDone.clear();
+				state.remoteAsksDismissed.clear();
 				state.remoteAsksUnsupported = undefined;
 				const result = await acp.request("session/load", {
 					sessionId: state.sessionId,

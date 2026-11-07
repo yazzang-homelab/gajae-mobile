@@ -129,6 +129,8 @@ function askQuestions(input: unknown): { question: string; options: string[] }[]
  */
 export interface RemoteAskRequest {
 	id: string;
+	/** Stable across toggles and selector/editor transitions of one question (the contract's card identity). */
+	questionId?: string;
 	sessionId?: string;
 	question: string;
 	options: string[];
@@ -159,6 +161,7 @@ export function remoteAskRequests(result: unknown): RemoteAskRequest[] {
 		return [
 			{
 				id: item.id,
+				questionId: typeof item.questionId === "string" ? item.questionId : undefined,
 				sessionId: typeof item.sessionId === "string" ? item.sessionId : undefined,
 				question: item.question,
 				options: item.options,
@@ -186,13 +189,14 @@ export function remoteAskCard(request: RemoteAskRequest): RemoteAskCard | undefi
 	const picks = request.options.slice(0, request.options.length - transitions);
 	const controls = request.controls.filter(c => c.enabled);
 	if (picks.length === 0 && controls.length === 0) return undefined;
-	const marked = request.selectedOptions !== undefined && request.selectedOptions.length > 0;
+	// Marked from the first card of a multi-select, so it reads as one to toggle before anything is picked.
+	const marked = request.multi === true || (request.selectedOptions !== undefined && request.selectedOptions.length > 0);
 	const recommended = request.recommendedIndex !== undefined && request.recommendedIndex >= 0 ? picks[request.recommendedIndex] : undefined;
 	const answers = new Map<string, RemoteAskAnswer>();
 	const options = picks.map((label, index) => {
 		const optionId = `option:${index}`;
 		answers.set(optionId, { kind: "value", value: label });
-		const name = marked ? `${request.selectedOptions!.includes(label) ? "[x] " : "[ ] "}${label}` : label;
+		const name = marked ? `${request.selectedOptions?.includes(label) ? "[x] " : "[ ] "}${label}` : label;
 		return { optionId, name: label === recommended ? `${name} (추천)` : name, kind: "allow_once" };
 	});
 	for (const control of controls) {

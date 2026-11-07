@@ -905,7 +905,7 @@ describe("sessions over the bridge", () => {
 			const first = selector("req-1", { multi: true, options: ["A", "B"], transitionCount: 0, selectedOptions: [], controls: [{ ...done, enabled: false }], next: second });
 			const { client, sid, askUpdate } = await hostAsk({ FAKE_ASK_LIST: "q34" }, [first]);
 			const card1 = (await client.waitFor(e => e.ev === "permission.request" && e.p.sessionId === sid, 3000)).p;
-			expect(card1.options.map((o: any) => o.name)).toEqual(["A", "B"]);
+			expect(card1.options.map((o: any) => o.name)).toEqual(["[ ] A", "[ ] B"]);
 			await client.request("permission.respond", { requestId: card1.requestId, optionId: "option:0" });
 			const card2 = (await client.waitFor(e => e.ev === "permission.request" && e.p.requestId !== card1.requestId, 3000)).p;
 			expect(card2.options).toEqual([
@@ -927,8 +927,12 @@ describe("sessions over the bridge", () => {
 			await Bun.sleep(2500);
 			expect(client.events.filter(e => e.ev === "permission.request")).toHaveLength(1);
 
-			// A second request (the next question) is shown; the terminal then answers the ask.
-			await client.request("sdk.control", { sessionId: sid, op: "turn.steer", input: { text: `host ask ${JSON.stringify([selector("req-2")])}` } });
+			// A terminal toggle gives the same question a new id: still left to the terminal.
+			await client.request("sdk.control", { sessionId: sid, op: "turn.steer", input: { text: `host ask ${JSON.stringify([selector("req-1b")])}` } });
+			await Bun.sleep(2500);
+			expect(client.events.filter(e => e.ev === "permission.request")).toHaveLength(1);
+			// The next question is shown; the terminal then answers the ask.
+			await client.request("sdk.control", { sessionId: sid, op: "turn.steer", input: { text: `host ask ${JSON.stringify([selector("req-2", { questionId: "q2" })])}` } });
 			const next = (await client.waitFor(e => e.ev === "permission.request" && e.p.requestId !== card.requestId, 3000)).p;
 			fs.appendFileSync(file, `${JSON.stringify({ type: "message", message: { role: "toolResult", toolCallId: askId, toolName: "ask", content: [{ type: "text", text: "User selected: B" }] } })}\n`);
 			await client.waitFor(askUpdate("completed"), 3000);
@@ -936,11 +940,22 @@ describe("sessions over the bridge", () => {
 			expect(await client.request("permission.list", {})).toEqual({ requests: [] });
 		});
 
-		test("a host without it (gjc 0.19.3) keeps the read-only row and no card", async () => {
-			const { client, askUpdate } = await hostAsk({}, [selector("req-1")]);
+		test("a host without it (gjc 0.19.3) keeps the read-only row and no card, asked once", async () => {
+			const { bridge, client, askUpdate } = await hostAsk({}, [selector("req-1")]);
 			await client.waitFor(askUpdate("pending"), 3000);
 			await Bun.sleep(2500);
 			expect(client.events.filter(e => e.ev === "permission.request")).toEqual([]);
+			expect(fs.readFileSync(path.join(bridge.home, "agent", "ask-list-calls"), "utf8")).toBe("x");
+		});
+
+		test("an answer that fails short of the question shows the card again", async () => {
+			const { client, sid, askUpdate } = await hostAsk({ FAKE_ASK_LIST: "q34" }, [selector("req-1", { failOnce: true })]);
+			const card = (await client.waitFor(e => e.ev === "permission.request" && e.p.sessionId === sid, 3000)).p;
+			await client.request("permission.respond", { requestId: card.requestId, optionId: "option:1" });
+			const again = (await client.waitFor(e => e.ev === "permission.request" && e.p.requestId !== card.requestId, 3000)).p;
+			await client.request("permission.respond", { requestId: again.requestId, optionId: "option:1" });
+			const answered = await client.waitFor(askUpdate("completed"), 4000);
+			expect(answered.p.update.content[0].content.text).toBe("User selected: B (1 answers)");
 		});
 	});
 

@@ -39,6 +39,7 @@ interface FakeAskRequest {
 	id: string;
 	toolCallId: string;
 	next?: FakeAskRequest;
+	failOnce?: boolean;
 	[key: string]: unknown;
 }
 const remoteAsks = new Map<string, FakeAskRequest[]>();
@@ -258,10 +259,11 @@ async function handle(msg: any) {
 				return reply({ type: "query_response", id: "q", ok: true, page: { items: [item], complete: true } });
 			}
 			if (params.query === "ask.requests.list") {
+				if (agentDir) fs.appendFileSync(`${agentDir}/ask-list-calls`, "x");
 				// FAKE_ASK_LIST=q34 stands for a session host with gajae-code#7611; without it, as gjc 0.19.3, no such query.
 				if (process.env.FAKE_ASK_LIST !== "q34")
 					return reply({ type: "query_response", id: "q", ok: false, error: { code: "unknown_operation", message: `Unknown query operation: ${params.query}` } });
-				const items = (remoteAsks.get(params.sessionId) ?? []).map(({ toolCallId: _, next: __, ...item }) => item);
+				const items = (remoteAsks.get(params.sessionId) ?? []).map(({ toolCallId: _, next: __, failOnce: ___, ...item }) => item);
 				return reply({ type: "query_response", id: "q", ok: true, page: { items, complete: true, revision: "r" } });
 			}
 			if (params.query === "context.get")
@@ -290,6 +292,11 @@ async function handle(msg: any) {
 				const asks = remoteAsks.get(params.sessionId) ?? [];
 				const request = asks.find(r => r.id === params.input?.id);
 				if (!request) return reply({ ok: false, error: { code: "stale_request", message: "stale" } });
+				// `failOnce`: the first answer fails short of the question (a transport error, not a stale id).
+				if (request.failOnce) {
+					request.failOnce = false;
+					return reply({ ok: false, error: { code: "internal", message: "transport lost" } });
+				}
 				askAnswers.push({ sessionId: params.sessionId, id: request.id, answer: params.input.answer });
 				remoteAsks.set(params.sessionId, [...asks.filter(r => r !== request), ...(request.next ? [request.next] : [])]);
 				if (!request.next) {

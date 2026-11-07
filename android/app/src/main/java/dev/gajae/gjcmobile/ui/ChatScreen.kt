@@ -294,7 +294,7 @@ fun TranscriptRow(item: TranscriptItem, showThinking: Boolean) {
         }
         is TranscriptItem.Kind.Agent -> MarkdownText(kind.text)
         is TranscriptItem.Kind.Thought -> ThoughtView(kind.text, showThinking)
-        is TranscriptItem.Kind.Tool -> ToolCallView(kind.call)
+        is TranscriptItem.Kind.Tool -> if (kind.call.hostAsk) TerminalAskView(kind.call) else ToolCallView(kind.call)
         is TranscriptItem.Kind.Plan -> PlanView(kind.entries)
         is TranscriptItem.Kind.TurnEnded -> when {
             kind.error != null -> Text("⚠ ${kind.error}", style = MaterialTheme.typography.labelMedium, color = Palette.gajaeRed)
@@ -450,6 +450,33 @@ private fun ToolCallView(call: ToolCall) {
                     SelectionContainer { Text(call.output.takeLast(8000), fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.labelSmall, color = Palette.cream) }
                 }
             }
+        }
+    }
+}
+
+/** Question answered in the host terminal (gjc TUI): read-only, never button-like. */
+@Composable
+private fun TerminalAskView(call: ToolCall) {
+    val questions = call.terminalQuestions
+    Column(
+        Modifier.fillMaxWidth().card(stroke = when (call.status) { "failed" -> Palette.gajaeRed; "completed" -> Palette.shellLine; else -> Palette.strawGold }).padding(10.dp),
+        verticalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        Text("터미널 질문", style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.Bold, color = Palette.strawGold)
+        if (questions.isEmpty()) {
+            // Without questions to show, the bridge's text stands in while waiting; once settled, output is the answer.
+            if (!call.isFinished && call.output.isNotEmpty()) SelectionContainer { Text(call.output, style = MaterialTheme.typography.bodySmall, color = Palette.cream) }
+        } else {
+            questions.forEach { q ->
+                SelectionContainer { Text(q.question, style = MaterialTheme.typography.bodyMedium, color = Palette.cream) }
+                if (q.multi) Text("여러 개 선택", style = MaterialTheme.typography.labelSmall, color = Palette.muted)
+                q.options.forEach { Text("• $it", style = MaterialTheme.typography.labelMedium, color = Palette.muted) }
+            }
+        }
+        when (call.status) {
+            "completed" -> Text("✓ " + call.output.ifEmpty { "터미널에서 답했습니다." }, style = MaterialTheme.typography.labelMedium, color = Palette.visorGreen)
+            "failed" -> Text("⚠ " + call.output.ifEmpty { "답을 받지 못했습니다." }, style = MaterialTheme.typography.labelMedium, color = Palette.gajaeRed)
+            else -> Text("터미널에서 답하세요. 승인 카드가 뜨면 폰에서도 고를 수 있습니다.", style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.Bold, color = Palette.strawGold)
         }
     }
 }

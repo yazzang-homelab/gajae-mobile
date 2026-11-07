@@ -34,6 +34,16 @@ const cancellable = new Map<string, () => void>();
 // them here, so the bridge's clean-up path is exercised.
 const steers = new Map<string, { id: string; text: string; mode: "steer" | "followUp"; label: string }[]>();
 let nextSteer = 1;
+/** What ask.requests.list lists per session; `toolCallId` and `next` (listed after a non-final pick) stay in the fake. */
+interface FakeAskRequest {
+	id: string;
+	toolCallId: string;
+	next?: FakeAskRequest;
+	failOnce?: boolean;
+	[key: string]: unknown;
+}
+const remoteAsks = new Map<string, FakeAskRequest[]>();
+const askAnswers: { sessionId: string; id: string; answer: unknown }[] = [];
 // Sessions with a turn typed in the TUI ("terminal turn" … "terminal done"), which no ACP prompt owns.
 const terminalTurns = new Set<string>();
 // ACP prompts that arrived during a terminal turn. Like gjc 0.19.3 (measured 2026-11-06 on pve3): such a prompt waits
@@ -248,6 +258,14 @@ async function handle(msg: any) {
 				const item = { operations, hostTools: false, ...(btw.endsWith("-exchanges") ? { btwAskExchangesVersion: 1 } : {}) };
 				return reply({ type: "query_response", id: "q", ok: true, page: { items: [item], complete: true } });
 			}
+			if (params.query === "ask.requests.list") {
+				if (agentDir) fs.appendFileSync(`${agentDir}/ask-list-calls`, "x");
+				// FAKE_ASK_LIST=q34 stands for a session host with gajae-code#7611; without it, as gjc 0.19.3, no such query.
+				if (process.env.FAKE_ASK_LIST !== "q34")
+					return reply({ type: "query_response", id: "q", ok: false, error: { code: "unknown_operation", message: `Unknown query operation: ${params.query}` } });
+				const items = (remoteAsks.get(params.sessionId) ?? []).map(({ toolCallId: _, next: __, failOnce: ___, ...item }) => item);
+				return reply({ type: "query_response", id: "q", ok: true, page: { items, complete: true, revision: "r" } });
+			}
 			if (params.query === "context.get")
 				return reply({ type: "query_response", id: "q", ok: true, page: { items: [{ usage: { tokens: 1200, contextWindow: 100000, percent: 1.2 }, systemPrompt: ["abc", "de"] }], complete: true } });
 			return reply({ type: "query_response", id: "q", ok: false, error: { code: "unsupported", message: `no ${params.query}` } });
@@ -269,8 +287,35 @@ async function handle(msg: any) {
 				thinkingLevels.set(params.sessionId, params.input.level);
 				return reply({ changed: true });
 			}
+			if (params.operation === "ask.answer") {
+				// The listed request leaves; a commit writes the ask's toolResult as gjc does, a toggle/next lists `next`.
+				const asks = remoteAsks.get(params.sessionId) ?? [];
+				const request = asks.find(r => r.id === params.input?.id);
+				if (!request) return reply({ ok: false, error: { code: "stale_request", message: "stale" } });
+				// `failOnce`: the first answer fails short of the question (a transport error, not a stale id).
+				if (request.failOnce) {
+					request.failOnce = false;
+					return reply({ ok: false, error: { code: "internal", message: "transport lost" } });
+				}
+				askAnswers.push({ sessionId: params.sessionId, id: request.id, answer: params.input.answer });
+				remoteAsks.set(params.sessionId, [...asks.filter(r => r !== request), ...(request.next ? [request.next] : [])]);
+				if (!request.next) {
+					const value = params.input.answer?.value ?? params.input.answer?.controlId;
+					const file = `${agentDir}/sessions/v2-fake/2026-10-26T00-00-00-000Z_${params.sessionId}.jsonl`;
+					fs.appendFileSync(
+						file,
+						`${JSON.stringify({ type: "message", message: { role: "toolResult", toolCallId: request.toolCallId, toolName: "ask", content: [{ type: "text", text: `User selected: ${value} (${askAnswers.length} answers)` }] } })}\n`,
+					);
+				}
+				return reply({ id: request.id, sessionId: params.sessionId, settlement: { kind: request.next ? "resolve_without_commit" : "commit" } });
+			}
 			if (params.operation === "turn.steer") {
 				const text = String(params.input?.text ?? "");
+				// "host ask <json>" stands for the TUI showing those ask requests (what ask.requests.list lists).
+				if (text.startsWith("host ask ")) {
+					remoteAsks.set(params.sessionId, JSON.parse(text.slice("host ask ".length)));
+					return reply({ accepted: true });
+				}
 				// "terminal turn" stands for a turn typed in the TUI: gjc reports it working, but no ACP prompt owns it.
 				if (text === "terminal turn") {
 					terminalTurns.add(params.sessionId);

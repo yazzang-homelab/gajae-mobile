@@ -85,6 +85,7 @@ GCM nonce = 0x00000000 ‖ 카운터,  AAD = "gjcm1"
    - 세션 호스트는 원래 턴 내용을 그 턴을 보낸 연결과 관찰자(observer) 연결에만 보냈습니다. ACP는 둘 다 아니어서 0.19.3 이전 gjc에서는 앱에 working/idle만 보입니다.
    - ACP를 관찰자로 만들면 안 됩니다. 분리된 세션 호스트는 관찰자만 붙어 있으면 스스로 종료하므로 앱이 연 세션이 사라집니다. 상류 수정도 관찰자로 만들지 않고 턴 스트림만 보냅니다.
    - 호스트 쪽 코드가 필요하므로 0.19.3 이전 gjc로 시작된 터미널 세션은 그 gjc를 다시 시작해야 보입니다. 실측(2026-11-04, 공식 0.19.3, 패치 없음): TUI 턴의 bash `tool_call`과 진행·완료, ask, 답변, idle이 실시간 도착.
+   - 터미널 턴의 ask는 브리지가 대화 기록(transcript)에서 찾아 읽기 전용 행으로 보여 줍니다. 세션 호스트가 `ask.requests.list`를 지원하면(상류 [gajae-code#7611](https://github.com/Yeachan-Heo/gajae-code/pull/7611), 0.19.3 다음 릴리스) 그 질문을 권한 카드로도 띄우고, 폰의 선택을 `ask.answer`로 보냅니다. gjc가 헤드리스 세션의 ask를 ACP 클라이언트에 넘기는 방식(`createSdkPermissionAskAnswerSource`)과 같습니다: 선택형 질문만, 자유 입력("Other")은 빼고, 다중 선택은 한 번에 하나씩 토글한 뒤 '완료' 같은 컨트롤로 끝냅니다. 카드를 닫으면 터미널에 맡기고, 터미널이 먼저 답하면 카드를 내립니다. 권한 모드(allow/deny)는 ask에 답하지 않습니다. 0.19.3 호스트는 이 조회가 `unknown_operation`이라 읽기 전용 행만 남습니다. 실측(2026-11-07, 상류 dev 소스 TUI + 브리지): 질문이 TUI에 뜬 뒤 0.3초 안에 카드가 왔고, 폰에서 고른 답이 TUI 질문에 들어가 모델이 이어서 답했습니다.
 7. 추론은 `agent_thought_chunk`로 와서 "추론" 블록으로 보입니다. Anthropic 요약 추론과 OpenAI Responses 추론 요약은 `thinking_delta`가 아니라 `reasoning_summary_*` 이벤트로 옵니다.
    - 공식 0.19.3의 ACP 매퍼는 이를 버리므로 앱에 추론이 오지 않습니다. 근거는 코드입니다(아래 #7557은 v0.19.3 태그에 없음). 실측은 0.19.3 이전의 0.19.0 dev에서 한 것입니다(2026-10-26, opus-5-5 medium: `agent_message_chunk` 56개, `agent_thought_chunk` 0개).
    - 상류 [gajae-code#7557](https://github.com/Yeachan-Heo/gajae-code/pull/7557)이 dev에 들어가 0.19.3 다음 릴리스부터 요약 델타가 추론 청크로 옵니다.

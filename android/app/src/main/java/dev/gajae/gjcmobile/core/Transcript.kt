@@ -124,7 +124,9 @@ class SessionTranscript {
                 for (index in toolIndex.values) {
                     val call = (rows[index].kind as? TranscriptItem.Kind.Tool)?.call ?: continue
                     if (call.isFinished) continue
-                    rows[index] = rows[index].copy(kind = TranscriptItem.Kind.Tool(call.copy(status = if (reason == "end_turn") "completed" else "failed")))
+                    // A terminal question still open when the turn ends got no answer; its output is only the waiting notice.
+                    val ended = if (call.hostAsk) call.copy(status = "failed", output = "") else call.copy(status = if (reason == "end_turn") "completed" else "failed")
+                    rows[index] = rows[index].copy(kind = TranscriptItem.Kind.Tool(ended))
                 }
             }
             "x_gjcm_permission_mode" -> PermissionMode.of(u["mode"].str)?.let { permissionMode = it }

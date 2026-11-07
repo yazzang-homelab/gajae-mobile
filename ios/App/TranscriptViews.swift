@@ -163,13 +163,15 @@ struct TerminalAskView: View {
         VStack(alignment: .leading, spacing: 6) {
             Label("터미널 질문", systemImage: "terminal").font(.caption.bold()).foregroundStyle(Palette.strawGold)
             if questions.isEmpty {
-                if !call.output.isEmpty {
+                // Without questions to show, the bridge's text stands in while waiting; once settled, output is the answer.
+                if !call.isFinished && !call.output.isEmpty {
                     Text(call.output).font(.caption).foregroundStyle(Palette.cream).textSelection(.enabled)
                 }
             } else {
                 ForEach(Array(questions.enumerated()), id: \.offset) { _, q in
                     VStack(alignment: .leading, spacing: 2) {
                         Text(q.question).font(.callout).foregroundStyle(Palette.cream).textSelection(.enabled)
+                        if q.multi { Text("여러 개 선택").font(.caption2).foregroundStyle(Palette.muted) }
                         ForEach(Array(q.options.enumerated()), id: \.offset) { _, option in
                             Text("• " + option).font(.caption).foregroundStyle(Palette.muted)
                         }
@@ -189,7 +191,7 @@ struct TerminalAskView: View {
         }
         .padding(10)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .card(stroke: call.status == "failed" ? Palette.gajaeRed : Palette.strawGold)
+        .card(stroke: call.status == "failed" ? Palette.gajaeRed : call.status == "completed" ? Palette.shellLine : Palette.strawGold)
     }
 }
 

@@ -167,7 +167,13 @@ public struct SessionTranscript: Equatable, Sendable {
             if reason != "end_turn" { push(.turnEnded(stopReason: reason, error: u["error"]?.string)) }
             for index in toolIndex.values {
                 guard case var .tool(call) = items[index].kind, !call.isFinished else { continue }
-                call.status = reason == "end_turn" ? "completed" : "failed"
+                if call.hostAsk {
+                    // A terminal question still open when the turn ends got no answer; its output is only the waiting notice.
+                    call.status = "failed"
+                    call.output = ""
+                } else {
+                    call.status = reason == "end_turn" ? "completed" : "failed"
+                }
                 items[index].kind = .tool(call)
             }
         case "x_gjcm_permission_mode":

@@ -157,6 +157,26 @@ final class HostAskTests: XCTestCase {
         XCTAssertFalse(call.hostAsk)
         XCTAssertEqual(call.status, "completed")
     }
+
+    func testTurnEndFailsOpenTerminalQuestionWithoutWaitingNotice() throws {
+        var t = SessionTranscript()
+        t.apply(SequencedUpdate(seq: 1, update: ["sessionUpdate": "tool_call", "toolCallId": "a", "title": "ask", "status": "pending", "rawInput": input, "_meta": meta,
+                                                 "content": [["type": "content", "content": ["type": "text", "text": "배포할까요?\n터미널에서 답을 기다리는 질문입니다."]]]]))
+        t.apply(SequencedUpdate(seq: 2, update: ["sessionUpdate": "x_gjcm_turn_end", "stopReason": "end_turn"]))
+        let call = try XCTUnwrap(t.items.compactMap { item -> ToolCall? in if case let .tool(c) = item.kind { return c } else { return nil } }.first)
+        XCTAssertEqual(call.status, "failed")
+        XCTAssertEqual(call.output, "")
+    }
+
+    func testReplayedFailedAskReturnsToPendingTerminalQuestion() throws {
+        // A reload replays a waiting ask as failed (no result yet); the bridge then shows it again as pending.
+        var t = SessionTranscript()
+        t.apply(SequencedUpdate(seq: 1, update: ["sessionUpdate": "tool_call", "toolCallId": "a", "title": "ask", "status": "failed", "rawInput": input]))
+        t.apply(SequencedUpdate(seq: 2, update: ["sessionUpdate": "tool_call", "toolCallId": "a", "title": "ask: 배포할까요?", "status": "pending", "rawInput": input, "_meta": meta]))
+        let call = try XCTUnwrap(askCall(t))
+        XCTAssertTrue(call.hostAsk)
+        XCTAssertEqual(call.status, "pending")
+    }
 }
 
 final class ModelTests: XCTestCase {

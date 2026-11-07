@@ -464,10 +464,12 @@ private fun TerminalAskView(call: ToolCall) {
     ) {
         Text("터미널 질문", style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.Bold, color = Palette.strawGold)
         if (questions.isEmpty()) {
-            if (call.output.isNotEmpty()) SelectionContainer { Text(call.output, style = MaterialTheme.typography.bodySmall, color = Palette.cream) }
+            // Without questions to show, the bridge's text stands in while waiting; once settled, output is the answer.
+            if (!call.isFinished && call.output.isNotEmpty()) SelectionContainer { Text(call.output, style = MaterialTheme.typography.bodySmall, color = Palette.cream) }
         } else {
             questions.forEach { q ->
                 SelectionContainer { Text(q.question, style = MaterialTheme.typography.bodyMedium, color = Palette.cream) }
+                if (q.multi) Text("여러 개 선택", style = MaterialTheme.typography.labelSmall, color = Palette.muted)
                 q.options.forEach { Text("• $it", style = MaterialTheme.typography.labelMedium, color = Palette.muted) }
             }
         }

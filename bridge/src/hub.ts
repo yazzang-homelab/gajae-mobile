@@ -20,9 +20,12 @@ import {
 	remoteAskCard,
 	remoteAskRequests,
 	scanTranscriptAsks,
+	terminalAsk,
 } from "./host-asks";
 import { SavedSessionIndex } from "./saved-sessions";
 import { Throughput } from "./throughput";
+import { SdkCli } from "./sdk-cli";
+import { TmuxError, TmuxLauncher, type TmuxOptions, tuiCommand } from "./tmux";
 
 export const TURN_END = "x_gjcm_turn_end";
 
@@ -96,9 +99,11 @@ export interface PendingPermission {
 	sessionId: string;
 	toolCall: unknown;
 	options: Array<{ optionId: string; name: string; kind: string }>;
-	resolve(outcome: PermissionOutcome): void;
+	resolve(outcome: PermissionOutcome): void | Promise<void>;
 	/** A TUI ask answered through `ask.answer` (see `SessionHub.#syncRemoteAsks`), not a guarded tool: no mode answers it. */
 	hostAsk?: boolean;
+	/** Shown from a tmux session's approval channel rather than asked over ACP (see `SessionHub.#enableChannel`). */
+	fromChannel?: boolean;
 }
 
 interface SessionState {
@@ -162,6 +167,23 @@ interface SessionState {
 	remoteAskSync?: { again: boolean };
 	/** The session host has no `ask.requests.list` (gjc 0.19.3 and older): asks stay answerable in the terminal only. */
 	remoteAsksUnsupported?: boolean;
+	/** Opened by this bridge in a tmux window, so gjc in the terminal hosts it (asks show only there). */
+	inTmux?: boolean;
+	/** That window's permission approval channel, which brings its tool approvals to the phones (see `#readChannel`). */
+	channel?: ApprovalChannel;
+	/** While `session/load` replays the history: no channel reads for replayed tool calls. */
+	replaying?: boolean;
+	/** `seq` once the last load's replay ended: a phone that last saw less gets a full snapshot, never the replay as news. */
+	historySeq: number;
+	/** The permission mode last announced to the phones (`shownPermissionMode`). */
+	shownMode?: PermissionMode;
+	/** A reload the bridge started on its own (`#reattach`): its replay is kept from phones already showing the chat. */
+	quietReplay?: boolean;
+	/**
+	 * Phones (`HubClient.device`) that showed the chat during a quiet replay: they lack what the terminal did while gjc ACP
+	 * was gone, and their later live updates hide that from `afterSeq`, so their next open gets a full snapshot.
+	 */
+	resync: Set<string>;
 }
 
 export interface SessionStatus {
@@ -171,6 +193,57 @@ export interface SessionStatus {
 	tokensPerSecond?: number;
 	/** gjc's waiting steers and follow-ups, read once a second while the session works; empty when idle. */
 	queued: QueuedMessage[];
+}
+
+/** A tmux session's permission approval channel as the bridge follows it (see `SessionHub.#enableChannel`). */
+interface ApprovalChannel {
+	/** Requests shown to the phones, by gjc's request id. */
+	requests: Map<string, { requestId: string; toolCallId: string }>;
+	/** Tool calls that arrived pending and are not listed in the channel yet. */
+	waitingTools: Set<string>;
+	/** Requests answered or taken down, never shown again. */
+	settled: Set<string>;
+	reading?: Promise<void>;
+	/** Another read was asked for while one ran. */
+	again?: boolean;
+}
+
+/** `permission.requests.list` item (gjc external-permissions.ts). */
+interface ChannelRequest {
+	id: string;
+	toolCallId: string;
+	toolCall: unknown;
+	options: PendingPermission["options"];
+}
+
+/**
+ * The permission mode a phone is shown. A session gjc hosts in a tmux window runs guarded tools unasked unless its
+ * approval channel is on (measured on gjc 0.19.3), so `prompt` without the channel is shown as what happens: `allow`.
+ */
+function shownPermissionMode(state: SessionState): PermissionMode {
+	return state.inTmux && !state.channel && state.permissionMode === "prompt" ? "allow" : state.permissionMode;
+}
+
+/** Reads per trigger at most, and the wait between them while a pending tool call is not listed yet. */
+const CHANNEL_READS = 4;
+const CHANNEL_RETRY_MS = 1000;
+
+/** `permission.requests.list` result (`{sessionId, enabled, requests:[{id, sessionId, expiresAt, options, toolCall}]}`). */
+function channelRequests(result: unknown): { enabled: boolean; requests: ChannelRequest[] } {
+	const { enabled, requests } = (result ?? {}) as { enabled?: unknown; requests?: unknown };
+	return { enabled: enabled !== false, requests: Array.isArray(requests) ? channelRequestItems(requests) : [] };
+}
+
+function channelRequestItems(requests: unknown[]): ChannelRequest[] {
+	return requests.flatMap(item => {
+		const r = item as { id?: unknown; options?: unknown; toolCall?: { toolCallId?: unknown } };
+		if (typeof r.id !== "string" || !Array.isArray(r.options) || typeof r.toolCall?.toolCallId !== "string") return [];
+		const options = r.options.filter(
+			(o): o is PendingPermission["options"][number] =>
+				typeof o?.optionId === "string" && typeof o?.name === "string" && typeof o?.kind === "string",
+		);
+		return [{ id: r.id, toolCallId: r.toolCall.toolCallId, toolCall: r.toolCall, options }];
+	});
 }
 
 /** The echo of a phone prompt queued behind a TUI turn, held until gjc hands the prompt to the model. */
@@ -209,6 +282,8 @@ const STREAMED_TEXT_UPDATES = new Set(["agent_message_chunk", "agent_thought_chu
 
 export interface HubClient {
 	readonly id: string;
+	/** The paired device behind this connection, which a reconnecting phone keeps (`id` is per connection). */
+	readonly device?: string;
 	deliver(event: string, payload: unknown): void;
 }
 
@@ -220,6 +295,9 @@ export interface HubOptions {
 	maxBufferedUpdates?: number;
 	maxBufferedBytes?: number;
 	version: string;
+	/** Opt-in: open new sessions as windows of this tmux session (see tmux.ts). */
+	tmux?: TmuxOptions;
+	log?: (line: string) => void;
 }
 
 export interface OpenSnapshot {
@@ -236,8 +314,10 @@ export interface OpenSnapshot {
 }
 
 export class SessionHub {
-	#options: Required<Omit<HubOptions, "acp">> & { acp: AcpSpawnOptions };
+	#options: Required<Omit<HubOptions, "acp" | "tmux" | "log">> & Pick<HubOptions, "acp" | "log">;
 	readonly #saved: SavedSessionIndex;
+	readonly #tmux?: TmuxLauncher;
+	readonly #sdkCli?: SdkCli;
 	#acp?: AcpProcess;
 	#starting?: Promise<AcpProcess>;
 	#agentInfo: unknown;
@@ -248,10 +328,16 @@ export class SessionHub {
 	#restartDelayMs = 0;
 	#recyclePending = false;
 	#statusTimer?: ReturnType<typeof setInterval>;
+	#stopped = false;
 
 	constructor(options: HubOptions) {
 		this.#options = { maxBufferedUpdates: 5000, maxBufferedBytes: 48 * 1024 * 1024, ...options };
 		this.#saved = new SavedSessionIndex(options.agentDir);
+		// The window gets the tmux server's environment; point gjc there at the agent dir the ACP side uses.
+		if (options.tmux) {
+			this.#tmux = new TmuxLauncher(options.tmux, tuiCommand(options.acp.command), { GJC_CODING_AGENT_DIR: options.agentDir });
+			this.#sdkCli = new SdkCli({ command: tuiCommand(options.acp.command), agentDir: options.agentDir });
+		}
 	}
 
 	// ── clients ──────────────────────────────────────────────────────────────
@@ -295,6 +381,7 @@ export class SessionHub {
 			this.#acp = acp;
 			this.#restartDelayMs = 0;
 			queueMicrotask(() => this.#maybeRecycle());
+			queueMicrotask(() => void this.#reattach());
 			return acp;
 		} catch (error) {
 			acp.kill();
@@ -309,20 +396,51 @@ export class SessionHub {
 		// Whatever spawns next resolves the launcher again, so a pending recycle is satisfied.
 		this.#recyclePending = false;
 		this.#restartDelayMs = Math.min(Math.max(this.#restartDelayMs * 2, 1000), 30_000);
-		for (const permission of this.#permissions.values()) permission.resolve({ outcome: "cancelled" });
-		this.#permissions.clear();
+		// An approval asked over ACP dies with the process. One from a tmux session's channel lives on in the TUI host:
+		// its card is only taken down, and the reload below lists it again.
+		for (const permission of this.#permissions.values()) if (!permission.fromChannel) permission.resolve({ outcome: "cancelled" });
+		for (const permission of [...this.#permissions.values()]) {
+			this.#permissions.delete(permission.requestId);
+			if (permission.fromChannel) this.#broadcastAll("permission.resolved", { requestId: permission.requestId, sessionId: permission.sessionId });
+		}
 		for (const state of this.#sessions.values()) {
 			state.loaded = false;
+			state.channel = undefined;
 			if (state.running) {
 				state.running = false;
 				this.#append(state, { sessionUpdate: AGENT_EXIT, code, stderrTail: acp.stderrTail.slice(-2000) });
 			}
 		}
+		// The TUI in a tmux window waits on the bridge for its tool approvals: attach again without waiting for a phone.
+		if (!this.#stopped && [...this.#sessions.values()].some(s => s.inTmux)) {
+			setTimeout(() => void this.agent().catch(error => this.#options.log?.(`gjc ACP restart failed: ${error?.message ?? error}`)), 0);
+		}
 	}
 
 	stop(): void {
+		this.#stopped = true;
 		if (this.#statusTimer) clearInterval(this.#statusTimer);
 		this.#acp?.kill();
+	}
+
+	/**
+	 * Loads every session a tmux window of the bridge hosts, after the ACP process (re)started: on bridge start, after a
+	 * recycle or a crash. Until then nothing would watch its approval channel, and a tool typed in the terminal would wait
+	 * 60s for an answer only the phone can give, then be rejected.
+	 */
+	async #reattach(): Promise<void> {
+		if (!this.#tmux || this.#stopped) return;
+		const windows = new Map((await this.#tmux.hostedSessions()).map(w => [w.sessionId, w.cwd]));
+		for (const state of this.#sessions.values()) if (state.inTmux && !windows.has(state.sessionId)) windows.set(state.sessionId, state.cwd);
+		for (const [sessionId, windowCwd] of windows) {
+			const known = this.#sessions.get(sessionId);
+			if (known?.loaded || this.#stopped) continue;
+			const cwd = known?.cwd ?? (windowCwd || this.#saved.find(sessionId)?.cwd);
+			if (!cwd) continue;
+			await this.#load(this.#stateFor(sessionId, cwd), true).catch(error =>
+				this.#options.log?.(`reattach ${sessionId} failed: ${error instanceof Error ? error.message : String(error)}`),
+			);
+		}
 	}
 
 	/**
@@ -375,8 +493,9 @@ export class SessionHub {
 		if (method !== "session/update" || typeof params?.sessionId !== "string") return;
 		const state = this.#stateFor(params.sessionId);
 		if (this.#holdEcho(state, params.update)) return;
-		this.#append(state, params.update);
+		this.#append(state, state.inTmux ? terminalAsk(params.update) : params.update);
 		this.#lookForHandOver(state, params.update);
+		if (state.channel && !state.replaying) this.#watchChannel(state, params.update);
 	}
 
 	/**
@@ -439,6 +558,151 @@ export class SessionHub {
 		for (const update of hold?.updates ?? []) this.#append(state, update);
 	}
 
+	/**
+	 * Turns on the permission approval channel of a session gjc hosts in a tmux window. gjc sends a TUI host's tool
+	 * approvals to no ACP client, and gjc 0.19.3 prohibits the channel over ACP, so the bridge goes through the
+	 * session CLI (see sdk-cli.ts). Measured 2026-11-07 on pve3: with the channel on, the bash approvals of both a
+	 * phone turn and a turn typed in the terminal are listed by `permission.requests.list` (the TUI shows only a
+	 * spinner meanwhile) and `permission.respond` allows or rejects them. Without it the TUI ran bash unasked while
+	 * the phone showed `prompt`. Enabling sets the session to prompt; re-enabling is a no-op. A failure leaves the
+	 * session without the channel, logged.
+	 */
+	async #enableChannel(state: SessionState): Promise<void> {
+		const cli = this.#sdkCli;
+		if (!cli || state.channel) return;
+		try {
+			await cli.control(state.sessionId, state.cwd, "permission.channel.set", { enabled: true });
+			state.channel = { requests: new Map(), waitingTools: new Set(), settled: new Set() };
+		} catch (error) {
+			this.#options.log?.(`permission channel not enabled for ${state.sessionId}: ${error instanceof Error ? error.message : String(error)}`);
+		}
+	}
+
+	/**
+	 * gjc announces a channel request on no stream, but the tool it gates arrives over ACP as a pending tool call
+	 * first (measured ~1.4s before it is listed): read the channel then, again while such a call stays pending
+	 * unlisted, and drop the card of a call that ended (expired, cancelled, answered in another way).
+	 */
+	#watchChannel(state: SessionState, update: any): void {
+		const channel = state.channel!;
+		const kind = update?.sessionUpdate;
+		if (kind !== "tool_call" && kind !== "tool_call_update") return;
+		const toolCallId = update.toolCallId;
+		if (typeof toolCallId !== "string") return;
+		const pending = update.status === "pending" || (kind === "tool_call" && update.status === undefined);
+		// gjc starts every tool call pending; only a guarded one in prompt mode waits on the channel, never an ask.
+		if (pending && (state.permissionMode !== "prompt" || update.rawInput?.questions !== undefined)) return;
+		if (pending) {
+			channel.waitingTools.add(toolCallId);
+			this.#readChannel(state);
+			return;
+		}
+		if (update.status === undefined) return;
+		channel.waitingTools.delete(toolCallId);
+		if (update.status !== "completed" && update.status !== "failed") return;
+		for (const [id, request] of channel.requests) {
+			if (request.toolCallId === toolCallId) this.#dropChannelRequest(state, id);
+		}
+	}
+
+	/** Lists the channel's requests into phone permission cards; one read at a time, another queued behind it. */
+	#readChannel(state: SessionState): void {
+		const channel = state.channel;
+		const cli = this.#sdkCli;
+		if (!channel || !cli) return;
+		if (channel.reading) {
+			channel.again = true;
+			return;
+		}
+		channel.reading = (async () => {
+			for (let attempt = 0; attempt < CHANNEL_READS; attempt++) {
+				channel.again = false;
+				let read: { enabled: boolean; requests: ChannelRequest[] };
+				try {
+					read = channelRequests(await cli.query(state.sessionId, state.cwd, "permission.requests.list"));
+				} catch (error) {
+					this.#options.log?.(`permission.requests.list failed for ${state.sessionId}: ${error instanceof Error ? error.message : String(error)}`);
+					return;
+				}
+				if (state.channel !== channel) return;
+				if (!read.enabled) {
+					// The host lost it (a TUI restarted under the same id): turn it on again.
+					for (const id of [...channel.requests.keys()]) this.#dropChannelRequest(state, id);
+					state.channel = undefined;
+					await this.#enableChannel(state);
+					this.#announceShownMode(state);
+					return;
+				}
+				const listed = read.requests.filter(r => !channel.settled.has(r.id));
+				const ids = new Set(listed.map(r => r.id));
+				for (const id of channel.requests.keys()) if (!ids.has(id)) this.#dropChannelRequest(state, id);
+				for (const request of listed) {
+					channel.waitingTools.delete(request.toolCallId);
+					if (!channel.requests.has(request.id)) this.#showChannelRequest(state, request);
+				}
+				// A gated call shows up in the channel a moment after it arrives here; one that never does was not gated.
+				if (!channel.again && channel.waitingTools.size === 0) return;
+				if (!channel.again) await Bun.sleep(CHANNEL_RETRY_MS);
+			}
+		})().finally(() => {
+			channel.reading = undefined;
+			if (channel.again) this.#readChannel(state);
+		});
+	}
+
+	#showChannelRequest(state: SessionState, request: ChannelRequest): void {
+		const channel = state.channel!;
+		const requestId = `perm-${this.#nextPermission++}`;
+		channel.requests.set(request.id, { requestId, toolCallId: request.toolCallId });
+		const pending: PendingPermission = {
+			requestId,
+			sessionId: state.sessionId,
+			toolCall: request.toolCall,
+			options: request.options,
+			resolve: outcome => this.#answerChannel(state, request, outcome),
+			fromChannel: true,
+		};
+		this.#permissions.set(requestId, pending);
+		this.#broadcastAll("permission.request", publicPermission(pending));
+	}
+
+	/** Tells the phones the permission mode to show when it changed, e.g. `allow` for a TUI host that lost its channel. */
+	#announceShownMode(state: SessionState): void {
+		const shown = shownPermissionMode(state);
+		if (shown === (state.shownMode ?? state.permissionMode)) return;
+		state.shownMode = shown;
+		this.#append(state, { sessionUpdate: PERMISSION_MODE_UPDATE, mode: shown });
+	}
+
+	/** Removes a request's card from the phones without answering it (gjc settled it some other way). */
+	#dropChannelRequest(state: SessionState, id: string): void {
+		const shown = state.channel?.requests.get(id);
+		if (!shown) return;
+		state.channel!.requests.delete(id);
+		// A read that started before gjc settled it may still list it: never shown again.
+		state.channel!.settled.add(id);
+		this.#permissions.delete(shown.requestId);
+		this.#broadcastAll("permission.resolved", { requestId: shown.requestId, sessionId: state.sessionId });
+		if (this.#recyclePending) setTimeout(() => this.#maybeRecycle(), 0);
+	}
+
+	/** The phone's answer: `permission.respond` with the picked option, a dismissal as the offered rejection. */
+	async #answerChannel(state: SessionState, request: ChannelRequest, outcome: PermissionOutcome): Promise<void> {
+		if (!state.channel?.requests.has(request.id)) return;
+		this.#dropChannelRequest(state, request.id);
+		const optionId =
+			outcome.outcome === "selected" ? outcome.optionId : request.options.find(o => o.kind === "reject_once" || o.kind === "reject_always")?.optionId;
+		if (!optionId) return; // nothing to reject with: gjc fails it closed when it expires
+		try {
+			await this.#sdkCli!.control(state.sessionId, state.cwd, "permission.respond", { sessionId: state.sessionId, id: request.id, optionId });
+		} catch (error) {
+			this.#options.log?.(`permission.respond failed for ${state.sessionId}: ${error instanceof Error ? error.message : String(error)}`);
+			// Still waiting (the CLI failed, not gjc): show it again.
+			state.channel?.settled.delete(request.id);
+			this.#readChannel(state);
+		}
+	}
+
 	async #onRequest(method: string, params: any): Promise<unknown> {
 		if (method !== "session/request_permission") throw new AcpError(-32601, `Method not supported by gjc-mobile bridge: ${method}`);
 		const requestId = `perm-${this.#nextPermission++}`;
@@ -466,6 +730,8 @@ export class SessionHub {
 				sessionId,
 				cwd: cwd ?? this.#options.defaultCwd,
 				seq: 0,
+				historySeq: 0,
+				resync: new Set(),
 				buffer: [],
 				bufferBytes: 0,
 				loaded: false,
@@ -504,6 +770,8 @@ export class SessionHub {
 			const dropped = state.buffer.shift()!;
 			state.bufferBytes -= approxBytes(dropped.update);
 		}
+		// A phone showing the chat already has the history a reload of the bridge's own replays.
+		if (state.quietReplay) return;
 		for (const { client, sessions } of this.#clients.values()) {
 			if (sessions.has(state.sessionId)) client.deliver("session.update", { sessionId: state.sessionId, ...entry });
 		}
@@ -802,7 +1070,24 @@ export class SessionHub {
 		const cwd = params.cwd || this.#options.defaultCwd;
 		// gjc answers a missing cwd with "Lifecycle worktree does not exist" after spawning a session host.
 		if (!isDirectory(cwd)) throw new AcpError(-32602, `호스트에 작업 디렉터리가 없습니다: ${cwd}`);
+		const tmuxSkipped = this.#tmux && (await this.#tmux.unavailable());
+		if (tmuxSkipped) this.#options.log?.(`tmux skipped (opening over ACP): ${tmuxSkipped.slice(0, 200)}`);
 		const result = await acp.request("session/new", { cwd, mcpServers: [] });
+		if (this.#tmux && !tmuxSkipped) {
+			// ACP lets go of the session it just wrote, and gjc in the window resumes it; the phone then attaches
+			// to that TUI host like to any terminal session. A failure leaves the (empty) session saved.
+			try {
+				await acp.request("session/close", { sessionId: result.sessionId });
+				await this.#tmux.open(result.sessionId, cwd);
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				throw new AcpError(-32021, `새 세션을 tmux 창으로 열지 못했습니다(${result.sessionId}): ${message}`, {
+					code: error instanceof TmuxError ? error.code : "tmux_handoff_failed",
+				});
+			}
+			this.#stateFor(result.sessionId, cwd).inTmux = true;
+			return this.openSession(clientId, { sessionId: result.sessionId, cwd });
+		}
 		const state = this.#stateFor(result.sessionId, cwd);
 		state.loaded = true;
 		state.configOptions = supportedConfigOptions(result.configOptions ?? state.configOptions);
@@ -810,41 +1095,61 @@ export class SessionHub {
 	}
 
 	async openSession(clientId: string, params: { sessionId: string; cwd?: string; afterSeq?: number }): Promise<OpenSnapshot> {
-		const acp = await this.agent();
 		const state = this.#stateFor(params.sessionId, params.cwd ?? this.#saved.find(params.sessionId)?.cwd);
 		if (!state.loaded) {
-			state.loading ??= (async () => {
-				// A reload replays the full history again; start the replay buffer from scratch.
-				state.buffer = [];
-				state.bufferBytes = 0;
-				// The replay carries a waiting ask as failed ("ends without a result"); show it again as pending.
-				state.hostAsks.clear();
-				state.hostAskScan = undefined;
-				// The cards went with the ACP process that listed them (or are listed again below); the host may be another build.
-				this.#dropRemoteAsks(state);
-				state.remoteAsksDone.clear();
-				state.remoteAsksDismissed.clear();
-				state.remoteAsksUnsupported = undefined;
-				const result = await acp.request("session/load", {
-					sessionId: state.sessionId,
-					cwd: state.cwd,
-					mcpServers: [],
-				});
-				state.configOptions = supportedConfigOptions(result?.configOptions ?? state.configOptions);
-				if (state.permissionMode !== "prompt") await this.#applyPermissionMode(acp, state.sessionId, state.permissionMode);
-				state.loaded = true;
-			})()
-				.catch(error => {
-					this.#recycleOnBrokerLoss(acp, error);
-					throw error;
-				})
-				.finally(() => {
-				state.loading = undefined;
-			});
-			await state.loading;
+			await this.#load(state);
 			return this.#subscribe(clientId, state, 0, true);
 		}
 		return this.#subscribe(clientId, state, params.afterSeq ?? 0);
+	}
+
+	/** Loads the session into the ACP process (`session/load`); one load at a time per session. */
+	#load(state: SessionState, quiet = false): Promise<void> {
+		if (state.loaded) return Promise.resolve();
+		state.loading ??= (async () => {
+			const acp = await this.agent();
+			// A reload replays the full history again; start the replay buffer from scratch.
+			state.buffer = [];
+			state.bufferBytes = 0;
+			// The replay carries a waiting ask as failed ("ends without a result"); show it again as pending.
+			state.hostAsks.clear();
+			state.hostAskScan = undefined;
+			// The cards went with the ACP process that listed them (or are listed again below); the host may be another build.
+			this.#dropRemoteAsks(state);
+			state.remoteAsksDone.clear();
+			state.remoteAsksDismissed.clear();
+			state.remoteAsksUnsupported = undefined;
+			// The channel is judged again below; its cards come back from the first read.
+			for (const id of [...(state.channel?.requests.keys() ?? [])]) this.#dropChannelRequest(state, id);
+			state.channel = undefined;
+			state.replaying = true;
+			state.quietReplay = quiet;
+			let result: any;
+			try {
+				result = await acp.request("session/load", { sessionId: state.sessionId, cwd: state.cwd, mcpServers: [] });
+			} catch (error) {
+				this.#recycleOnBrokerLoss(acp, error);
+				throw error;
+			} finally {
+				state.replaying = false;
+				state.quietReplay = false;
+				state.historySeq = state.seq;
+				if (quiet) for (const { client, sessions } of this.#clients.values()) if (sessions.has(state.sessionId)) state.resync.add(client.device ?? client.id);
+			}
+			state.configOptions = supportedConfigOptions(result?.configOptions ?? state.configOptions);
+			// Judged on every load: a window the bridge opened (also before a restart) hosts it, or no longer does.
+			if (this.#tmux) state.inTmux = await this.#tmux.hosts(state.sessionId, state.cwd);
+			// Before the mode: enabling the channel sets the session to prompt.
+			if (state.inTmux) await this.#enableChannel(state);
+			if (state.permissionMode !== "prompt") await this.#applyPermissionMode(acp, state.sessionId, state.permissionMode);
+			state.loaded = true;
+			this.#announceShownMode(state);
+			// Requests already waiting (from before a restart) are not announced by any later tool call.
+			this.#readChannel(state);
+		})().finally(() => {
+			state.loading = undefined;
+		});
+		return state.loading;
 	}
 
 	/** Copies a saved session into a new one and opens it (gjc replays the copied history on load). */
@@ -878,9 +1183,11 @@ export class SessionHub {
 	}
 
 	#subscribe(clientId: string, state: SessionState, afterSeq: number, forceReset = false): OpenSnapshot {
-		this.#clients.get(clientId)?.sessions.add(state.sessionId);
+		const entry = this.#clients.get(clientId);
+		entry?.sessions.add(state.sessionId);
+		const resync = state.resync.delete(entry?.client.device ?? clientId);
 		const firstSeq = state.buffer[0]?.seq ?? state.seq + 1;
-		const reset = forceReset || afterSeq === 0 || afterSeq < firstSeq - 1 || afterSeq > state.seq;
+		const reset = forceReset || resync || afterSeq === 0 || afterSeq < firstSeq - 1 || afterSeq > state.seq || afterSeq < state.historySeq;
 		return {
 			sessionId: state.sessionId,
 			cwd: state.cwd,
@@ -892,7 +1199,7 @@ export class SessionHub {
 			reset,
 			updates: reset ? state.buffer.slice() : state.buffer.filter(u => u.seq > afterSeq),
 			permissions: [...this.#permissions.values()].filter(p => p.sessionId === state.sessionId).map(publicPermission),
-			permissionMode: state.permissionMode,
+			permissionMode: shownPermissionMode(state),
 		};
 	}
 
@@ -906,17 +1213,29 @@ export class SessionHub {
 		if (!mode) throw new AcpError(-32602, `permission mode must be one of ${PERMISSION_MODES.join(", ")}`);
 		const state = this.#sessions.get(params.sessionId);
 		if (!state?.loaded) throw new AcpError(-32002, "Session is not open; call session.open first");
+		if (mode === "prompt" && state.inTmux && !state.channel) {
+			await this.#enableChannel(state);
+			if (!state.channel)
+				throw new AcpError(-32020, "터미널(tmux) 세션의 승인 채널을 켜지 못해 폰에서 승인할 수 없습니다. 브리지 로그를 확인하세요.", {
+					code: "approval_channel_unavailable",
+				});
+		}
+		const kind = mode === "allow" ? "allow_once" : "reject_once";
+		const settle = (fromChannel: boolean) => {
+			if (mode === "prompt") return [];
+			return [...this.#permissions.values()].flatMap(pending => {
+				if (pending.sessionId !== state.sessionId || pending.hostAsk || Boolean(pending.fromChannel) !== fromChannel) return [];
+				const option = pending.options.find(o => o.kind === kind);
+				return option ? [pending.resolve({ outcome: "selected", optionId: option.optionId })] : [];
+			});
+		};
+		// gjc cancels the channel's waiting requests when the mode changes: answer them first.
+		await Promise.all(settle(true));
 		await this.#applyPermissionMode(await this.agent(), state.sessionId, mode, state);
 		state.permissionMode = mode;
+		state.shownMode = mode;
 		this.#append(state, { sessionUpdate: PERMISSION_MODE_UPDATE, mode });
-		if (mode !== "prompt") {
-			const kind = mode === "allow" ? "allow_once" : "reject_once";
-			for (const pending of this.#permissions.values()) {
-				if (pending.sessionId !== state.sessionId || pending.hostAsk) continue;
-				const option = pending.options.find(o => o.kind === kind);
-				if (option) pending.resolve({ outcome: "selected", optionId: option.optionId });
-			}
-		}
+		settle(false);
 		return { mode };
 	}
 

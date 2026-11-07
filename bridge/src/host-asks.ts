@@ -87,8 +87,6 @@ export function scanTranscriptAsks(file: string, tailBytes = TAIL_BYTES): Transc
 /** The `tool_call` the phone renders for an ask waiting in the TUI (same id gjc uses when it replays the session). */
 export function hostAskToolCall(ask: TranscriptAsk): Record<string, unknown> {
 	const questions = askQuestions(ask.input);
-	const lines = questions.flatMap(q => [q.question, ...q.options.map(o => `  • ${o}`)]);
-	lines.push("", "터미널(gjc TUI)에서 답을 기다리는 질문입니다. 답은 터미널에서 고르면 여기에도 표시됩니다.");
 	return {
 		sessionUpdate: "tool_call",
 		toolCallId: ask.toolCallId,
@@ -96,9 +94,30 @@ export function hostAskToolCall(ask: TranscriptAsk): Record<string, unknown> {
 		kind: "other",
 		status: "pending",
 		rawInput: ask.input,
-		content: [{ type: "content", content: { type: "text", text: lines.join("\n") } }],
+		content: terminalAskContent(questions),
 		_meta: { gjcm: { hostAsk: true } },
 	};
+}
+
+/**
+ * An `ask` of a turn the phone started in a session the TUI hosts (a tmux window, see tmux.ts). gjc puts the
+ * question up in the terminal and sends the phone only a bare `tool_call` (measured on 0.19.3: no
+ * `session/request_permission`, `workflow.gates.list` empty), so the phone gets the question, the options, and
+ * where to answer. Other updates pass through unchanged.
+ */
+export function terminalAsk(update: Record<string, unknown>): Record<string, unknown> {
+	// A finished ask replayed by session/load has its answer in the update that follows; leave it be.
+	if (update.sessionUpdate !== "tool_call" || update.status !== "pending") return update;
+	const questions = askQuestions(update.rawInput);
+	if (questions.length === 0) return update;
+	const meta = (update._meta as Record<string, unknown> | undefined) ?? {};
+	return { ...update, content: terminalAskContent(questions), _meta: { ...meta, gjcm: { hostAsk: true } } };
+}
+
+function terminalAskContent(questions: { question: string; options: string[] }[]): unknown[] {
+	const lines = questions.flatMap(q => [q.question, ...q.options.map(o => `  • ${o}`)]);
+	lines.push("", "터미널(gjc TUI)에서 답을 기다리는 질문입니다. 답은 터미널에서 고르면 여기에도 표시됩니다.");
+	return [{ type: "content", content: { type: "text", text: lines.join("\n") } }];
 }
 
 export function hostAskSettled(toolCallId: string, result: TranscriptAskResult | undefined): Record<string, unknown> {

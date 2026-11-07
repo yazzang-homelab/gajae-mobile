@@ -55,7 +55,7 @@ bunx gjcm-bridge serve
 bunx gjcm-bridge pair
 ```
 
-The defaults are `--host 0.0.0.0 --port 7787 --gjc "gjc --mode=acp"`. `bunx gjcm-bridge@latest serve` picks up a new release. To run from source instead: `git clone https://github.com/yazzang-homelab/gajae-mobile.git && cd gajae-mobile/bridge && bun install && bun src/cli.ts serve`.
+The defaults are `--host 0.0.0.0 --port 7787 --gjc "gjc --mode=acp"`. On a host that uses tmux, `--tmux-session gjcm` opens the app's new sessions as windows of that tmux session, so you can pick them up on the PC ([bridge/README.md](bridge/README.md#새-세션을-tmux-창으로-열기-옵트인), Korean). `bunx gjcm-bridge@latest serve` picks up a new release. To run from source instead: `git clone https://github.com/yazzang-homelab/gajae-mobile.git && cd gajae-mobile/bridge && bun install && bun src/cli.ts serve`.
 
 Then open the app and scan the code. `deploy/gjcm-bridge.service` is an example systemd unit for running the bridge permanently.
 

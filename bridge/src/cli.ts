@@ -2,7 +2,7 @@
 /**
  * gjcm-bridge — host daemon that lets the gjc-mobile iPhone app drive `gjc --mode=acp`.
  *
- *   gjcm-bridge serve   [--host 0.0.0.0] [--port 7787] [--cwd DIR] [--gjc "gjc --mode=acp"] [--demo-endpoint wss://…/ws]
+ *   gjcm-bridge serve   [--host 0.0.0.0] [--port 7787] [--cwd DIR] [--gjc "gjc --mode=acp"] [--tmux-session gjcm] [--demo-endpoint wss://…/ws]
  *   gjcm-bridge pair    [--port 7787] [--endpoint ws://host:port/ws ...] [--ttl-min 10] [--png FILE] [--reusable]
  *   gjcm-bridge devices
  *   gjcm-bridge revoke  <deviceKeyPrefix|name>
@@ -26,6 +26,8 @@ const { positionals, values } = parseArgs({
 		port: { type: "string", default: "7787" },
 		cwd: { type: "string" },
 		gjc: { type: "string", default: "gjc --mode=acp" },
+		// Opt-in: open the phone's new sessions as windows of this tmux session (only while a tmux server runs).
+		"tmux-session": { type: "string" },
 		endpoint: { type: "string", multiple: true },
 		"ttl-min": { type: "string", default: "10" },
 		png: { type: "string" },
@@ -42,11 +44,14 @@ const port = Number(values.port);
 
 switch (command) {
 	case "serve": {
+		const log = (line: string) => console.log(`${new Date().toISOString()} ${line}`);
 		const hub = new SessionHub({
 			acp: { command: values.gjc!.split(/\s+/).filter(Boolean) },
 			defaultCwd: values.cwd ?? os.homedir(),
 			agentDir: process.env.GJC_CODING_AGENT_DIR || path.join(os.homedir(), ".gjc", "agent"),
 			version: pkg.version,
+			...(values["tmux-session"] ? { tmux: { session: values["tmux-session"] } } : {}),
+			log,
 		});
 		const server = startBridgeServer({
 			hostname: values.host!,
@@ -54,7 +59,7 @@ switch (command) {
 			state,
 			hub,
 			uploads: new UploadStore(state.uploadsDir),
-			log: line => console.log(`${new Date().toISOString()} ${line}`),
+			log,
 			...(values["demo-endpoint"] ? { demoOffer: () => demoOfferUrl(state, values["demo-endpoint"]!) } : {}),
 		});
 		console.log(`gjcm-bridge ${pkg.version} listening on ${server.hostname}:${server.port} (state ${state.home})`);

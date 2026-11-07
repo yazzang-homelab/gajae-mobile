@@ -55,7 +55,7 @@ bunx gjcm-bridge serve
 bunx gjcm-bridge pair
 ```
 
-默认参数为 `--host 0.0.0.0 --port 7787 --gjc "gjc --mode=acp"`。使用 `bunx gjcm-bridge@latest serve` 获取新版本。如需从源码运行：`git clone https://github.com/yazzang-homelab/gajae-mobile.git && cd gajae-mobile/bridge && bun install && bun src/cli.ts serve`。
+默认参数为 `--host 0.0.0.0 --port 7787 --gjc "gjc --mode=acp"`。在使用 tmux 的主机上加 `--tmux-session gjcm`，应用新建的会话会作为该 tmux 会话的窗口打开，可在电脑上接着查看（[bridge/README.md](bridge/README.md#새-세션을-tmux-창으로-열기-옵트인)，韩文）。使用 `bunx gjcm-bridge@latest serve` 获取新版本。如需从源码运行：`git clone https://github.com/yazzang-homelab/gajae-mobile.git && cd gajae-mobile/bridge && bun install && bun src/cli.ts serve`。
 
 打开应用扫码即可连接。如需常驻运行，可参考示例 systemd 单元 `deploy/gjcm-bridge.service`。
 

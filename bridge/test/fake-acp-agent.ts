@@ -105,7 +105,13 @@ const terminalTurns = new Set<string>();
 // `running: false` until the prompt settles.
 // session/cancel does not stop the terminal turn; it purges the queued prompt, which then fails as
 // "Prompt submission failed." ("Queued prompt was removed before consumption" in gjc's log).
-const queuedPrompts = new Map<string, { steerId: string; blocks: any[]; taken?: boolean; settle: (outcome: "consumed" | "removed") => void }>();
+// `orphan`: gjc no longer tracks it as the session's active prompt, so session/close does not settle it either.
+const queuedPrompts = new Map<
+	string,
+	{ steerId: string; blocks: any[]; taken?: boolean; orphan?: boolean; settle: (outcome: "consumed" | "removed" | "closed") => void }
+>();
+// Sessions whose next session/load fails once ("fail next load").
+const failNextLoad = new Set<string>();
 // gjc's SDK permission policy; every ACP attachment (session/new, session/load) resets it to prompt.
 const permissionModes = new Map<string, string>();
 
@@ -196,6 +202,8 @@ async function handle(msg: any) {
 			return;
 		}
 		case "session/load": {
+			if (failNextLoad.delete(params.sessionId))
+				return write({ jsonrpc: "2.0", id, error: { code: -32603, message: "Internal error: load failed" } });
 			if (params.sessionId === "broker-lost")
 				return write({ jsonrpc: "2.0", id, error: { code: -32603, message: "Internal error: SDK request outcome is uncertain after the frame was sent." } });
 			const history = sessions.get(params.sessionId);
@@ -220,6 +228,14 @@ async function handle(msg: any) {
 		}
 		case "session/close": {
 			attached.delete(params.sessionId);
+			// Like gjc 0.19.3 (measured with a TUI host): closing the attachment settles a prompt still waiting on it as
+			// cancelled; the host's own turn is left alone.
+			const waiting = queuedPrompts.get(params.sessionId);
+			if (waiting && !waiting.orphan) {
+				queuedPrompts.delete(params.sessionId);
+				steers.set(params.sessionId, (steers.get(params.sessionId) ?? []).filter(s => s.id !== waiting.steerId));
+				waiting.settle("closed");
+			}
 			const cwd = sessionCwds.get(params.sessionId);
 			if (cwd && process.env.GJCM_TEST_TMUX) fs.writeFileSync(path.join(cwd, ".gjc", "state", "sdk", `${params.sessionId}.closed`), "");
 			return reply({});
@@ -278,8 +294,9 @@ async function handle(msg: any) {
 						const entry = { id: steerId, text: listed || (hasImage ? "[Image]" : ""), mode: ahead ? "followUp" : "steer", label: ahead ? "Follow-up" : "Steer" } as const;
 						steers.set(sid, [...(steers.get(sid) ?? []), entry]);
 					}, 400);
-				const outcome = await new Promise<"consumed" | "removed">(settle => queuedPrompts.set(sid, { steerId, blocks: params.prompt, settle }));
+				const outcome = await new Promise<"consumed" | "removed" | "closed">(settle => queuedPrompts.set(sid, { steerId, blocks: params.prompt, settle }));
 				if (outcome === "removed") return write({ jsonrpc: "2.0", id, error: { code: -32603, message: "Prompt submission failed." } });
+				if (outcome === "closed") return reply({ stopReason: "cancelled" });
 				update(sid, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: `받은 블록: ${params.prompt.map((b: any) => b.type).join(",")}` } });
 				reply({ stopReason: "end_turn" });
 				update(sid, { sessionUpdate: "session_info_update", _meta: { gjcPhase: "idle", running: false } });
@@ -379,7 +396,16 @@ async function handle(msg: any) {
 					return reply({ type: "query_response", id: "q", ok: false, error: { code: "internal", message: "SDK session attachment is stale." } });
 				}
 				const operations = ["turn.steer", ...(btw.startsWith("turn") ? ["turn.btw", "btw.ask"] : btw.startsWith("ask") ? ["btw.ask"] : [])];
-				const item = { operations, hostTools: false, ...(btw.endsWith("-exchanges") ? { btwAskExchangesVersion: 1 } : {}) };
+				// FAKE_SURFACE=sdk stands for a session gjc ACP hosts itself; by default a terminal hosts it, as the
+				// "terminal ..." steers below play.
+				// FAKE_SURFACE=none stands for a host that does not say (no such field).
+				const surface = process.env.FAKE_SURFACE ?? "cli";
+				const item = {
+					operations,
+					hostTools: false,
+					...(surface === "none" ? {} : { primaryControlSurface: surface }),
+					...(btw.endsWith("-exchanges") ? { btwAskExchangesVersion: 1 } : {}),
+				};
 				return reply({ type: "query_response", id: "q", ok: true, page: { items: [item], complete: true } });
 			}
 			if (params.query === "ask.requests.list") {
@@ -390,8 +416,18 @@ async function handle(msg: any) {
 				const items = (remoteAsks.get(params.sessionId) ?? []).map(({ toolCallId: _, next: __, failOnce: ___, ...item }) => item);
 				return reply({ type: "query_response", id: "q", ok: true, page: { items, complete: true, revision: "r" } });
 			}
-			if (params.query === "context.get")
-				return reply({ type: "query_response", id: "q", ok: true, page: { items: [{ usage: { tokens: 1200, contextWindow: 100000, percent: 1.2 }, systemPrompt: ["abc", "de"] }], complete: true } });
+			if (params.query === "context.get") {
+				// Like gjc 0.19.3: the host's own run state, apart from the ACP phase a pending prompt keeps at working.
+				const queue = steers.get(params.sessionId) ?? [];
+				const item = {
+					usage: { tokens: 1200, contextWindow: 100000, percent: 1.2 },
+					isStreaming: terminalTurns.has(params.sessionId) || cancellable.has(params.sessionId),
+					steeringQueueDepth: queue.filter(s => s.mode === "steer").length,
+					followupQueueDepth: queue.filter(s => s.mode === "followUp").length,
+					systemPrompt: ["abc", "de"],
+				};
+				return reply({ type: "query_response", id: "q", ok: true, page: { items: [item], complete: true } });
+			}
 			return reply({ type: "query_response", id: "q", ok: false, error: { code: "unsupported", message: `no ${params.query}` } });
 		case "_gjc/sdk/control":
 			if (params.operation === "session.rename") {
@@ -474,6 +510,30 @@ async function handle(msg: any) {
 						steers.set(params.sessionId, (steers.get(params.sessionId) ?? []).filter(s => s.id !== waiting.steerId));
 					}
 					update(params.sessionId, { sessionUpdate: "tool_call_update", toolCallId: "terminal-tool", status: "completed" });
+					return reply({ accepted: true });
+				}
+				// "terminal esc" stands for the TUI's Esc on a run that carries the phone's prompt. Seen 2026-11-08 on pve3
+				// (gjc 0.19.3): the run stopped and the host went idle, but the ACP prompt was never answered and gjc reported
+				// working on.
+				// "terminal esc, orphaned" also leaves the prompt out of gjc's sight (see `orphan`).
+				if (text === "terminal esc" || text === "terminal esc, orphaned") {
+					terminalTurns.delete(params.sessionId);
+					const waiting = queuedPrompts.get(params.sessionId);
+					if (waiting) {
+						waiting.taken = true;
+						waiting.orphan = text.endsWith("orphaned");
+						steers.set(params.sessionId, (steers.get(params.sessionId) ?? []).filter(s => s.id !== waiting.steerId));
+					}
+					return reply({ accepted: true });
+				}
+				if (text === "fail next load") {
+					failNextLoad.add(params.sessionId);
+					return reply({ accepted: true });
+				}
+				// "host compacting" / "host compacted": gjc's auto-compaction, which `isStreaming` does not cover.
+				if (text === "host compacting" || text === "host compacted") {
+					const phase = text === "host compacting" ? "compacting" : "idle";
+					update(params.sessionId, { sessionUpdate: "session_info_update", _meta: { gjcPhase: phase, running: phase !== "idle" } });
 					return reply({ accepted: true });
 				}
 				// "terminal done" ends that TUI turn.

@@ -43,8 +43,16 @@ if (process.argv.includes("sdk") && process.argv.includes("session") && rawAt >=
 		const requests = fs.existsSync(file("requests.json")) ? JSON.parse(fs.readFileSync(file("requests.json"), "utf8")) : [];
 		out({ sessionId, enabled: fs.existsSync(file("channel")), requests });
 	} else if (op === "permission.respond") {
-		fs.writeFileSync(file("answer.json"), JSON.stringify(input));
-		out({ accepted: true });
+		const requests: Array<{ id: string }> = fs.existsSync(file("requests.json")) ? JSON.parse(fs.readFileSync(file("requests.json"), "utf8")) : [];
+		// `<id>.respond-fail` stands for one call that never reached the host (the CLI or broker failed).
+		if (fs.existsSync(file("respond-fail"))) {
+			fs.rmSync(file("respond-fail"));
+			failed("internal", "Broker request failed.");
+		} else if (!requests.some(r => r.id === input.id)) failed("invalid_input", "Permission request is stale or already answered");
+		else {
+			fs.writeFileSync(file("answer.json"), JSON.stringify(input));
+			out({ accepted: true });
+		}
 	} else failed("unknown_operation", `Unknown control operation: ${op}.`);
 	process.exit(0);
 }

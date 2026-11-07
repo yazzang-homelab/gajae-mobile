@@ -290,5 +290,5 @@ export function startBridgeServer(options: BridgeServerOptions): Server<Conn> {
 }
 
 function clientFor(ws: ServerWebSocket<Conn>, send: (ws: ServerWebSocket<Conn>, m: unknown) => void): HubClient {
-	return { id: ws.data.id, deliver: (ev, p) => send(ws, { ev, p }) };
+	return { id: ws.data.id, device: ws.data.deviceKey, deliver: (ev, p) => send(ws, { ev, p }) };
 }

@@ -3,6 +3,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { BridgeClient } from "../src/client";
 import { AGENT_EXIT, TURN_END } from "../src/hub";
 import { TmuxLauncher, tuiCommand } from "../src/tmux";
 import { FAKE_AGENT, startTestBridge } from "./helpers";
@@ -41,12 +42,18 @@ async function tmuxBridge(options: { server: boolean; tui?: string; readyTimeout
 	const tmuxOptions = { session: "gjcm", socket, ...(options.readyTimeoutMs ? { readyTimeoutMs: options.readyTimeoutMs } : {}) };
 	const bridge = await startTestBridge(command, cwd, { GJCM_TEST_TMUX: JSON.stringify(tmuxOptions), ...options.env });
 	cleanups.push(() => bridge.stop());
-	const { client } = await bridge.pairedClient();
+	const { client, identity } = await bridge.pairedClient();
 	const windows = () => {
 		const listed = tmux(socket, "list-panes", "-s", "-t", "=gjcm", "-F", "#{pane_start_command}");
 		return listed.code === 0 ? listed.stdout.split("\n").filter(Boolean) : [];
 	};
-	return { socket, cwd, client, windows, home: bridge.home };
+	/** The same phone connecting again (a new connection of the paired device). */
+	const reconnect = async () => {
+		const again = await BridgeClient.connect(bridge.endpoint, identity);
+		cleanups.push(() => again.close());
+		return again;
+	};
+	return { socket, cwd, client, windows, reconnect, home: bridge.home };
 }
 
 describe("tuiCommand", () => {
@@ -196,6 +203,29 @@ describe.skipIf(!hasTmux)("tool approvals of a tmux session reach the phone (gm#
 		expect(await client.request("permission.list", {})).toEqual({ requests: [] });
 	});
 
+	test("shows the card again when the answer did not reach gjc, and not once gjc no longer has the request", async () => {
+		const { client, cwd } = await tmuxBridge({ server: true });
+		const sid = (await client.request("session.new", {})).sessionId;
+		const sdk = path.join(cwd, ".gjc", "state", "sdk");
+		await client.request("sdk.control", { sessionId: sid, op: "turn.steer", input: { text: "terminal tool" } });
+		const card = await client.waitFor(permissionFor(sid), 10_000);
+		// The call fails before gjc: the request still waits, so the phone gets it again and can answer it.
+		fs.writeFileSync(path.join(sdk, `${sid}.respond-fail`), "");
+		await client.request("permission.respond", { requestId: card.p.requestId, optionId: "allow_once" });
+		const again = await client.waitFor(e => permissionFor(sid)(e) && e.p.requestId !== card.p.requestId, 10_000);
+		expect(again.p.toolCall.toolCallId).toBe("tt1");
+		// gjc dropped the request before the answer came (it expired between two reads): gjc refuses it, no card again.
+		const listed = path.join(sdk, `${sid}.requests.json`);
+		fs.rmSync(listed);
+		await client.request("permission.respond", { requestId: again.p.requestId, optionId: "allow_once" });
+		await Bun.sleep(3000);
+		expect(client.events.filter(permissionFor(sid))).toHaveLength(2);
+		expect(fs.existsSync(path.join(sdk, `${sid}.answer.json`))).toBe(false);
+		expect(await client.request("permission.list", {})).toEqual({ requests: [] });
+		await client.request("sdk.control", { sessionId: sid, op: "turn.steer", input: { text: "expire" } });
+		expect((await client.waitFor(toolEnd(sid, "tt1"), 5000)).p.update.status).toBe("failed");
+	}, 30_000);
+
 	test("the phone's deny mode still decides without asking once the channel is on", async () => {
 		const { client } = await tmuxBridge({ server: true });
 		const sid = (await client.request("session.new", {})).sessionId;
@@ -222,7 +252,7 @@ describe.skipIf(!hasTmux)("tool approvals of a tmux session reach the phone (gm#
 	});
 
 	test("after gjc ACP dies, attaches the tmux session again by itself and shows the approval the TUI still waits on", async () => {
-		const { client, cwd } = await tmuxBridge({ server: true });
+		const { client, cwd, reconnect } = await tmuxBridge({ server: true });
 		const sid = (await client.request("session.new", {})).sessionId;
 		const answer = path.join(cwd, ".gjc", "state", "sdk", `${sid}.answer.json`);
 		await client.request("session.prompt", { sessionId: sid, prompt: [{ type: "text", text: "hello" }] });
@@ -243,6 +273,15 @@ describe.skipIf(!hasTmux)("tool approvals of a tmux session reach the phone (gm#
 		expect(fs.existsSync(answer)).toBe(false);
 		// The reload's replay is not news to the phone showing the chat; a phone that saw up to before gets a full snapshot.
 		expect(hellos()).toBe(hellosBefore);
+		// That phone lacks what the terminal did while ACP was gone, and live updates after the reload hide the gap from
+		// afterSeq: its next open, here over a new connection of the same device, is a full snapshot, once.
+		await client.request("sdk.control", { sessionId: sid, op: "turn.steer", input: { text: "terminal turn" } });
+		const live = await client.waitFor(e => e.ev === "session.update" && e.p.sessionId === sid && e.p.update._meta?.gjcPhase === "working", 5000);
+		const phone = await reconnect();
+		const resynced = await phone.request("session.open", { sessionId: sid, afterSeq: live.p.seq });
+		expect(resynced.reset).toBe(true);
+		expect(resynced.updates.some((u: any) => u.update.sessionUpdate === "user_message_chunk" && u.update.content?.text === "hello")).toBe(true);
+		expect((await phone.request("session.open", { sessionId: sid, afterSeq: resynced.seq })).reset).toBe(false);
 		const { updates: replay } = await client.request("session.open", { sessionId: sid, afterSeq: Number.MAX_SAFE_INTEGER });
 		// A phone that saw everything right up to the replay.
 		const snap = await client.request("session.open", { sessionId: sid, afterSeq: replay[0].seq - 1 });
@@ -309,6 +348,9 @@ describe.skipIf(!hasTmux)("TmuxLauncher.hosts", () => {
 		await launcher.open("abc", cwd);
 		expect(await launcher.hosts("abc", cwd)).toBe(true);
 		// What a restarted bridge loads again: the window's session and its directory.
+		expect(await launcher.hostedSessions()).toEqual([{ sessionId: "abc", cwd }]);
+		// A `gjc --resume` the user started in that tmux session is not the bridge's.
+		expect(tmux(socket, "new-window", "-d", "-t", "=gjcm:", "sh", "-c", "sleep 600", "--resume", "mine").code).toBe(0);
 		expect(await launcher.hostedSessions()).toEqual([{ sessionId: "abc", cwd }]);
 		expect(await launcher.hosts("abcd", cwd)).toBe(false);
 		// Another session's endpoint naming this window's gjc is not hosted here: the window resumes "abc".

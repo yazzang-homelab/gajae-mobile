@@ -36,6 +36,9 @@ const DEFAULT_READY_TIMEOUT_MS = 30_000;
 const POLL_MS = 200;
 /** tmux turns `.` and `:` in session names into `_`, so such a name would never be found again. */
 const SESSION_NAME = /^[A-Za-z0-9_-]+$/;
+/** The window option naming the session a window was opened for: only windows the bridge opened carry it. */
+const SESSION_TAG = "@gjcm_session";
+const SESSION_ID = /^[A-Za-z0-9_-]+$/;
 
 interface Run {
 	code: number;
@@ -127,6 +130,7 @@ export class TmuxLauncher {
 	 * publishes the session's SDK endpoint. Removes the window and throws a TmuxError when it does not.
 	 */
 	async open(sessionId: string, cwd: string): Promise<void> {
+		if (!SESSION_ID.test(sessionId)) throw new TmuxError("tmux_failed", `tmux 창에 열 수 없는 세션 id입니다: ${sessionId}`);
 		// Window creation runs one at a time, so two phones starting sessions together do not both create the
 		// tmux session; waiting for gjc does not hold the next phone up.
 		const created = this.#creating.then(() => this.#create(sessionId, cwd));
@@ -141,8 +145,9 @@ export class TmuxLauncher {
 	}
 
 	/**
-	 * Whether a window of the dedicated session hosts `sessionId` now: it was started as `--resume <sessionId>` and
-	 * the session's SDK endpoint names a process in it. Recognizes the bridge's windows again after a bridge restart.
+	 * Whether a window of the dedicated session hosts `sessionId` now: the bridge opened it for `sessionId` and the
+	 * session's SDK endpoint names a process in it. Recognizes the bridge's windows again after a bridge restart; a
+	 * `gjc --resume` the user started in that tmux session is theirs and keeps its own approvals.
 	 */
 	async hosts(sessionId: string, cwd: string): Promise<boolean> {
 		const pid = this.#endpointPid(path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`));
@@ -151,23 +156,20 @@ export class TmuxLauncher {
 	}
 
 	/**
-	 * The sessions the dedicated session's windows were started for (`--resume <id>`), with each window's working
-	 * directory: what to load again after a bridge or ACP restart. `hosts` confirms each one.
+	 * The sessions the bridge opened the dedicated session's windows for, with each window's working directory: what
+	 * to load again after a bridge or ACP restart. `hosts` confirms each one.
 	 */
 	async hostedSessions(): Promise<Array<{ sessionId: string; cwd: string }>> {
 		return (await this.#panes()).map(({ sessionId, cwd }) => ({ sessionId, cwd }));
 	}
 
 	async #panes(): Promise<Array<{ panePid: number; sessionId: string; cwd: string }>> {
-		const listed = await this.#run(["list-panes", "-s", "-t", `=${this.#options.session}`, "-F", "#{pane_pid}\t#{pane_current_path}\t#{pane_start_command}"]);
+		const listed = await this.#run(["list-panes", "-s", "-t", `=${this.#options.session}`, "-F", `#{pane_pid}\t#{pane_current_path}\t#{${SESSION_TAG}}`]);
 		if (listed.code !== 0) return [];
 		return listed.stdout.split("\n").flatMap(line => {
-			const [pidText = "", cwd = "", command = ""] = line.split("\t");
+			const [pidText = "", cwd = "", sessionId = ""] = line.split("\t");
 			const panePid = Number(pidText);
-			const words = command.split(/\s+/);
-			const at = words.indexOf("--resume");
-			const sessionId = at >= 0 ? words[at + 1] : undefined;
-			return sessionId && Number.isInteger(panePid) ? [{ panePid, sessionId, cwd }] : [];
+			return SESSION_ID.test(sessionId) && Number.isInteger(panePid) ? [{ panePid, sessionId, cwd }] : [];
 		});
 	}
 
@@ -186,6 +188,12 @@ export class TmuxLauncher {
 		const [pidText, pane] = created.stdout.split(" ");
 		const panePid = Number(pidText);
 		if (!Number.isInteger(panePid) || !pane) throw new TmuxError("tmux_failed", `tmux ${verb}가 창 정보를 주지 않았습니다: ${created.stdout}`);
+		// Untagged, the window would not be found again: its tool approvals would reach no phone.
+		const tagged = await this.#run(["set-option", "-w", "-t", pane, SESSION_TAG, sessionId]);
+		if (tagged.code !== 0) {
+			await this.#run(["kill-pane", "-t", pane]);
+			throw new TmuxError("tmux_failed", `tmux 창에 세션 표시를 못 달았습니다: ${tagged.stderr || `exit ${tagged.code}`}`);
+		}
 		return { panePid, pane };
 	}
 

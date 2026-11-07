@@ -179,6 +179,11 @@ interface SessionState {
 	shownMode?: PermissionMode;
 	/** A reload the bridge started on its own (`#reattach`): its replay is kept from phones already showing the chat. */
 	quietReplay?: boolean;
+	/**
+	 * Phones (`HubClient.device`) that showed the chat during a quiet replay: they lack what the terminal did while gjc ACP
+	 * was gone, and their later live updates hide that from `afterSeq`, so their next open gets a full snapshot.
+	 */
+	resync: Set<string>;
 }
 
 export interface SessionStatus {
@@ -277,6 +282,8 @@ const STREAMED_TEXT_UPDATES = new Set(["agent_message_chunk", "agent_thought_chu
 
 export interface HubClient {
 	readonly id: string;
+	/** The paired device behind this connection, which a reconnecting phone keeps (`id` is per connection). */
+	readonly device?: string;
 	deliver(event: string, payload: unknown): void;
 }
 
@@ -724,6 +731,7 @@ export class SessionHub {
 				cwd: cwd ?? this.#options.defaultCwd,
 				seq: 0,
 				historySeq: 0,
+				resync: new Set(),
 				buffer: [],
 				bufferBytes: 0,
 				loaded: false,
@@ -1126,6 +1134,7 @@ export class SessionHub {
 				state.replaying = false;
 				state.quietReplay = false;
 				state.historySeq = state.seq;
+				if (quiet) for (const { client, sessions } of this.#clients.values()) if (sessions.has(state.sessionId)) state.resync.add(client.device ?? client.id);
 			}
 			state.configOptions = supportedConfigOptions(result?.configOptions ?? state.configOptions);
 			// Judged on every load: a window the bridge opened (also before a restart) hosts it, or no longer does.
@@ -1174,9 +1183,11 @@ export class SessionHub {
 	}
 
 	#subscribe(clientId: string, state: SessionState, afterSeq: number, forceReset = false): OpenSnapshot {
-		this.#clients.get(clientId)?.sessions.add(state.sessionId);
+		const entry = this.#clients.get(clientId);
+		entry?.sessions.add(state.sessionId);
+		const resync = state.resync.delete(entry?.client.device ?? clientId);
 		const firstSeq = state.buffer[0]?.seq ?? state.seq + 1;
-		const reset = forceReset || afterSeq === 0 || afterSeq < firstSeq - 1 || afterSeq > state.seq || afterSeq < state.historySeq;
+		const reset = forceReset || resync || afterSeq === 0 || afterSeq < firstSeq - 1 || afterSeq > state.seq || afterSeq < state.historySeq;
 		return {
 			sessionId: state.sessionId,
 			cwd: state.cwd,

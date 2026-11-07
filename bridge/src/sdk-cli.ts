@@ -55,7 +55,8 @@ export class SdkCli {
 			try {
 				response = JSON.parse(stdout.trim());
 			} catch {
-				throw new SdkCliError("cli_failed", `gjc sdk session raw exited ${code}: ${(stderr || stdout).trim().slice(0, 300)}`);
+				// stdout can carry a request's command or file content (`permission.requests.list`): log only its size.
+				throw new SdkCliError("cli_failed", `gjc sdk session raw exited ${code} (${stdout.length} bytes of stdout): ${stderr.trim().slice(0, 300)}`);
 			}
 			if (response?.ok === true) return response.result;
 			// A failed operation answers `{ok:false,error}`; a CLI failure is a `gjc.command-error` envelope.

@@ -140,18 +140,23 @@ async function channelApproval(sid: string, dir: string, toolCall: Record<string
 	// gjc lists the request a moment after the pending tool call arrives over ACP (measured ~1.4s).
 	await Bun.sleep(1200);
 	fs.writeFileSync(requests, JSON.stringify([{ id, sessionId: sid, expiresAt: new Date(Date.now() + 60_000).toISOString(), options: channelOptions, toolCall: { ...toolCall, toolName: "bash" } }]));
-	let expired = false;
-	expiring.set(sid, () => (expired = true));
+	const answered = (): string | undefined => {
+		if (!fs.existsSync(answer)) return undefined;
+		const given = JSON.parse(fs.readFileSync(answer, "utf8"));
+		fs.rmSync(answer);
+		return given.id === id ? given.optionId : undefined;
+	};
+	// Like gjc, the request settles at once: by the response that landed first, or by the expiry or cancellation,
+	// after which a response finds it gone.
+	let settled: { optionId?: string } | undefined;
+	expiring.set(sid, () => (settled ??= { optionId: answered() }));
 	try {
-		while (!expired) {
-			if (fs.existsSync(answer)) {
-				const given = JSON.parse(fs.readFileSync(answer, "utf8"));
-				fs.rmSync(answer);
-				if (given.id === id) return given.optionId;
-			}
+		for (;;) {
+			if (settled) return settled.optionId;
+			const optionId = answered();
+			if (optionId) return optionId;
 			await Bun.sleep(30);
 		}
-		return undefined;
 	} finally {
 		expiring.delete(sid);
 		fs.rmSync(requests, { force: true });
@@ -190,6 +195,7 @@ async function handle(msg: any) {
 			staleAttachments.delete(params.sessionId);
 			attached.add(params.sessionId);
 			permissionModes.delete(params.sessionId);
+			sessionCwds.set(params.sessionId, params.cwd);
 			for (const text of history) update(params.sessionId, { sessionUpdate: "user_message_chunk", content: { type: "text", text } });
 			return reply({ configOptions });
 		}
@@ -295,8 +301,14 @@ async function handle(msg: any) {
 				update(sid, { sessionUpdate: "tool_call", ...toolCall });
 				const mode = permissionModes.get(sid) ?? "prompt";
 				const channel = mode === "prompt" ? channelOn(sid) : undefined;
+				// Measured on gjc 0.19.3: a TUI host (the session ACP closed for the tmux window) does not ask over ACP; without
+				// its approval channel it runs the tool unasked.
+				const sdkDir = path.join(sessionCwds.get(sid) ?? process.cwd(), ".gjc", "state", "sdk");
+				const tuiHost = fs.existsSync(path.join(sdkDir, `${sid}.closed`));
 				const res = channel
 					? { outcome: { outcome: "selected", optionId: (await channelApproval(sid, channel, toolCall)) ?? "reject_once" } }
+					: tuiHost && mode === "prompt"
+						? { outcome: { outcome: "selected", optionId: "allow_once" } }
 					: mode === "prompt"
 						? await request("session/request_permission", {
 								sessionId: sid,
@@ -384,8 +396,11 @@ async function handle(msg: any) {
 			if (params.operation === "permission_mode.set") {
 				if (staleAttachments.has(params.sessionId))
 					return reply({ ok: false, error: { code: "internal", message: "SDK session attachment is stale." } });
+				const changed = (permissionModes.get(params.sessionId) ?? "prompt") !== params.input?.mode;
 				permissionModes.set(params.sessionId, params.input?.mode);
-				return reply({ changed: true, mode: params.input?.mode });
+				// Like gjc (external-permissions.ts), a mode change cancels the channel's waiting requests.
+				if (changed) expiring.get(params.sessionId)?.();
+				return reply({ changed, mode: params.input?.mode });
 			}
 			if (params.operation === "thinking.set") {
 				thinkingLevels.set(params.sessionId, params.input.level);

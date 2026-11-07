@@ -841,6 +841,124 @@ describe("sessions over the bridge", () => {
 		expect(failed.p.update.content[0].content.text).toContain("턴이 끝났습니다");
 	});
 
+	describe("a TUI ask the session host lists (ask.requests.list, gajae-code#7611)", () => {
+		/** A session whose transcript shows `ask` pending in a TUI turn, with the requests the host lists for it. */
+		const hostAsk = async (env: Record<string, string>, requests: unknown[]) => {
+			const bridge = await useBridge(env);
+			const { client } = await bridge.pairedClient();
+			const sid = (await client.request("session.new", {})).sessionId;
+			const dir = path.join(bridge.home, "agent", "sessions", "v2-fake");
+			fs.mkdirSync(dir, { recursive: true });
+			const file = path.join(dir, `2026-10-26T00-00-00-000Z_${sid}.jsonl`);
+			const askId = "toolu_ask|fc_9";
+			const ask = { questions: [{ id: "ab", question: "A와 B 중 무엇?", options: [{ label: "A" }, { label: "B" }] }] };
+			fs.writeFileSync(
+				file,
+				`${JSON.stringify({ type: "session", version: 5, id: sid, cwd: "/tmp" })}\n${JSON.stringify({ type: "message", message: { role: "assistant", content: [{ type: "toolCall", id: askId, name: "ask", arguments: ask }] } })}\n`,
+			);
+			await client.request("sdk.control", { sessionId: sid, op: "turn.steer", input: { text: `host ask ${JSON.stringify(requests)}` } });
+			await client.request("sdk.control", { sessionId: sid, op: "turn.steer", input: { text: "terminal turn" } });
+			const askUpdate = (status: string) => (e: { ev: string; p: any }) =>
+				e.ev === "session.update" && e.p.sessionId === sid && e.p.update.toolCallId === askId && e.p.update.status === status;
+			return { bridge, client, sid, file, askId, askUpdate };
+		};
+		const selector = (id: string, extra: Record<string, unknown> = {}) => ({
+			id,
+			toolCallId: "toolu_ask|fc_9",
+			questionId: "qid",
+			sessionId: undefined as string | undefined,
+			question: "A와 B 중 무엇?",
+			options: ["A", "B", "Other (type your own)"],
+			interaction: "selector",
+			transitionCount: 1,
+			controls: [],
+			...extra,
+		});
+
+		test("becomes a permission card whose pick goes back as ask.answer and settles the ask row", async () => {
+			const { client, sid, askId, askUpdate } = await hostAsk({ FAKE_ASK_LIST: "q34" }, [selector("req-1", { recommendedIndex: 1 })]);
+			await client.waitFor(askUpdate("pending"), 3000);
+			const card = (await client.waitFor(e => e.ev === "permission.request" && e.p.sessionId === sid, 3000)).p;
+			// Like gjc's own ask-to-permission bridge: the free-text "Other" entry is left out, the recommended one marked.
+			expect(card.options).toEqual([
+				{ optionId: "option:0", name: "A", kind: "allow_once" },
+				{ optionId: "option:1", name: "B (추천)", kind: "allow_once" },
+			]);
+			expect(card.toolCall).toMatchObject({ toolCallId: askId, toolName: "ask", title: "A와 B 중 무엇?" });
+			expect((await client.request("permission.list", {})).requests.map((p: any) => p.requestId)).toEqual([card.requestId]);
+			// An ask is not a guarded tool: switching to "allow" must not pick an answer for the user.
+			await client.request("session.setPermissionMode", { sessionId: sid, mode: "allow" });
+			await Bun.sleep(1500);
+			expect(client.events.some(e => e.ev === "permission.resolved" && e.p.requestId === card.requestId)).toBe(false);
+
+			await client.request("permission.respond", { requestId: card.requestId, optionId: "option:0" });
+			await client.waitFor(e => e.ev === "permission.resolved" && e.p.requestId === card.requestId, 3000);
+			const answered = await client.waitFor(askUpdate("completed"), 4000);
+			expect(answered.p.update.content[0].content.text).toBe("User selected: A (1 answers)");
+			await Bun.sleep(1500);
+			expect(client.events.filter(e => e.ev === "permission.request")).toHaveLength(1);
+		});
+
+		test("a multi-select takes one toggle per card, then the enabled control", async () => {
+			const done = { id: "navigation_forward", label: "완료", enabled: true };
+			const second = selector("req-2", { multi: true, options: ["A", "B"], transitionCount: 0, selectedOptions: ["A"], controls: [done] });
+			const first = selector("req-1", { multi: true, options: ["A", "B"], transitionCount: 0, selectedOptions: [], controls: [{ ...done, enabled: false }], next: second });
+			const { client, sid, askUpdate } = await hostAsk({ FAKE_ASK_LIST: "q34" }, [first]);
+			const card1 = (await client.waitFor(e => e.ev === "permission.request" && e.p.sessionId === sid, 3000)).p;
+			expect(card1.options.map((o: any) => o.name)).toEqual(["[ ] A", "[ ] B"]);
+			await client.request("permission.respond", { requestId: card1.requestId, optionId: "option:0" });
+			const card2 = (await client.waitFor(e => e.ev === "permission.request" && e.p.requestId !== card1.requestId, 3000)).p;
+			expect(card2.options).toEqual([
+				{ optionId: "option:0", name: "[x] A", kind: "allow_once" },
+				{ optionId: "option:1", name: "[ ] B", kind: "allow_once" },
+				{ optionId: "control:navigation_forward", name: "완료", kind: "allow_once" },
+			]);
+			await client.request("permission.respond", { requestId: card2.requestId, optionId: "control:navigation_forward" });
+			const answered = await client.waitFor(askUpdate("completed"), 4000);
+			expect(answered.p.update.content[0].content.text).toBe("User selected: navigation_forward (2 answers)");
+		});
+
+		test("dismissing the card leaves the question to the terminal, and a terminal answer takes the card down", async () => {
+			const { client, sid, file, askId, askUpdate } = await hostAsk({ FAKE_ASK_LIST: "q34" }, [selector("req-1")]);
+			const card = (await client.waitFor(e => e.ev === "permission.request" && e.p.sessionId === sid, 3000)).p;
+			await client.request("permission.respond", { requestId: card.requestId });
+			await client.waitFor(e => e.ev === "permission.resolved" && e.p.requestId === card.requestId, 3000);
+			// Still listed by the host, but never shown again.
+			await Bun.sleep(2500);
+			expect(client.events.filter(e => e.ev === "permission.request")).toHaveLength(1);
+
+			// A terminal toggle gives the same question a new id: still left to the terminal.
+			await client.request("sdk.control", { sessionId: sid, op: "turn.steer", input: { text: `host ask ${JSON.stringify([selector("req-1b")])}` } });
+			await Bun.sleep(2500);
+			expect(client.events.filter(e => e.ev === "permission.request")).toHaveLength(1);
+			// The next question is shown; the terminal then answers the ask.
+			await client.request("sdk.control", { sessionId: sid, op: "turn.steer", input: { text: `host ask ${JSON.stringify([selector("req-2", { questionId: "q2" })])}` } });
+			const next = (await client.waitFor(e => e.ev === "permission.request" && e.p.requestId !== card.requestId, 3000)).p;
+			fs.appendFileSync(file, `${JSON.stringify({ type: "message", message: { role: "toolResult", toolCallId: askId, toolName: "ask", content: [{ type: "text", text: "User selected: B" }] } })}\n`);
+			await client.waitFor(askUpdate("completed"), 3000);
+			await client.waitFor(e => e.ev === "permission.resolved" && e.p.requestId === next.requestId, 3000);
+			expect(await client.request("permission.list", {})).toEqual({ requests: [] });
+		});
+
+		test("a host without it (gjc 0.19.3) keeps the read-only row and no card, asked once", async () => {
+			const { bridge, client, askUpdate } = await hostAsk({}, [selector("req-1")]);
+			await client.waitFor(askUpdate("pending"), 3000);
+			await Bun.sleep(2500);
+			expect(client.events.filter(e => e.ev === "permission.request")).toEqual([]);
+			expect(fs.readFileSync(path.join(bridge.home, "agent", "ask-list-calls"), "utf8")).toBe("x");
+		});
+
+		test("an answer that fails short of the question shows the card again", async () => {
+			const { client, sid, askUpdate } = await hostAsk({ FAKE_ASK_LIST: "q34" }, [selector("req-1", { failOnce: true })]);
+			const card = (await client.waitFor(e => e.ev === "permission.request" && e.p.sessionId === sid, 3000)).p;
+			await client.request("permission.respond", { requestId: card.requestId, optionId: "option:1" });
+			const again = (await client.waitFor(e => e.ev === "permission.request" && e.p.requestId !== card.requestId, 3000)).p;
+			await client.request("permission.respond", { requestId: again.requestId, optionId: "option:1" });
+			const answered = await client.waitFor(askUpdate("completed"), 4000);
+			expect(answered.p.update.content[0].content.text).toBe("User selected: B (1 answers)");
+		});
+	});
+
 	test("session.status carries gjc's queue while the session works, whoever queued the message", async () => {
 		const bridge = await useBridge();
 		const { client } = await bridge.pairedClient();

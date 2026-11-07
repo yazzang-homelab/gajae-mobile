@@ -121,3 +121,88 @@ function askQuestions(input: unknown): { question: string; options: string[] }[]
 			options: Array.isArray(q.options) ? q.options.map((o: any) => o?.label).filter((l: unknown) => typeof l === "string") : [],
 		}));
 }
+
+/**
+ * One pending ask from gjc's `ask.requests.list` (Q34, gajae-code#7611; newer than 0.19.3), the session-owned view of a
+ * question the TUI shows, answered with `ask.answer` (C06). Fields used here; the rest (answerSchema, editor) is for
+ * free-text interactions a permission card cannot take.
+ */
+export interface RemoteAskRequest {
+	id: string;
+	/** Stable across toggles and selector/editor transitions of one question (the contract's card identity). */
+	questionId?: string;
+	sessionId?: string;
+	question: string;
+	options: string[];
+	interaction: string;
+	multi?: boolean;
+	selectedOptions?: string[];
+	recommendedIndex?: number;
+	transitionCount?: number;
+	controls: Array<{ id: string; label: string; enabled: boolean }>;
+}
+
+export type RemoteAskAnswer = { kind: "value"; value: string } | { kind: "control"; controlId: string };
+
+export interface RemoteAskCard {
+	options: Array<{ optionId: string; name: string; kind: string }>;
+	answers: Map<string, RemoteAskAnswer>;
+}
+
+export function remoteAskRequests(result: unknown): RemoteAskRequest[] {
+	const items = (result as { page?: { items?: unknown } } | undefined)?.page?.items;
+	if (!Array.isArray(items)) return [];
+	return items.flatMap(item => {
+		if (typeof item?.id !== "string" || typeof item.question !== "string" || typeof item.interaction !== "string") return [];
+		if (!Array.isArray(item.options) || !item.options.every((o: unknown) => typeof o === "string")) return [];
+		const controls = Array.isArray(item.controls)
+			? item.controls.filter((c: any) => typeof c?.id === "string" && typeof c.label === "string").map((c: any) => ({ id: c.id, label: c.label, enabled: c.enabled === true }))
+			: [];
+		return [
+			{
+				id: item.id,
+				questionId: typeof item.questionId === "string" ? item.questionId : undefined,
+				sessionId: typeof item.sessionId === "string" ? item.sessionId : undefined,
+				question: item.question,
+				options: item.options,
+				interaction: item.interaction,
+				multi: item.multi === true,
+				selectedOptions: Array.isArray(item.selectedOptions) ? item.selectedOptions.filter((o: unknown) => typeof o === "string") : undefined,
+				recommendedIndex: typeof item.recommendedIndex === "number" ? item.recommendedIndex : undefined,
+				transitionCount: typeof item.transitionCount === "number" ? item.transitionCount : undefined,
+				controls,
+			},
+		];
+	});
+}
+
+/**
+ * The permission card for one pending ask, built the way gjc itself bridges a headless session's asks to an ACP client
+ * (`createSdkPermissionAskAnswerSource`, sdk/bus): selector interactions only; the trailing "Other"/clarification
+ * entries (`transitionCount`) dropped, since they open a text editor a card cannot fill; multi-select options marked
+ * `[x]`/`[ ]` (picking one toggles it, and the next listing carries the new state) with the enabled controls (Next,
+ * Done) as further options. None for a text editor, or when nothing is left to pick.
+ */
+export function remoteAskCard(request: RemoteAskRequest): RemoteAskCard | undefined {
+	if (request.interaction !== "selector") return undefined;
+	const transitions = request.transitionCount && request.transitionCount > 0 ? Math.min(request.transitionCount, request.options.length) : 0;
+	const picks = request.options.slice(0, request.options.length - transitions);
+	const controls = request.controls.filter(c => c.enabled);
+	if (picks.length === 0 && controls.length === 0) return undefined;
+	// Marked from the first card of a multi-select, so it reads as one to toggle before anything is picked.
+	const marked = request.multi === true || (request.selectedOptions !== undefined && request.selectedOptions.length > 0);
+	const recommended = request.recommendedIndex !== undefined && request.recommendedIndex >= 0 ? picks[request.recommendedIndex] : undefined;
+	const answers = new Map<string, RemoteAskAnswer>();
+	const options = picks.map((label, index) => {
+		const optionId = `option:${index}`;
+		answers.set(optionId, { kind: "value", value: label });
+		const name = marked ? `${request.selectedOptions?.includes(label) ? "[x] " : "[ ] "}${label}` : label;
+		return { optionId, name: label === recommended ? `${name} (추천)` : name, kind: "allow_once" };
+	});
+	for (const control of controls) {
+		const optionId = `control:${control.id}`;
+		answers.set(optionId, { kind: "control", controlId: control.id });
+		options.push({ optionId, name: control.label, kind: "allow_once" });
+	}
+	return { options, answers };
+}

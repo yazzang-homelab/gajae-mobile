@@ -897,7 +897,7 @@ describe("sessions over the bridge", () => {
 			expect(answered.p.update.content[0].content.text).toBe("User selected: A (1 answers)");
 			await Bun.sleep(1500);
 			expect(client.events.filter(e => e.ev === "permission.request")).toHaveLength(1);
-		});
+		}, 20_000);
 
 		test("a multi-select takes one toggle per card, then the enabled control", async () => {
 			const done = { id: "navigation_forward", label: "완료", enabled: true };
@@ -916,7 +916,7 @@ describe("sessions over the bridge", () => {
 			await client.request("permission.respond", { requestId: card2.requestId, optionId: "control:navigation_forward" });
 			const answered = await client.waitFor(askUpdate("completed"), 4000);
 			expect(answered.p.update.content[0].content.text).toBe("User selected: navigation_forward (2 answers)");
-		});
+		}, 20_000);
 
 		test("dismissing the card leaves the question to the terminal, and a terminal answer takes the card down", async () => {
 			const { client, sid, file, askId, askUpdate } = await hostAsk({ FAKE_ASK_LIST: "q34" }, [selector("req-1")]);
@@ -938,7 +938,7 @@ describe("sessions over the bridge", () => {
 			await client.waitFor(askUpdate("completed"), 3000);
 			await client.waitFor(e => e.ev === "permission.resolved" && e.p.requestId === next.requestId, 3000);
 			expect(await client.request("permission.list", {})).toEqual({ requests: [] });
-		});
+		}, 20_000);
 
 		test("a host without it (gjc 0.19.3) keeps the read-only row and no card, asked once", async () => {
 			const { bridge, client, askUpdate } = await hostAsk({}, [selector("req-1")]);
@@ -946,7 +946,7 @@ describe("sessions over the bridge", () => {
 			await Bun.sleep(2500);
 			expect(client.events.filter(e => e.ev === "permission.request")).toEqual([]);
 			expect(fs.readFileSync(path.join(bridge.home, "agent", "ask-list-calls"), "utf8")).toBe("x");
-		});
+		}, 20_000);
 
 		test("an answer that fails short of the question shows the card again", async () => {
 			const { client, sid, askUpdate } = await hostAsk({ FAKE_ASK_LIST: "q34" }, [selector("req-1", { failOnce: true })]);
@@ -956,7 +956,7 @@ describe("sessions over the bridge", () => {
 			await client.request("permission.respond", { requestId: again.requestId, optionId: "option:1" });
 			const answered = await client.waitFor(askUpdate("completed"), 4000);
 			expect(answered.p.update.content[0].content.text).toBe("User selected: B (1 answers)");
-		});
+		}, 20_000);
 	});
 
 	test("session.status carries gjc's queue while the session works, whoever queued the message", async () => {

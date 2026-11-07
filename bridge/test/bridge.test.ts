@@ -694,9 +694,18 @@ describe("sessions over the bridge", () => {
 			const ticks = client.events.length;
 			await client.waitFor(e => e.ev === "session.status" && e.p.sessionId === sid && client.events.indexOf(e) >= ticks, 3000);
 			await Bun.sleep(800); // the next once-a-second read lands inside the 400ms gap
+			// A steer typed in the TUI meanwhile is the only new entry that read sees; it is not this prompt.
+			await client.request("sdk.control", { sessionId: sid, op: "turn.steer", input: { text: "터미널 지시" } });
 			await client.request("session.prompt", { sessionId: sid, prompt: [photo] });
 			await Bun.sleep(1200);
 			expect(users()).toEqual([]);
+			const later = client.events.length;
+			await client.waitFor(e => e.ev === "session.status" && e.p.sessionId === sid && client.events.indexOf(e) >= later, 3000);
+			await client.request("sdk.control", { sessionId: sid, op: "turn.steer", input: { text: "terminal step" } });
+			await client.waitFor(
+				e => e.ev === "session.update" && e.p.sessionId === sid && e.p.update.sessionUpdate === "user_message_chunk",
+				600,
+			);
 			await client.request("sdk.control", { sessionId: sid, op: "turn.steer", input: { text: "terminal done" } });
 			await client.waitFor(turnEnd(sid));
 			expect(users()).toEqual(["image"]);

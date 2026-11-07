@@ -393,9 +393,10 @@ export class SessionHub {
 		const hold = state.echoHold;
 		if (!hold || hold.echoedAt === undefined || hold.cancelled) return;
 		if (hold.queueId === undefined) {
-			const fresh = queue.filter(m => !hold.before.has(m.id));
-			// gjc lists it as a steer, or as a follow-up when one already waits ahead of it.
-			const listed = fresh.find(m => m.text.trim() === hold.text) ?? (fresh.length === 1 ? fresh[0] : undefined);
+			// gjc lists it as a steer, or as a follow-up when one already waits ahead of it. Matched by text only: a
+			// steer typed in the TUI meanwhile is new to [before] too, and taking it for this prompt would hold the
+			// message until that one goes.
+			const listed = queue.find(m => !hold.before.has(m.id) && m.text.trim() === hold.text);
 			if (listed) {
 				hold.queueId = listed.id;
 				return;

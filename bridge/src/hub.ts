@@ -128,6 +128,10 @@ interface SessionState {
 	turnAttachmentText?: string;
 	/** That prompt's own message while it waits in gjc's queue (see `#holdEcho`). */
 	echoHold?: EchoHold;
+	/** Watch for a turn gjc ACP never ends (`#watchStuckTurn`): when the host was last asked, the `seq` it answered idle at. */
+	stuckCheck?: { at: number; idleSeq?: number; asking?: boolean };
+	/** In-flight `#releaseTurn`. */
+	releasing?: Promise<void>;
 	/**
 	 * Set by `interrupt()` from its cancel until its replacement prompt has started. Another prompt in that window
 	 * (a phone sending a held photo message as the cancelled turn ends) would take the turn the waiting steers are
@@ -260,8 +264,6 @@ interface EchoHold {
 	echoedAt?: number;
 	/** When `#lookForHandOver` last started a queue read. */
 	lookedAt?: number;
-	/** A cancel purges the queued prompt; it leaving the queue then is no hand-over. */
-	cancelled?: boolean;
 }
 
 type EchoBlock = { type: "text"; text: string } | { type: "image"; data: string };
@@ -297,6 +299,8 @@ export interface HubOptions {
 	version: string;
 	/** Opt-in: open new sessions as windows of this tmux session (see tmux.ts). */
 	tmux?: TmuxOptions;
+	/** How often a phone turn gjc ACP may never end is checked against the host (see `#watchStuckTurn`). */
+	stuckTurnCheckMs?: number;
 	log?: (line: string) => void;
 }
 
@@ -331,7 +335,7 @@ export class SessionHub {
 	#stopped = false;
 
 	constructor(options: HubOptions) {
-		this.#options = { maxBufferedUpdates: 5000, maxBufferedBytes: 48 * 1024 * 1024, ...options };
+		this.#options = { maxBufferedUpdates: 5000, maxBufferedBytes: 48 * 1024 * 1024, stuckTurnCheckMs: STUCK_TURN_CHECK_MS, ...options };
 		this.#saved = new SavedSessionIndex(options.agentDir);
 		// The window gets the tmux server's environment; point gjc there at the agent dir the ACP side uses.
 		if (options.tmux) {
@@ -533,7 +537,7 @@ export class SessionHub {
 	/** Releases the held echo once gjc's queue (read at [sampledAt]) shows the prompt left it. */
 	#settleEchoHold(state: SessionState, queue: QueuedMessage[], sampledAt: number): void {
 		const hold = state.echoHold;
-		if (!hold || hold.echoedAt === undefined || hold.cancelled) return;
+		if (!hold || hold.echoedAt === undefined) return;
 		if (hold.queueId === undefined) {
 			// gjc lists it as a steer, or as a follow-up when one already waits ahead of it. Matched by text only: a
 			// steer typed in the TUI meanwhile is new to [before] too, and taking it for this prompt would hold the
@@ -1015,6 +1019,7 @@ export class SessionHub {
 			for (const state of active) {
 				this.#sampleHostAsks(state);
 				this.#syncRemoteAsks(state);
+				this.#watchStuckTurn(state);
 				void Promise.all([this.#sampleUsage(state), this.#sampleQueue(state)]).finally(() => this.#publishStatus(state));
 			}
 			if (active.length === 0) {
@@ -1253,6 +1258,8 @@ export class SessionHub {
 	async prompt(params: { sessionId: string; prompt: unknown[] }, interrupting = false): Promise<{ accepted: true }> {
 		const acp = await this.agent();
 		const state = this.#sessions.get(params.sessionId);
+		// A released turn ends before its session is loaded again; the phone may already send the next message.
+		await state?.releasing?.catch(() => {});
 		if (!state?.loaded) throw new AcpError(-32002, "Session is not open; call session.open first");
 		if (state.running || (state.interrupting && !interrupting))
 			throw new AcpError(-32003, "A turn is already running in this session");
@@ -1269,12 +1276,14 @@ export class SessionHub {
 			state.hostRunning && echoed.length > 0
 				? { blocks: echoed, updates: [], text: queueText(params.prompt), before: new Set(state.queued.map(m => m.id)) }
 				: undefined;
+		state.stuckCheck = { at: Date.now() };
 		this.#track(state, { sessionUpdate: "x_gjcm_turn_start" });
 		state.turn = acp.request("session/prompt", { sessionId: params.sessionId, prompt: params.prompt }).then(
 			result => {
 				state.running = false;
 				state.turnBehindHost = false;
 				state.turnAttachmentText = undefined;
+				state.stuckCheck = undefined;
 				// Answered, so gjc took it: a hand-over the queue reads missed still shows the message, before the turn end.
 				this.#releaseEcho(state);
 				this.#append(state, { sessionUpdate: TURN_END, stopReason: result?.stopReason ?? "end_turn" });
@@ -1284,7 +1293,8 @@ export class SessionHub {
 				state.running = false;
 				state.turnBehindHost = false;
 				state.turnAttachmentText = undefined;
-				// Still held: it never reached the model (gjc 0.19.3 fails a queued prompt purged by a cancel as
+				state.stuckCheck = undefined;
+				// Still held: it never reached the model (gjc 0.19.3 fails a queued prompt purged from its queue as
 				// "Prompt submission failed."), so it is not shown as said.
 				state.echoHold = undefined;
 				if (String(error?.message ?? error).includes(STALE_ATTACHMENT)) state.loaded = false;
@@ -1295,15 +1305,107 @@ export class SessionHub {
 		return { accepted: true };
 	}
 
+	/**
+	 * The phone's stop. gjc lets a client stop only a run it owns (see `interrupt`), so a turn typed in the TUI and a
+	 * phone prompt that went in behind one are refused at once, pointing at the terminal's Esc. Measured 2026-11-08 on
+	 * gjc 0.19.3: `session/cancel` left both running, and while the phone's prompt still waited in gjc's queue it
+	 * purged it, photos included ("Prompt submission failed."); a held photo message went back to the composer while
+	 * the turn went on. Such a phone turn whose host has nothing left to do is one gjc ACP no longer ends: it is
+	 * released (`#releaseTurn`).
+	 */
 	async cancel(params: { sessionId: string }): Promise<{ ok: true }> {
-		// gjc purges a prompt waiting behind a TUI turn on cancel: it leaving the queue now is no hand-over.
-		const hold = this.#sessions.get(params.sessionId)?.echoHold;
-		if (hold) hold.cancelled = true;
-		for (const permission of this.#permissions.values()) {
-			if (permission.sessionId === params.sessionId) permission.resolve({ outcome: "cancelled" });
+		const state = this.#sessions.get(params.sessionId);
+		if (state?.releasing) {
+			await state.releasing;
+			return { ok: true };
 		}
-		(await this.agent()).notify("session/cancel", { sessionId: params.sessionId });
+		// The bridge's own turn stops as before; its stop also stays when a steer repeats an attachment prompt's text
+		// (the backstop `interrupt` has would make it refuse a turn a phone-only session can stop nowhere else).
+		if (state?.loaded && (state.running ? state.turnBehindHost : state.hostRunning)) {
+			const host = await this.#hostActivity(state);
+			if (state.running && host?.idle) {
+				await this.#releaseTurn(state);
+				return { ok: true };
+			}
+			if (state.running || !host?.idle) throw hostTurnStop(state.running);
+		}
+		return this.#cancelTurn(params.sessionId);
+	}
+
+	/** Stops a turn this bridge owns: gjc settles its `session/prompt` as cancelled. */
+	async #cancelTurn(sessionId: string): Promise<{ ok: true }> {
+		for (const permission of this.#permissions.values()) {
+			if (permission.sessionId === sessionId) permission.resolve({ outcome: "cancelled" });
+		}
+		(await this.agent()).notify("session/cancel", { sessionId });
 		return { ok: true };
+	}
+
+	/**
+	 * The session host's own word on whether it still works (`context.get`: `isStreaming` and its queue depths, gjc
+	 * 0.19.3), apart from the ACP phase, which a pending prompt keeps at working. `undefined` when it cannot say.
+	 */
+	async #hostActivity(state: SessionState): Promise<{ idle: boolean } | undefined> {
+		try {
+			const response = await this.#sdkRequest(await this.agent(), state, "query", "context.get", {});
+			const item = response?.page?.items?.[0];
+			if (typeof item?.isStreaming !== "boolean") return undefined;
+			return { idle: !item.isStreaming && !item.steeringQueueDepth && !item.followupQueueDepth };
+		} catch {
+			return undefined;
+		}
+	}
+
+	/**
+	 * Ends a phone turn gjc ACP no longer ends. Seen 2026-11-08 on pve3 (gjc 0.19.3): a phone prompt went in behind a
+	 * TUI turn and ran on after it until the terminal's Esc; the TUI went idle, but `session/prompt` stayed unanswered
+	 * for over an hour, so the phone showed the turn working and refused every new message (-32003). Closing the ACP
+	 * attachment settles the waiting prompt (as cancelled) and leaves a TUI host alone; the session is loaded again
+	 * at once. Measured on gjc 0.19.3 with a TUI host: settled in 16ms, the host's turn ran on, reattached in 1.2s,
+	 * and the next prompt was answered normally.
+	 */
+	#releaseTurn(state: SessionState): Promise<void> {
+		state.releasing ??= (async () => {
+			const acp = await this.agent();
+			this.#options.log?.(`releasing a turn of ${state.sessionId}: its host is idle, but gjc ACP never ended it`);
+			await acp.request("session/close", { sessionId: state.sessionId });
+			state.loaded = false;
+			if (!(await this.#settled(state, RELEASE_SETTLE_TIMEOUT_MS)))
+				throw new AcpError(-32004, "gjc가 이 턴을 끝내지 않았습니다. 잠시 후 다시 시도하세요.");
+			await this.#load(state, true);
+		})().finally(() => {
+			state.releasing = undefined;
+		});
+		return state.releasing;
+	}
+
+	/**
+	 * Notices a turn `#releaseTurn` is for without waiting for a stop. While a phone prompt that went in behind a TUI
+	 * turn is pending, the host is asked every [HubOptions.stuckTurnCheckMs]; idle twice in a row with no update in
+	 * between releases it. A phone turn of its own is left to the stop: it settles with its run (measured).
+	 */
+	#watchStuckTurn(state: SessionState): void {
+		const check = state.stuckCheck;
+		if (!check || check.asking || !state.running || !state.turnBehindHost || !state.loaded || state.releasing) return;
+		if (Date.now() - check.at < this.#options.stuckTurnCheckMs) return;
+		const seq = state.seq;
+		check.asking = true;
+		void this.#hostActivity(state).then(host => {
+			check.asking = false;
+			check.at = Date.now();
+			if (state.stuckCheck !== check) return;
+			if (!host?.idle || state.seq !== seq) {
+				check.idleSeq = undefined;
+				return;
+			}
+			if (check.idleSeq !== seq) {
+				check.idleSeq = seq;
+				return;
+			}
+			void this.#releaseTurn(state).catch(error =>
+				this.#options.log?.(`releasing a turn of ${state.sessionId} failed: ${error instanceof Error ? error.message : String(error)}`),
+			);
+		});
 	}
 
 	/**
@@ -1370,7 +1472,7 @@ export class SessionHub {
 	): Promise<{ accepted: true; text: string }> {
 		const params = { sessionId: state.sessionId };
 		if (isActive(state)) {
-			await this.cancel({ sessionId: params.sessionId });
+			await this.#cancelTurn(params.sessionId);
 			if (!(await this.#settled(state, INTERRUPT_SETTLE_TIMEOUT_MS)))
 				throw new AcpError(-32004, "진행 중인 턴이 중단되지 않았습니다. 잠시 후 다시 시도하세요.");
 		}
@@ -1657,6 +1759,10 @@ export const MODEL_ROLE_TARGETS = [
 ] as const;
 const CONFIG_FLUSH_TIMEOUT_MS = 5000;
 const INTERRUPT_SETTLE_TIMEOUT_MS = 10_000;
+/** `session/close` settled the waiting prompt in 16ms (gjc 0.19.3, TUI host). */
+const RELEASE_SETTLE_TIMEOUT_MS = 5000;
+/** Spacing of the host checks `#watchStuckTurn` needs twice in a row (a host step rarely goes 15s without an update). */
+const STUCK_TURN_CHECK_MS = 15_000;
 /**
  * gjc's ACP refuses a prompt whose SDK frame passes 256 KiB (`MAX_PROMPT_FRAME_BYTES`, gjc 0.19.3) with an English
  * message the phone shows as is ("ACP prompt is 326 KiB, over the 256 KiB transport limit..."). The frame carries the
@@ -1829,6 +1935,11 @@ function promptText(prompt: unknown[]): string {
 		.map(block => block!.text as string)
 		.join("\n")
 		.trim();
+}
+
+function hostTurnStop(phoneTurn: boolean): AcpError {
+	const what = phoneTurn ? "보낸 메시지는 터미널에서 시작한 턴에 이어져 있어" : "터미널에서 시작한 턴은";
+	return new AcpError(-32004, `${what} 앱에서 멈출 수 없습니다. 터미널에서 Esc로 멈추세요.`, { code: "host_turn" });
 }
 
 function noPendingSteer(): AcpError {

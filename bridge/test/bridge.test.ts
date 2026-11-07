@@ -725,15 +725,111 @@ describe("sessions over the bridge", () => {
 			expect(users()).toEqual(["text", "image"]);
 		});
 
-		test("never shows a message a cancel purged from the queue", async () => {
+		test("stays queued, photo included, when the phone's stop is refused instead of letting gjc purge it", async () => {
+			// Measured 2026-11-08 on gjc 0.19.3: session/cancel left the TUI turn running and purged this prompt.
 			const { client, sid, users } = await startTerminalTurn();
-			await client.request("session.prompt", { sessionId: sid, prompt: [photo, { type: "text", text: "취소될 사진" }] });
+			await client.request("session.prompt", { sessionId: sid, prompt: [photo, { type: "text", text: "멈추려던 사진" }] });
 			await client.waitFor(e => e.ev === "session.status" && e.p.sessionId === sid && e.p.queued.length > 0, 3000);
-			await client.request("session.cancel", { sessionId: sid });
-			expect((await client.waitFor(turnEnd(sid), 4000)).p.update.stopReason).toBe("error");
-			await Bun.sleep(1200);
-			expect(users()).toEqual([]);
+			const started = Date.now();
+			const refused = await client.request("session.cancel", { sessionId: sid }).catch((e: any) => e);
+			expect(refused.code).toBe(-32004);
+			expect(refused.data).toEqual({ code: "host_turn" });
+			expect(refused.message).toContain("터미널에서 Esc");
+			expect(Date.now() - started).toBeLessThan(1000);
+			await Bun.sleep(1700); // past the 1.5s a purged prompt takes to fail
+			expect(client.events.some(turnEnd(sid))).toBe(false);
+			const queued = (await client.request("sdk.query", { sessionId: sid, op: "queue.messages.list" })).items.map((m: any) => m.text);
+			expect(queued).toEqual(["멈추려던 사진"]);
+			await client.request("sdk.control", { sessionId: sid, op: "turn.steer", input: { text: "terminal done" } });
+			expect((await client.waitFor(turnEnd(sid))).p.update.stopReason).toBe("end_turn");
+			expect(users()).toEqual(["image", "text"]);
 		});
+	});
+
+	describe("the phone's stop on a turn only the terminal can stop", () => {
+		const photo = { type: "image", mimeType: "image/png", data: "iVBORw0KGgo=" };
+		const terminalTurn = async (env: Record<string, string> = {}) => {
+			const bridge = await useBridge(env);
+			const { client } = await bridge.pairedClient();
+			const sid = (await client.request("session.new", {})).sessionId;
+			await client.request("sdk.control", { sessionId: sid, op: "turn.steer", input: { text: "terminal turn" } });
+			await client.waitFor(e => e.ev === "session.status" && e.p.sessionId === sid && e.p.running);
+			return { client, sid };
+		};
+		/** A phone prompt the TUI turn took, then the terminal's Esc: the host is idle but gjc never answers the prompt. */
+		const stuckPhoneTurn = async (env: Record<string, string> = {}) => {
+			const { client, sid } = await terminalTurn(env);
+			await client.request("session.prompt", { sessionId: sid, prompt: [photo, { type: "text", text: "이어진 사진" }] });
+			await client.waitFor(e => e.ev === "session.status" && e.p.sessionId === sid && e.p.queued.length > 0, 3000);
+			await client.request("sdk.control", { sessionId: sid, op: "turn.steer", input: { text: "terminal step" } });
+			await client.request("sdk.control", { sessionId: sid, op: "turn.steer", input: { text: "terminal esc" } });
+			return { client, sid };
+		};
+		const stillStuck = async (client: BridgeClient, sid: string) =>
+			((await client.request("session.prompt", { sessionId: sid, prompt: [{ type: "text", text: "다음" }] }).catch((e: any) => e)) as any).code === -32003;
+
+		test("is refused at once on a turn typed in the TUI", async () => {
+			const { client, sid } = await terminalTurn();
+			const refused = await client.request("session.cancel", { sessionId: sid }).catch((e: any) => e);
+			expect(refused.code).toBe(-32004);
+			expect(refused.data).toEqual({ code: "host_turn" });
+			expect(refused.message).toBe("터미널에서 시작한 턴은 앱에서 멈출 수 없습니다. 터미널에서 Esc로 멈추세요.");
+			await client.request("sdk.control", { sessionId: sid, op: "turn.steer", input: { text: "terminal done" } });
+			await client.waitFor(e => e.ev === "session.status" && e.p.sessionId === sid && !e.p.running, 3000);
+			// Once the terminal is done, the stop is the plain one again (nothing to stop, nothing refused).
+			expect(await client.request("session.cancel", { sessionId: sid })).toEqual({ ok: true });
+		});
+
+		test("is refused on the phone's prompt the TUI turn took while that turn still runs", async () => {
+			const { client, sid } = await terminalTurn();
+			await client.request("session.prompt", { sessionId: sid, prompt: [photo, { type: "text", text: "받은 사진" }] });
+			await client.waitFor(e => e.ev === "session.status" && e.p.sessionId === sid && e.p.queued.length > 0, 3000);
+			await client.request("sdk.control", { sessionId: sid, op: "turn.steer", input: { text: "terminal step" } });
+			const refused = await client.request("session.cancel", { sessionId: sid }).catch((e: any) => e);
+			expect(refused.code).toBe(-32004);
+			expect(refused.message).toBe("보낸 메시지는 터미널에서 시작한 턴에 이어져 있어 앱에서 멈출 수 없습니다. 터미널에서 Esc로 멈추세요.");
+			await client.request("sdk.control", { sessionId: sid, op: "turn.steer", input: { text: "terminal done" } });
+			expect((await client.waitFor(turnEnd(sid))).p.update.stopReason).toBe("end_turn");
+		});
+
+		test("releases a phone turn gjc ACP never ends once the terminal stopped it, and the chat goes on", async () => {
+			const { client, sid } = await stuckPhoneTurn();
+			expect(await stillStuck(client, sid)).toBe(true);
+			expect(await client.request("session.cancel", { sessionId: sid })).toEqual({ ok: true });
+			const end = client.events.find(turnEnd(sid));
+			expect(end?.p.update.stopReason).toBe("cancelled");
+			await client.waitFor(e => e.ev === "session.status" && e.p.sessionId === sid && !e.p.running, 3000);
+			await client.request("session.prompt", { sessionId: sid, prompt: [{ type: "text", text: "다시 됐나" }] });
+			const next = await client.waitFor(e => turnEnd(sid)(e) && e !== end, 3000);
+			expect(next.p.update.stopReason).toBe("end_turn");
+		});
+
+		test("releases such a turn by itself once the host stays idle with nothing new", async () => {
+			const { client, sid } = await stuckPhoneTurn({ GJCM_TEST_STUCK_TURN_MS: "200" });
+			const end = await client.waitFor(turnEnd(sid), 6000);
+			expect(end.p.update.stopReason).toBe("cancelled");
+			// Sent the moment the phone sees the turn end: it waits for the session to be loaded again.
+			await client.request("session.prompt", { sessionId: sid, prompt: [{ type: "text", text: "다시 됐나" }] });
+			expect((await client.waitFor(e => turnEnd(sid)(e) && e !== end, 3000)).p.update.stopReason).toBe("end_turn");
+		}, 15_000);
+
+		test("does not release a turn by itself while its host still works or anything new arrives", async () => {
+			const { client, sid } = await terminalTurn({ GJCM_TEST_STUCK_TURN_MS: "200" });
+			await client.request("session.prompt", { sessionId: sid, prompt: [photo, { type: "text", text: "기다리는 사진" }] });
+			await client.request("sdk.control", { sessionId: sid, op: "turn.steer", input: { text: "terminal step" } });
+			await Bun.sleep(3000); // the TUI turn runs on: several checks, all working
+			expect(client.events.some(turnEnd(sid))).toBe(false);
+			await client.request("sdk.control", { sessionId: sid, op: "turn.steer", input: { text: "terminal esc" } });
+			// Idle by the host's word, but updates keep coming (the session is not quiet): still not released.
+			const until = Date.now() + 3000;
+			while (Date.now() < until) {
+				await client.request("sdk.control", { sessionId: sid, op: "turn.steer", input: { text: "terminal step" } });
+				await Bun.sleep(100);
+			}
+			expect(client.events.some(turnEnd(sid))).toBe(false);
+			expect(await stillStuck(client, sid)).toBe(true);
+			await client.waitFor(turnEnd(sid), 6000);
+		}, 20_000);
 	});
 
 	test("session.interrupt also refuses a text-only phone prompt queued behind a TUI turn instead of failing it", async () => {

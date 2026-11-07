@@ -413,12 +413,30 @@ final class ChatModel: Identifiable {
 
     func cancel() async {
         guard let client = connection?.connectedClient else { return }
-        // Stopping the turn is no cue to start the next one: the held message goes back to the composer.
-        if heldPhotoMessage != nil {
-            cancelHeldPhotoMessage()
+        // Stopping the turn is no cue to start the next one: the held message stays out of the turn end's reach.
+        let held = heldPhotoMessage
+        heldPhotoMessage = nil
+        do {
+            _ = try await reopening(client) { try await client.cancel(sessionId) }
+        } catch let BridgeError.remote(code: -32004, message, .some("host_turn")) {
+            // Only the terminal can stop this turn (gjc lets a client stop only its own runs): it runs on, and the
+            // held message still goes out once it ends.
+            transcript.appendNotice(message)
+            guard let held else { return }
+            if heldPhotoMessage == nil {
+                heldPhotoMessage = held
+                sendHeldPhotoMessageIfIdle()
+            } else {
+                restore(held)
+            }
+            return
+        } catch {
+            show(error)
+        }
+        if let held {
+            restore(held)
             transcript.appendNotice("턴을 멈춰서 보내려던 사진 메시지를 입력창으로 돌려놓았습니다.")
         }
-        try? await client.cancel(sessionId)
     }
 
     func pick(_ command: SlashCommand) {

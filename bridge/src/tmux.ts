@@ -191,6 +191,8 @@ export class TmuxLauncher {
 		// Untagged, the window would not be found again: its tool approvals would reach no phone.
 		const tagged = await this.#run(["set-option", "-w", "-t", pane, SESSION_TAG, sessionId]);
 		if (tagged.code !== 0) {
+			// A command that cannot start (a wrong --gjc) takes its window with it before the tag lands.
+			if (!alive(panePid)) throw new TmuxError("tmux_window_exited", `tmux 세션 ${session}의 새 창에서 gjc가 바로 끝났습니다`);
 			await this.#run(["kill-pane", "-t", pane]);
 			throw new TmuxError("tmux_failed", `tmux 창에 세션 표시를 못 달았습니다: ${tagged.stderr || `exit ${tagged.code}`}`);
 		}

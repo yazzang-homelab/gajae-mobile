@@ -113,6 +113,16 @@ describe.skipIf(!hasTmux)("new sessions as tmux windows (gm#58)", () => {
 		expect(tmux(socket, "list-sessions").code).not.toBe(0);
 	});
 
+	test("reports a TUI command that cannot start as the window's gjc exiting", async () => {
+		const socket = `gjcm-test-${crypto.randomBytes(4).toString("hex")}`;
+		cleanups.push(() => void tmux(socket, "kill-server"));
+		expect(tmux(socket, "new-session", "-d", "-s", "keep", "sleep 600").code).toBe(0);
+		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjcm-tmux-cwd-"));
+		cleanups.push(() => fs.rmSync(cwd, { recursive: true, force: true }));
+		const launcher = new TmuxLauncher({ session: "gjcm", socket }, [path.join(cwd, "no-such-gjc")]);
+		for (const sessionId of ["s1", "s2", "s3"]) expect((await launcher.open(sessionId, cwd).catch((e: any) => e)).code).toBe("tmux_window_exited");
+	});
+
 	test("opens over ACP when no tmux server runs, without starting one", async () => {
 		const { socket, client, windows } = await tmuxBridge({ server: false });
 		const sid = (await client.request("session.new", {})).sessionId;

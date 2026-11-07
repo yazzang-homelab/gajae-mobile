@@ -140,6 +140,24 @@ export class TmuxLauncher {
 		}
 	}
 
+	/**
+	 * Whether a window of the dedicated session hosts `sessionId` now: it was started as `--resume <sessionId>` and
+	 * the session's SDK endpoint names a process in it. Recognizes the bridge's windows again after a bridge restart.
+	 */
+	async hosts(sessionId: string, cwd: string): Promise<boolean> {
+		const listed = await this.#run(["list-panes", "-s", "-t", `=${this.#options.session}`, "-F", "#{pane_pid} #{pane_start_command}"]);
+		if (listed.code !== 0) return false;
+		const pid = this.#endpointPid(path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`));
+		if (pid === undefined) return false;
+		return listed.stdout.split("\n").some(line => {
+			const space = line.indexOf(" ");
+			const panePid = Number(line.slice(0, space));
+			const words = line.slice(space + 1).split(/\s+/);
+			const at = words.indexOf("--resume");
+			return at >= 0 && words[at + 1] === sessionId && Number.isInteger(panePid) && descendsFrom(pid, panePid);
+		});
+	}
+
 	async #create(sessionId: string, cwd: string): Promise<{ panePid: number; pane: string }> {
 		const { session } = this.#options;
 		const env = Object.entries(this.#env).flatMap(([key, value]) => ["-e", `${key}=${value}`]);

@@ -22,6 +22,33 @@ if (resumeAt >= 0) {
 	await new Promise(() => {});
 }
 
+// Launched by the bridge as gjc's session CLI (`<agent> sdk session raw control|query <id> … --json`, see
+// sdk-cli.ts) for the permission approval channel of a session a tmux window hosts. Like gjc 0.19.3, the channel is
+// the host's: files under <cwd>/.gjc/state/sdk stand for it (`<id>.channel` on, `<id>.requests.json` the pending
+// requests, `<id>.answer.json` the last response), shared with the ACP process that runs the turns here.
+const rawAt = process.argv.indexOf("raw");
+if (process.argv.includes("sdk") && process.argv.includes("session") && rawAt >= 0) {
+	const [verb, sessionId] = [process.argv[rawAt + 1], process.argv[rawAt + 2]];
+	const op = process.argv[process.argv.indexOf(verb === "control" ? "--op" : "--query") + 1];
+	const input = verb === "control" ? JSON.parse(process.argv[process.argv.indexOf("--json-input") + 1]!) : undefined;
+	const file = (suffix: string) => path.join(process.cwd(), ".gjc", "state", "sdk", `${sessionId}.${suffix}`);
+	const out = (result: unknown) => process.stdout.write(`${JSON.stringify({ type: `${verb}_response`, id: "c", ok: true, result })}\n`);
+	const failed = (code: string, message: string) => process.stdout.write(`${JSON.stringify({ type: `${verb}_response`, id: "c", ok: false, error: { code, message } })}\n`);
+	if (process.env.FAKE_CLI_FAIL) failed("resource_gone", "No live session.");
+	else if (op === "permission.channel.set") {
+		if (input.enabled) fs.writeFileSync(file("channel"), "");
+		else fs.rmSync(file("channel"), { force: true });
+		out({ enabled: Boolean(input.enabled) });
+	} else if (op === "permission.requests.list") {
+		const requests = fs.existsSync(file("requests.json")) ? JSON.parse(fs.readFileSync(file("requests.json"), "utf8")) : [];
+		out({ sessionId, enabled: fs.existsSync(file("channel")), requests });
+	} else if (op === "permission.respond") {
+		fs.writeFileSync(file("answer.json"), JSON.stringify(input));
+		out({ accepted: true });
+	} else failed("unknown_operation", `Unknown control operation: ${op}.`);
+	process.exit(0);
+}
+
 // Sessions persist across restarts like ~/.gjc/agent/sessions does for real gjc.
 const stateFile = process.env.FAKE_ACP_STATE;
 const sessions = new Map<string, string[]>(
@@ -92,6 +119,44 @@ const configOptions = [
 ];
 // Like gjc, set_config_option for thinking is slow (it rebuilds the model catalog); thinking.set is not.
 const thinkingLevels = new Map<string, string>();
+
+// A tool approval through the host's permission channel (see the CLI mode above) instead of session/request_permission:
+// listed as a request, answered by `permission.respond`. A request left alone fails when "expire" is steered.
+const channelOptions = [
+	{ optionId: "allow_once", name: "Allow once", kind: "allow_once" },
+	{ optionId: "reject_once", name: "Reject", kind: "reject_once" },
+];
+let nextChannelRequest = 1;
+const expiring = new Map<string, () => void>();
+function channelOn(sid: string): string | undefined {
+	const cwd = sessionCwds.get(sid);
+	const dir = cwd && path.join(cwd, ".gjc", "state", "sdk");
+	return dir && fs.existsSync(path.join(dir, `${sid}.channel`)) ? dir : undefined;
+}
+async function channelApproval(sid: string, dir: string, toolCall: Record<string, unknown>): Promise<string | undefined> {
+	const id = `req-${nextChannelRequest++}`;
+	const requests = path.join(dir, `${sid}.requests.json`);
+	const answer = path.join(dir, `${sid}.answer.json`);
+	// gjc lists the request a moment after the pending tool call arrives over ACP (measured ~1.4s).
+	await Bun.sleep(1200);
+	fs.writeFileSync(requests, JSON.stringify([{ id, sessionId: sid, expiresAt: new Date(Date.now() + 60_000).toISOString(), options: channelOptions, toolCall: { ...toolCall, toolName: "bash" } }]));
+	let expired = false;
+	expiring.set(sid, () => (expired = true));
+	try {
+		while (!expired) {
+			if (fs.existsSync(answer)) {
+				const given = JSON.parse(fs.readFileSync(answer, "utf8"));
+				fs.rmSync(answer);
+				if (given.id === id) return given.optionId;
+			}
+			await Bun.sleep(30);
+		}
+		return undefined;
+	} finally {
+		expiring.delete(sid);
+		fs.rmSync(requests, { force: true });
+	}
+}
 
 async function handle(msg: any) {
 	const { id, method, params } = msg;
@@ -229,8 +294,10 @@ async function handle(msg: any) {
 				const toolCall = { toolCallId: "t1", title: "echo hi", kind: "execute", status: "pending", rawInput: { command: "echo hi" } };
 				update(sid, { sessionUpdate: "tool_call", ...toolCall });
 				const mode = permissionModes.get(sid) ?? "prompt";
-				const res =
-					mode === "prompt"
+				const channel = mode === "prompt" ? channelOn(sid) : undefined;
+				const res = channel
+					? { outcome: { outcome: "selected", optionId: (await channelApproval(sid, channel, toolCall)) ?? "reject_once" } }
+					: mode === "prompt"
 						? await request("session/request_permission", {
 								sessionId: sid,
 								toolCall,
@@ -351,6 +418,22 @@ async function handle(msg: any) {
 				// "host ask <json>" stands for the TUI showing those ask requests (what ask.requests.list lists).
 				if (text.startsWith("host ask ")) {
 					remoteAsks.set(params.sessionId, JSON.parse(text.slice("host ask ".length)));
+					return reply({ accepted: true });
+				}
+				// "terminal tool" stands for a bash call of the TUI turn that waits on the permission channel; "expire" lets
+				// a waiting channel request time out.
+				if (text === "terminal tool") {
+					const dir = channelOn(params.sessionId);
+					const toolCall = { toolCallId: "tt1", title: "rm -f x", kind: "execute", status: "pending", rawInput: { command: "rm -f x" } };
+					update(params.sessionId, { sessionUpdate: "tool_call", ...toolCall });
+					if (dir)
+						void channelApproval(params.sessionId, dir, toolCall).then(optionId =>
+							update(params.sessionId, { sessionUpdate: "tool_call_update", toolCallId: "tt1", status: optionId === "allow_once" ? "completed" : "failed" }),
+						);
+					return reply({ accepted: true });
+				}
+				if (text === "expire") {
+					expiring.get(params.sessionId)?.();
 					return reply({ accepted: true });
 				}
 				// "terminal turn" stands for a turn typed in the TUI: gjc reports it working, but no ACP prompt owns it.

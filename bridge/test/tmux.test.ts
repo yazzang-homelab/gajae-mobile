@@ -22,7 +22,7 @@ function tmux(socket: string, ...args: string[]) {
 }
 
 /** A bridge whose new sessions go to tmux session `gjcm` on a private tmux socket. */
-async function tmuxBridge(options: { server: boolean; tui?: string; readyTimeoutMs?: number }) {
+async function tmuxBridge(options: { server: boolean; tui?: string; readyTimeoutMs?: number; env?: Record<string, string> }) {
 	const socket = `gjcm-test-${crypto.randomBytes(4).toString("hex")}`;
 	cleanups.push(() => void tmux(socket, "kill-server"));
 	// The user's own tmux server, which the bridge only joins.
@@ -31,7 +31,7 @@ async function tmuxBridge(options: { server: boolean; tui?: string; readyTimeout
 	cleanups.push(() => fs.rmSync(cwd, { recursive: true, force: true }));
 	const command = [...FAKE_AGENT, "--mode=acp", ...(options.tui ? [`--tui=${options.tui}`] : [])];
 	const tmuxOptions = { session: "gjcm", socket, ...(options.readyTimeoutMs ? { readyTimeoutMs: options.readyTimeoutMs } : {}) };
-	const bridge = await startTestBridge(command, cwd, { GJCM_TEST_TMUX: JSON.stringify(tmuxOptions) });
+	const bridge = await startTestBridge(command, cwd, { GJCM_TEST_TMUX: JSON.stringify(tmuxOptions), ...options.env });
 	cleanups.push(() => bridge.stop());
 	const { client } = await bridge.pairedClient();
 	const windows = () => {
@@ -135,5 +135,100 @@ describe.skipIf(!hasTmux)("new sessions as tmux windows (gm#58)", () => {
 		expect(failed.data).toEqual({ code: "tmux_ready_timeout" });
 		expect(failed.message).toContain("2초 안에 준비되지 않았습니다");
 		expect(windows()).toEqual([]);
+	});
+});
+
+describe.skipIf(!hasTmux)("tool approvals of a tmux session reach the phone (gm#58)", () => {
+	const permissionFor = (sid: string) => (e: { ev: string; p: any }) => e.ev === "permission.request" && e.p.sessionId === sid;
+	const toolEnd = (sid: string, id: string) => (e: { ev: string; p: any }) =>
+		e.ev === "session.update" && e.p.sessionId === sid && e.p.update.toolCallId === id && ["completed", "failed"].includes(e.p.update.status);
+
+	test("shows a phone turn's approval as a card and answers it through gjc's permission channel", async () => {
+		// Measured 2026-11-07 on pve3 (gjc 0.19.3): the TUI host sends no session/request_permission over ACP, the
+		// channel is prohibited over ACP, and through `gjc sdk session raw` it lists and settles the approval.
+		const { client, cwd } = await tmuxBridge({ server: true });
+		const sid = (await client.request("session.new", {})).sessionId;
+		expect(fs.existsSync(path.join(cwd, ".gjc", "state", "sdk", `${sid}.channel`))).toBe(true);
+		await client.request("session.prompt", { sessionId: sid, prompt: [{ type: "text", text: "tool please" }] });
+		const card = await client.waitFor(permissionFor(sid), 10_000);
+		expect(card.p.toolCall).toMatchObject({ toolCallId: "t1", toolName: "bash", rawInput: { command: "echo hi" } });
+		expect(card.p.options.map((o: any) => o.kind)).toEqual(["allow_once", "reject_once"]);
+		// A phone opening the chat now gets the card in its snapshot too.
+		const snap = await client.request("session.open", { sessionId: sid, afterSeq: 0 });
+		expect(snap.permissions.map((p: any) => p.requestId)).toEqual([card.p.requestId]);
+
+		await client.request("permission.respond", { requestId: card.p.requestId, optionId: "allow_once" });
+		expect((await client.waitFor(toolEnd(sid, "t1"), 10_000)).p.update.status).toBe("completed");
+		expect((await client.waitFor(turnEnd(sid))).p.update.stopReason).toBe("end_turn");
+		expect(client.events.some(e => e.ev === "permission.resolved" && e.p.requestId === card.p.requestId)).toBe(true);
+		expect(await client.request("permission.list", {})).toEqual({ requests: [] });
+	});
+
+	test("a rejection reaches gjc as the offered reject option", async () => {
+		const { client } = await tmuxBridge({ server: true });
+		const sid = (await client.request("session.new", {})).sessionId;
+		await client.request("session.prompt", { sessionId: sid, prompt: [{ type: "text", text: "tool please" }] });
+		const card = await client.waitFor(permissionFor(sid), 10_000);
+		// A dismissal (no option) is sent as the rejection gjc offered.
+		await client.request("permission.respond", { requestId: card.p.requestId });
+		expect((await client.waitFor(toolEnd(sid, "t1"), 10_000)).p.update.status).toBe("failed");
+	});
+
+	test("brings a terminal turn's approval too, and drops the card of one that expired unanswered", async () => {
+		const { client } = await tmuxBridge({ server: true });
+		const sid = (await client.request("session.new", {})).sessionId;
+		await client.request("sdk.control", { sessionId: sid, op: "turn.steer", input: { text: "terminal turn" } });
+		await client.request("sdk.control", { sessionId: sid, op: "turn.steer", input: { text: "terminal tool" } });
+		const card = await client.waitFor(permissionFor(sid), 10_000);
+		expect(card.p.toolCall.toolCallId).toBe("tt1");
+		await client.request("sdk.control", { sessionId: sid, op: "turn.steer", input: { text: "expire" } });
+		await client.waitFor(toolEnd(sid, "tt1"), 5000);
+		const gone = await client.waitFor(e => e.ev === "permission.resolved" && e.p.requestId === card.p.requestId, 3000);
+		expect(gone.p.sessionId).toBe(sid);
+		expect(await client.request("permission.list", {})).toEqual({ requests: [] });
+	});
+
+	test("the phone's deny mode still decides without asking once the channel is on", async () => {
+		const { client } = await tmuxBridge({ server: true });
+		const sid = (await client.request("session.new", {})).sessionId;
+		await client.request("session.setPermissionMode", { sessionId: sid, mode: "deny" });
+		await client.request("session.prompt", { sessionId: sid, prompt: [{ type: "text", text: "tool please" }] });
+		expect((await client.waitFor(toolEnd(sid, "t1"), 10_000)).p.update.status).toBe("failed");
+		await Bun.sleep(300);
+		expect(client.events.some(permissionFor(sid))).toBe(false);
+	});
+
+	test("a session whose channel cannot be turned on still opens, its approvals asked over ACP as before", async () => {
+		const { client, cwd } = await tmuxBridge({ server: true, env: { FAKE_CLI_FAIL: "1" } });
+		const sid = (await client.request("session.new", {})).sessionId;
+		expect(fs.existsSync(path.join(cwd, ".gjc", "state", "sdk", `${sid}.channel`))).toBe(false);
+		await client.request("session.prompt", { sessionId: sid, prompt: [{ type: "text", text: "tool please" }] });
+		const card = await client.waitFor(permissionFor(sid), 10_000);
+		await client.request("permission.respond", { requestId: card.p.requestId, optionId: "allow_once" });
+		expect((await client.waitFor(toolEnd(sid, "t1"), 10_000)).p.update.status).toBe("completed");
+	});
+});
+
+describe.skipIf(!hasTmux)("TmuxLauncher.hosts", () => {
+	test("recognizes the window that hosts a session, and no longer once it is gone", async () => {
+		const socket = `gjcm-test-${crypto.randomBytes(4).toString("hex")}`;
+		cleanups.push(() => void tmux(socket, "kill-server"));
+		expect(tmux(socket, "new-session", "-d", "-s", "keep", "sleep 600").code).toBe(0);
+		const cwd = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "gjcm-tmux-hosts-")));
+		cleanups.push(() => fs.rmSync(cwd, { recursive: true, force: true }));
+		const sdk = path.join(cwd, ".gjc", "state", "sdk");
+		fs.mkdirSync(sdk, { recursive: true });
+		fs.writeFileSync(path.join(sdk, "abc.closed"), "");
+		const launcher = new TmuxLauncher({ session: "gjcm", socket }, FAKE_AGENT);
+		expect(await launcher.hosts("abc", cwd)).toBe(false);
+		await launcher.open("abc", cwd);
+		expect(await launcher.hosts("abc", cwd)).toBe(true);
+		expect(await launcher.hosts("abcd", cwd)).toBe(false);
+		// Another session's endpoint naming this window's gjc is not hosted here: the window resumes "abc".
+		fs.copyFileSync(path.join(sdk, "abc.json"), path.join(sdk, "xyz.json"));
+		expect(await launcher.hosts("xyz", cwd)).toBe(false);
+		// An endpoint naming a process outside the window (the ACP host's leftover) is not this window's.
+		fs.writeFileSync(path.join(sdk, "abc.json"), JSON.stringify({ version: 1, sessionId: "abc", pid: process.pid }));
+		expect(await launcher.hosts("abc", cwd)).toBe(false);
 	});
 });

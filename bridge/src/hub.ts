@@ -24,6 +24,7 @@ import {
 } from "./host-asks";
 import { SavedSessionIndex } from "./saved-sessions";
 import { Throughput } from "./throughput";
+import { SdkCli } from "./sdk-cli";
 import { TmuxError, TmuxLauncher, type TmuxOptions, tuiCommand } from "./tmux";
 
 export const TURN_END = "x_gjcm_turn_end";
@@ -166,6 +167,8 @@ interface SessionState {
 	remoteAsksUnsupported?: boolean;
 	/** Opened by this bridge in a tmux window, so gjc in the terminal hosts it (asks show only there). */
 	inTmux?: boolean;
+	/** That window's permission approval channel, which brings its tool approvals to the phones (see `#readChannel`). */
+	channel?: ApprovalChannel;
 }
 
 export interface SessionStatus {
@@ -175,6 +178,44 @@ export interface SessionStatus {
 	tokensPerSecond?: number;
 	/** gjc's waiting steers and follow-ups, read once a second while the session works; empty when idle. */
 	queued: QueuedMessage[];
+}
+
+/** A tmux session's permission approval channel as the bridge follows it (see `SessionHub.#enableChannel`). */
+interface ApprovalChannel {
+	/** Requests shown to the phones, by gjc's request id. */
+	requests: Map<string, { requestId: string; toolCallId: string }>;
+	/** Tool calls that arrived pending and are not listed in the channel yet. */
+	waitingTools: Set<string>;
+	reading?: Promise<void>;
+	/** Another read was asked for while one ran. */
+	again?: boolean;
+}
+
+/** `permission.requests.list` item (gjc external-permissions.ts). */
+interface ChannelRequest {
+	id: string;
+	toolCallId: string;
+	toolCall: unknown;
+	options: PendingPermission["options"];
+}
+
+/** Reads per trigger at most, and the wait between them while a pending tool call is not listed yet. */
+const CHANNEL_READS = 4;
+const CHANNEL_RETRY_MS = 1000;
+
+/** `permission.requests.list` result (`{sessionId, enabled, requests:[{id, sessionId, expiresAt, options, toolCall}]}`). */
+function channelRequests(result: unknown): ChannelRequest[] {
+	const requests = (result as { requests?: unknown } | undefined)?.requests;
+	if (!Array.isArray(requests)) return [];
+	return requests.flatMap(item => {
+		const r = item as { id?: unknown; options?: unknown; toolCall?: { toolCallId?: unknown } };
+		if (typeof r.id !== "string" || !Array.isArray(r.options) || typeof r.toolCall?.toolCallId !== "string") return [];
+		const options = r.options.filter(
+			(o): o is PendingPermission["options"][number] =>
+				typeof o?.optionId === "string" && typeof o?.name === "string" && typeof o?.kind === "string",
+		);
+		return [{ id: r.id, toolCallId: r.toolCall.toolCallId, toolCall: r.toolCall, options }];
+	});
 }
 
 /** The echo of a phone prompt queued behind a TUI turn, held until gjc hands the prompt to the model. */
@@ -246,6 +287,7 @@ export class SessionHub {
 	#options: Required<Omit<HubOptions, "acp" | "tmux" | "log">> & Pick<HubOptions, "acp" | "log">;
 	readonly #saved: SavedSessionIndex;
 	readonly #tmux?: TmuxLauncher;
+	readonly #sdkCli?: SdkCli;
 	#acp?: AcpProcess;
 	#starting?: Promise<AcpProcess>;
 	#agentInfo: unknown;
@@ -261,7 +303,10 @@ export class SessionHub {
 		this.#options = { maxBufferedUpdates: 5000, maxBufferedBytes: 48 * 1024 * 1024, ...options };
 		this.#saved = new SavedSessionIndex(options.agentDir);
 		// The window gets the tmux server's environment; point gjc there at the agent dir the ACP side uses.
-		if (options.tmux) this.#tmux = new TmuxLauncher(options.tmux, tuiCommand(options.acp.command), { GJC_CODING_AGENT_DIR: options.agentDir });
+		if (options.tmux) {
+			this.#tmux = new TmuxLauncher(options.tmux, tuiCommand(options.acp.command), { GJC_CODING_AGENT_DIR: options.agentDir });
+			this.#sdkCli = new SdkCli({ command: tuiCommand(options.acp.command), agentDir: options.agentDir });
+		}
 	}
 
 	// ── clients ──────────────────────────────────────────────────────────────
@@ -387,6 +432,7 @@ export class SessionHub {
 		if (this.#holdEcho(state, params.update)) return;
 		this.#append(state, state.inTmux ? terminalAsk(params.update) : params.update);
 		this.#lookForHandOver(state, params.update);
+		if (state.channel) this.#watchChannel(state, params.update);
 	}
 
 	/**
@@ -447,6 +493,125 @@ export class SessionHub {
 		const hold = state.echoHold;
 		state.echoHold = undefined;
 		for (const update of hold?.updates ?? []) this.#append(state, update);
+	}
+
+	/**
+	 * Turns on the permission approval channel of a session gjc hosts in a tmux window. gjc sends a TUI host's tool
+	 * approvals to no ACP client, and gjc 0.19.3 prohibits the channel over ACP, so the bridge goes through the
+	 * session CLI (see sdk-cli.ts). Measured 2026-11-07 on pve3: with the channel on, the bash approvals of both a
+	 * phone turn and a turn typed in the terminal are listed by `permission.requests.list` (the TUI shows only a
+	 * spinner meanwhile) and `permission.respond` allows or rejects them. Without it the TUI ran bash unasked while
+	 * the phone showed `prompt`. Enabling sets the session to prompt; re-enabling is a no-op. A failure leaves the
+	 * session without the channel, logged.
+	 */
+	async #enableChannel(state: SessionState): Promise<void> {
+		const cli = this.#sdkCli;
+		if (!cli || state.channel) return;
+		try {
+			await cli.control(state.sessionId, state.cwd, "permission.channel.set", { enabled: true });
+			state.channel = { requests: new Map(), waitingTools: new Set() };
+		} catch (error) {
+			this.#options.log?.(`permission channel not enabled for ${state.sessionId}: ${error instanceof Error ? error.message : String(error)}`);
+		}
+	}
+
+	/**
+	 * gjc announces a channel request on no stream, but the tool it gates arrives over ACP as a pending tool call
+	 * first (measured ~1.4s before it is listed): read the channel then, again while such a call stays pending
+	 * unlisted, and drop the card of a call that ended (expired, cancelled, answered in another way).
+	 */
+	#watchChannel(state: SessionState, update: any): void {
+		const channel = state.channel!;
+		const kind = update?.sessionUpdate;
+		if (kind !== "tool_call" && kind !== "tool_call_update") return;
+		const toolCallId = update.toolCallId;
+		if (typeof toolCallId !== "string") return;
+		if (update.status === "pending" || (kind === "tool_call" && update.status === undefined)) {
+			channel.waitingTools.add(toolCallId);
+			this.#readChannel(state);
+			return;
+		}
+		if (update.status === undefined) return;
+		channel.waitingTools.delete(toolCallId);
+		if (update.status !== "completed" && update.status !== "failed") return;
+		for (const [id, request] of channel.requests) {
+			if (request.toolCallId === toolCallId) this.#dropChannelRequest(state, id);
+		}
+	}
+
+	/** Lists the channel's requests into phone permission cards; one read at a time, another queued behind it. */
+	#readChannel(state: SessionState): void {
+		const channel = state.channel;
+		const cli = this.#sdkCli;
+		if (!channel || !cli) return;
+		if (channel.reading) {
+			channel.again = true;
+			return;
+		}
+		channel.reading = (async () => {
+			for (let attempt = 0; attempt < CHANNEL_READS; attempt++) {
+				channel.again = false;
+				let listed: ChannelRequest[];
+				try {
+					listed = channelRequests(await cli.query(state.sessionId, state.cwd, "permission.requests.list"));
+				} catch (error) {
+					this.#options.log?.(`permission.requests.list failed for ${state.sessionId}: ${error instanceof Error ? error.message : String(error)}`);
+					return;
+				}
+				if (state.channel !== channel) return;
+				const ids = new Set(listed.map(r => r.id));
+				for (const id of channel.requests.keys()) if (!ids.has(id)) this.#dropChannelRequest(state, id);
+				for (const request of listed) {
+					channel.waitingTools.delete(request.toolCallId);
+					if (!channel.requests.has(request.id)) this.#showChannelRequest(state, request);
+				}
+				// A gated call shows up in the channel a moment after it arrives here; one that never does was not gated.
+				if (!channel.again && channel.waitingTools.size === 0) return;
+				await Bun.sleep(CHANNEL_RETRY_MS);
+			}
+		})().finally(() => {
+			channel.reading = undefined;
+			if (channel.again) this.#readChannel(state);
+		});
+	}
+
+	#showChannelRequest(state: SessionState, request: ChannelRequest): void {
+		const channel = state.channel!;
+		const requestId = `perm-${this.#nextPermission++}`;
+		channel.requests.set(request.id, { requestId, toolCallId: request.toolCallId });
+		const pending: PendingPermission = {
+			requestId,
+			sessionId: state.sessionId,
+			toolCall: request.toolCall,
+			options: request.options,
+			resolve: outcome => void this.#answerChannel(state, request, outcome),
+		};
+		this.#permissions.set(requestId, pending);
+		this.#broadcastAll("permission.request", publicPermission(pending));
+	}
+
+	/** Removes a request's card from the phones without answering it (gjc settled it some other way). */
+	#dropChannelRequest(state: SessionState, id: string): void {
+		const shown = state.channel?.requests.get(id);
+		if (!shown) return;
+		state.channel!.requests.delete(id);
+		this.#permissions.delete(shown.requestId);
+		this.#broadcastAll("permission.resolved", { requestId: shown.requestId, sessionId: state.sessionId });
+	}
+
+	/** The phone's answer: `permission.respond` with the picked option, a dismissal as the offered rejection. */
+	async #answerChannel(state: SessionState, request: ChannelRequest, outcome: PermissionOutcome): Promise<void> {
+		if (!state.channel?.requests.has(request.id)) return;
+		this.#dropChannelRequest(state, request.id);
+		const optionId =
+			outcome.outcome === "selected" ? outcome.optionId : request.options.find(o => o.kind === "reject_once" || o.kind === "reject_always")?.optionId;
+		if (!optionId) return; // nothing to reject with: gjc fails it closed when it expires
+		try {
+			await this.#sdkCli!.control(state.sessionId, state.cwd, "permission.respond", { sessionId: state.sessionId, id: request.id, optionId });
+		} catch (error) {
+			this.#options.log?.(`permission.respond failed for ${state.sessionId}: ${error instanceof Error ? error.message : String(error)}`);
+		}
+		if (this.#recyclePending) setTimeout(() => this.#maybeRecycle(), 0);
 	}
 
 	async #onRequest(method: string, params: any): Promise<unknown> {
@@ -858,6 +1023,10 @@ export class SessionHub {
 					mcpServers: [],
 				});
 				state.configOptions = supportedConfigOptions(result?.configOptions ?? state.configOptions);
+				// A window this bridge opened before a restart is recognized again by its tmux pane.
+				if (this.#tmux && !state.inTmux && (await this.#tmux.hosts(state.sessionId, state.cwd))) state.inTmux = true;
+				// Before the mode: enabling the channel sets the session to prompt.
+				if (state.inTmux) await this.#enableChannel(state);
 				if (state.permissionMode !== "prompt") await this.#applyPermissionMode(acp, state.sessionId, state.permissionMode);
 				state.loaded = true;
 			})()

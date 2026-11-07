@@ -72,7 +72,7 @@ GCM nonce = 0x00000000 ‖ 카운터,  AAD = "gjcm1"
 
 ## 4. 세션 흐름
 
-1. `session.new{cwd}` → gjc ACP `session/new`. 0.19.3 실측 중간값 6.2초(4.7~13.8초, 45회)이고 대부분은 세션 호스트 기동입니다. 그래서 앱은 첫 메시지와 함께 생성합니다. 브리지를 `--tmux-session`으로 띄우면 새 세션을 tmux 창의 TUI가 이어받고 폰은 그 TUI에 붙습니다(약 15초, [브리지 README](../bridge/README.md#새-세션을-tmux-창으로-열기-옵트인)).
+1. `session.new{cwd}` → gjc ACP `session/new`. 0.19.3 실측 중간값 6.2초(4.7~13.8초, 45회)이고 대부분은 세션 호스트 기동입니다. 그래서 앱은 첫 메시지와 함께 생성합니다. 브리지를 `--tmux-session`으로 띄우면 새 세션을 tmux 창의 TUI가 이어받고 폰은 그 TUI에 붙습니다. 그 세션의 도구 승인은 gjc 세션 CLI의 승인 채널로 폰에 옵니다(약 15초, [브리지 README](../bridge/README.md#새-세션을-tmux-창으로-열기-옵트인)).
 2. `session.prompt`는 수락 즉시 응답하고 진행 상황은 `session.update` 이벤트로 흘러옵니다. 턴 종료는 브리지가 붙이는 `x_gjcm_turn_end`로 알립니다.
 3. 작업 중 메시지는 `turn.steer`(다음 모델 단계에 주입) 또는 `turn.follow_up`(턴 종료 후 전송)으로 보냅니다.
 4. **끼어들기**(`session.interrupt`): 대기열 조회 → `session/cancel` → 남은 지시 제거 → 같은 텍스트로 새 `session/prompt`. 실측 응답 196ms.

@@ -63,7 +63,8 @@ npm 패키지 `gjcm-bridge`이며 [Bun](https://bun.sh)으로만 실행됩니다
 - 실측(pve3, 공식 gjc 0.19.3, 2026-11-07, ACP가 떠 있는 상태): `session.new` 14.8~15.0초(ACP 경로 5.7~5.9초). 늘어난 시간은 창의 gjc 기동(endpoint까지 약 6.3초)과 다시 붙기입니다. 이 기능의 가치는 속도가 아니라 PC에서 이어 보기입니다.
 - 이 세션은 TUI가 소유합니다. 같은 실측에서 확인한 차이:
   - 앱에서 보낸 턴은 TUI 화면에도 그대로 보입니다.
-  - **ask는 터미널에서만 답할 수 있습니다.** gjc는 앱이 시작한 턴의 ask도 TUI에 띄우고 폰에는 답할 수 없는 `tool_call`만 보냅니다(`session/request_permission` 없음, `workflow.gates.list` 비어 있음). 브리지는 이 카드에 질문·선택지와 "터미널에서 답" 안내를 붙이고, 터미널에서 고른 답과 턴 끝은 폰에 옵니다. 이 안내는 브리지가 이번 실행에서 tmux로 연 세션에만 붙습니다.
+  - **ask는 터미널에서만 답할 수 있습니다.** gjc는 앱이 시작한 턴의 ask도 TUI에 띄우고 폰에는 답할 수 없는 `tool_call`만 보냅니다(`session/request_permission` 없음, `workflow.gates.list` 비어 있음). 브리지는 이 카드에 질문·선택지와 "터미널에서 답" 안내를 붙이고, 터미널에서 고른 답과 턴 끝은 폰에 옵니다. 이 안내는 브리지가 tmux 창으로 연 세션(본인이 연 창을 다시 열 때 알아봄)에만 붙습니다.
+  - **도구 승인(bash 등)은 폰으로 옵니다.** TUI가 소유한 세션은 승인을 ACP로 묻지 않고, gjc 0.19.3은 외부 승인 채널(`permission.channel.set`)도 ACP에서 막습니다(`operation_prohibited`). 그래서 브리지는 세션을 열 때 공식 세션 CLI(`gjc sdk session raw control|query`, `src/sdk-cli.ts`)로 채널을 켭니다. 대기 중인 `tool_call`이 오면 `permission.requests.list`를 읽어 폰에 승인 카드(`permission.request`)를 띄우고, 폰의 답을 `permission.respond`로 돌려줍니다(카드를 닫으면 거부). 앱에서 시작한 턴과 터미널에서 친 턴 모두 적용되며, 그동안 TUI에는 스피너만 보입니다. 답하지 않은 요청은 gjc가 60초 뒤 거부하고 카드도 사라집니다. 앱의 권한모드 `allow`/`deny`는 그대로 우선합니다. CLI 호출 하나가 2~4초라 카드는 도구 호출 뒤 약 2초에 뜹니다. 채널을 켜지 못하면 로그(`permission channel not enabled for ...`)만 남기고 예전처럼 엽니다. 실측(pve3, 0.19.3, 2026-11-07): 앱 턴 bash는 폰 허용으로 실행, 터미널 턴 bash는 폰 거부로 "Tool call rejected by user". 브리지를 다시 시작해도 그 세션을 열 때 tmux 창(`--resume <id>`을 띄운 창의 gjc가 endpoint를 가짐)으로 알아보고 다시 켭니다.
   - 앱이 시작한 턴은 앱에서 멈출 수 있습니다(`session.cancel` 후 약 0.4초에 `cancelled`). 터미널에서 친 턴은 앱의 멈춤이 효과가 없습니다(상류 [gajae-code#7566](https://github.com/Yeachan-Heo/gajae-code/issues/7566)).
   - 앱에서 채팅을 닫거나 브리지를 멈춰도 tmux 창과 TUI는 남습니다. 창은 터미널에서 닫습니다.
 - Windows 호스트와 tmux를 쓰지 않는 호스트에서는 이 옵션을 주지 않습니다.

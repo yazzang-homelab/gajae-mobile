@@ -624,6 +624,80 @@ describe("sessions over the bridge", () => {
 		expect(texts).toEqual(["이 사진 봐"]);
 	});
 
+	describe("a phone prompt queued behind a TUI turn", () => {
+		const photo = { type: "image", mimeType: "image/png", data: "iVBORw0KGgo=" };
+		const startTerminalTurn = async () => {
+			const bridge = await useBridge();
+			const { client } = await bridge.pairedClient();
+			const sid = (await client.request("session.new", {})).sessionId;
+			await client.request("sdk.control", { sessionId: sid, op: "turn.steer", input: { text: "terminal turn" } });
+			await client.waitFor(e => e.ev === "session.status" && e.p.sessionId === sid && e.p.running);
+			const users = () =>
+				client.events
+					.filter(e => e.ev === "session.update" && e.p.sessionId === sid && e.p.update.sessionUpdate === "user_message_chunk")
+					.map(e => e.p.update.content.type);
+			return { client, sid, users };
+		};
+
+		test("shows its message only once gjc hands it to the model, not while it waits in the queue", async () => {
+			// Measured 2026-11-07 on pve3 (gjc 0.19.3): gjc echoed the photo+text at once, kept it queued as a steer for
+			// 25s until the TUI turn's tool ended, and announced no hand-over; the phone drew it mid-turn while also
+			// listing it as waiting.
+			const { client, sid, users } = await startTerminalTurn();
+			await client.request("session.prompt", { sessionId: sid, prompt: [{ type: "text", text: "이 사진 봐" }, photo] });
+			const waiting = await client.waitFor(
+				e => e.ev === "session.status" && e.p.sessionId === sid && e.p.queued.some((m: any) => m.text === "이 사진 봐"),
+				3000,
+			);
+			expect(waiting.p.running).toBe(true);
+			await Bun.sleep(1200); // another queue read: still waiting
+			expect(users()).toEqual([]);
+			const snap = await client.request("session.open", { sessionId: sid, afterSeq: 0 });
+			expect(snap.updates.filter((u: any) => u.update.sessionUpdate === "user_message_chunk")).toEqual([]);
+
+			// Right after a once-a-second read, so the next one is ~1s away: the tool end that hands the prompt over
+			// triggers a read of its own.
+			const ticks = client.events.length;
+			await client.waitFor(e => e.ev === "session.status" && e.p.sessionId === sid && client.events.indexOf(e) >= ticks, 3000);
+			await client.request("sdk.control", { sessionId: sid, op: "turn.steer", input: { text: "terminal step" } });
+			const shown = await client.waitFor(
+				e => e.ev === "session.update" && e.p.sessionId === sid && e.p.update.sessionUpdate === "user_message_chunk",
+				600,
+			);
+			const stepEnd = client.events.findIndex(e => e.ev === "session.update" && e.p.update.toolCallId === "terminal-tool");
+			expect(client.events.indexOf(shown)).toBeGreaterThan(stepEnd);
+			await client.request("sdk.control", { sessionId: sid, op: "turn.steer", input: { text: "terminal done" } });
+			expect((await client.waitFor(turnEnd(sid))).p.update.stopReason).toBe("end_turn");
+			expect(users()).toEqual(["text", "image"]);
+			const replay = await client.request("session.open", { sessionId: sid, afterSeq: 0 });
+			expect(replay.updates.filter((u: any) => u.update.sessionUpdate === "user_message_chunk")).toHaveLength(2);
+		});
+
+		test("shows its message when gjc took it before any queue read listed it", async () => {
+			const { client, sid, users } = await startTerminalTurn();
+			await client.request("session.prompt", { sessionId: sid, prompt: [{ type: "text", text: "즉시 받음" }, photo] });
+			await client.waitFor(
+				e => e.ev === "session.update" && e.p.sessionId === sid && e.p.update.sessionUpdate === "user_message_chunk",
+				4000,
+			);
+			await Bun.sleep(50);
+			expect(users()).toEqual(["text", "image"]);
+			await client.request("sdk.control", { sessionId: sid, op: "turn.steer", input: { text: "terminal done" } });
+			await client.waitFor(turnEnd(sid));
+			expect(users()).toEqual(["text", "image"]);
+		});
+
+		test("never shows a message a cancel purged from the queue", async () => {
+			const { client, sid, users } = await startTerminalTurn();
+			await client.request("session.prompt", { sessionId: sid, prompt: [photo, { type: "text", text: "취소될 사진" }] });
+			await client.waitFor(e => e.ev === "session.status" && e.p.sessionId === sid && e.p.queued.length > 0, 3000);
+			await client.request("session.cancel", { sessionId: sid });
+			expect((await client.waitFor(turnEnd(sid), 4000)).p.update.stopReason).toBe("error");
+			await Bun.sleep(1200);
+			expect(users()).toEqual([]);
+		});
+	});
+
 	test("session.interrupt also refuses a text-only phone prompt queued behind a TUI turn instead of failing it", async () => {
 		const bridge = await useBridge();
 		const { client } = await bridge.pairedClient();

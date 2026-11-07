@@ -123,7 +123,9 @@ async function handle(msg: any) {
 			const texts = params.prompt.filter((b: any) => b.type === "text").map((b: any) => b.text);
 			if (terminalTurns.has(sid)) {
 				const steerId = `steer:${nextSteer++}`;
-				steers.set(sid, [...(steers.get(sid) ?? []), { id: steerId, text: texts.join("\n"), mode: "steer", label: "Steer" }]);
+				// "즉시" stands for a prompt the TUI turn took at once (it was at a step boundary): never listed as queued.
+				if (!texts.join(" ").startsWith("즉시"))
+					steers.set(sid, [...(steers.get(sid) ?? []), { id: steerId, text: texts.join("\n"), mode: "steer", label: "Steer" }]);
 				for (const block of params.prompt) update(sid, { sessionUpdate: "user_message_chunk", content: block });
 				const outcome = await new Promise<"consumed" | "removed">(settle => queuedPrompts.set(sid, { steerId, blocks: params.prompt, settle }));
 				if (outcome === "removed") return write({ jsonrpc: "2.0", id, error: { code: -32603, message: "Prompt submission failed." } });
@@ -181,7 +183,8 @@ async function handle(msg: any) {
 			if (waiting) {
 				queuedPrompts.delete(params.sessionId);
 				steers.set(params.sessionId, (steers.get(params.sessionId) ?? []).filter(s => s.id !== waiting.steerId));
-				waiting.settle("removed");
+				// The purged prompt fails a moment later, after a queue read can already see it gone.
+				setTimeout(() => waiting.settle("removed"), 1500);
 			}
 			cancellable.get(params.sessionId)?.();
 			cancellable.delete(params.sessionId);
@@ -241,6 +244,14 @@ async function handle(msg: any) {
 				if (text === "terminal turn") {
 					terminalTurns.add(params.sessionId);
 					update(params.sessionId, { sessionUpdate: "session_info_update", _meta: { gjcPhase: "working", running: true } });
+					return reply({ accepted: true });
+				}
+				// "terminal step" stands for the TUI turn's next step boundary: gjc hands a queued prompt to the model, which
+				// leaves the queue; the prompt still settles only with the turn.
+				if (text === "terminal step") {
+					const waiting = queuedPrompts.get(params.sessionId);
+					if (waiting) steers.set(params.sessionId, (steers.get(params.sessionId) ?? []).filter(s => s.id !== waiting.steerId));
+					update(params.sessionId, { sessionUpdate: "tool_call_update", toolCallId: "terminal-tool", status: "completed" });
 					return reply({ accepted: true });
 				}
 				// "terminal done" ends that TUI turn.

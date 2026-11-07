@@ -813,6 +813,57 @@ describe("sessions over the bridge", () => {
 			expect((await client.waitFor(e => turnEnd(sid)(e) && e !== end, 3000)).p.update.stopReason).toBe("end_turn");
 		}, 15_000);
 
+		test("ends a released turn itself when gjc's close leaves it unanswered, and a late answer ends nothing", async () => {
+			const { client, sid } = await terminalTurn();
+			await client.request("session.prompt", { sessionId: sid, prompt: [photo, { type: "text", text: "잊힌 사진" }] });
+			await client.request("sdk.control", { sessionId: sid, op: "turn.steer", input: { text: "terminal step" } });
+			await client.request("sdk.control", { sessionId: sid, op: "turn.steer", input: { text: "terminal esc, orphaned" } });
+			const started = Date.now();
+			expect(await client.request("session.cancel", { sessionId: sid })).toEqual({ ok: true });
+			expect(Date.now() - started).toBeGreaterThan(4000); // waited for gjc's answer first
+			const ends = () => client.events.filter(turnEnd(sid));
+			expect(ends().map(e => e.p.update.stopReason)).toEqual(["cancelled"]);
+			// gjc answers the old prompt after all: the turn already ended once.
+			await client.request("sdk.control", { sessionId: sid, op: "turn.steer", input: { text: "terminal done" } });
+			await Bun.sleep(300);
+			expect(ends()).toHaveLength(1);
+			await client.request("session.prompt", { sessionId: sid, prompt: [{ type: "text", text: "다시 됐나" }] });
+			await client.waitFor(e => turnEnd(sid)(e) && ends().length === 2, 3000);
+			expect(ends()[1]!.p.update.stopReason).toBe("end_turn");
+		}, 15_000);
+
+		test("does not release a turn by itself while the host compacts, which isStreaming does not cover", async () => {
+			const { client, sid } = await stuckPhoneTurn({ GJCM_TEST_STUCK_TURN_MS: "200" });
+			await client.request("sdk.control", { sessionId: sid, op: "turn.steer", input: { text: "host compacting" } });
+			await Bun.sleep(3500);
+			expect(client.events.some(turnEnd(sid))).toBe(false);
+			await client.request("sdk.control", { sessionId: sid, op: "turn.steer", input: { text: "host compacted" } });
+			expect((await client.waitFor(turnEnd(sid), 6000)).p.update.stopReason).toBe("cancelled");
+		}, 15_000);
+
+		test("stops as before in a session gjc ACP hosts itself: no terminal to point at", async () => {
+			const { client, sid } = await terminalTurn({ FAKE_SURFACE: "sdk" });
+			expect(await client.request("session.cancel", { sessionId: sid })).toEqual({ ok: true });
+		});
+
+		test("does not release a turn by itself in a session gjc ACP hosts itself, where closing it would close the host", async () => {
+			const { client, sid } = await stuckPhoneTurn({ GJCM_TEST_STUCK_TURN_MS: "200", FAKE_SURFACE: "sdk" });
+			await Bun.sleep(3500);
+			expect(client.events.some(turnEnd(sid))).toBe(false);
+		});
+
+		test("a chat opened while a turn is being released waits and shows it ended", async () => {
+			const { client, sid } = await terminalTurn();
+			await client.request("session.prompt", { sessionId: sid, prompt: [photo, { type: "text", text: "열면서 푸는 사진" }] });
+			await client.request("sdk.control", { sessionId: sid, op: "turn.steer", input: { text: "terminal step" } });
+			await client.request("sdk.control", { sessionId: sid, op: "turn.steer", input: { text: "terminal esc, orphaned" } });
+			const stopped = client.request("session.cancel", { sessionId: sid });
+			await Bun.sleep(300); // the release is waiting on gjc's answer (5s)
+			const snap = await client.request("session.open", { sessionId: sid, afterSeq: 0 });
+			expect(snap.running).toBe(false);
+			expect(await stopped).toEqual({ ok: true });
+		}, 15_000);
+
 		test("does not release a turn by itself while its host still works or anything new arrives", async () => {
 			const { client, sid } = await terminalTurn({ GJCM_TEST_STUCK_TURN_MS: "200" });
 			await client.request("session.prompt", { sessionId: sid, prompt: [photo, { type: "text", text: "기다리는 사진" }] });

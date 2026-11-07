@@ -400,36 +400,39 @@ class ChatModel(
 
     suspend fun cancel() {
         val client = connection.connectedClient ?: return
-        // Stopping the turn is no cue to start the next one: the held message stays out of the turn end's reach.
+        // Stopping the turn is no cue to start the next one: the held message stays out of the turn end's reach while
+        // the stop is on its way, and the chat keeps its subscription for it (see [leave]).
         val held = heldPhotoMessage
-        heldPhotoMessage = null
+        if (held != null) {
+            heldPhotoMessage = null
+            heldInFlight = true
+        }
+        var stopped = false
         try {
             reopening(client) { client.cancel(sessionId) }
+            stopped = true
         } catch (e: BridgeException.Remote) {
-            if (e.code == -32004 && e.reason == "host_turn") {
-                // Only the terminal can stop this turn (gjc lets a client stop only its own runs): it runs on, and the
-                // held message still goes out once it ends.
-                transcript.appendNotice(e.message ?: "")
-                if (held != null) {
-                    if (heldPhotoMessage == null) {
-                        heldPhotoMessage = held
-                        sendHeldPhotoMessageIfIdle()
-                    } else {
-                        restore(held)
-                    }
-                }
-                publish()
-                return
-            }
-            show(e)
+            // Only the terminal can stop this turn (gjc lets a client stop only its own runs): it runs on.
+            if (e.code == -32004 && e.reason == "host_turn") transcript.appendNotice(e.message ?: "") else show(e)
         } catch (e: Exception) {
             show(e)
+        } finally {
+            if (held != null) heldInFlight = false
         }
         if (held != null) {
-            restore(held)
-            transcript.appendNotice("턴을 멈춰서 보내려던 사진 메시지를 입력창으로 돌려놓았습니다.")
-            publish()
+            if (stopped) {
+                restore(held)
+                transcript.appendNotice("턴을 멈춰서 보내려던 사진 메시지를 입력창으로 돌려놓았습니다.")
+            } else if (heldPhotoMessage == null) {
+                // Not stopped: the held message still goes out once the turn ends.
+                heldPhotoMessage = held
+                sendHeldPhotoMessageIfIdle()
+            } else {
+                restore(held)
+            }
         }
+        publish()
+        if (held != null && !isVisible) leave()
     }
 
     suspend fun respond(request: PermissionRequest, option: PermissionOption?) {

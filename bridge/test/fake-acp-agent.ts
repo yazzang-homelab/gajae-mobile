@@ -105,7 +105,11 @@ const terminalTurns = new Set<string>();
 // `running: false` until the prompt settles.
 // session/cancel does not stop the terminal turn; it purges the queued prompt, which then fails as
 // "Prompt submission failed." ("Queued prompt was removed before consumption" in gjc's log).
-const queuedPrompts = new Map<string, { steerId: string; blocks: any[]; taken?: boolean; settle: (outcome: "consumed" | "removed" | "closed") => void }>();
+// `orphan`: gjc no longer tracks it as the session's active prompt, so session/close does not settle it either.
+const queuedPrompts = new Map<
+	string,
+	{ steerId: string; blocks: any[]; taken?: boolean; orphan?: boolean; settle: (outcome: "consumed" | "removed" | "closed") => void }
+>();
 // gjc's SDK permission policy; every ACP attachment (session/new, session/load) resets it to prompt.
 const permissionModes = new Map<string, string>();
 
@@ -223,7 +227,7 @@ async function handle(msg: any) {
 			// Like gjc 0.19.3 (measured with a TUI host): closing the attachment settles a prompt still waiting on it as
 			// cancelled; the host's own turn is left alone.
 			const waiting = queuedPrompts.get(params.sessionId);
-			if (waiting) {
+			if (waiting && !waiting.orphan) {
 				queuedPrompts.delete(params.sessionId);
 				steers.set(params.sessionId, (steers.get(params.sessionId) ?? []).filter(s => s.id !== waiting.steerId));
 				waiting.settle("closed");
@@ -388,7 +392,10 @@ async function handle(msg: any) {
 					return reply({ type: "query_response", id: "q", ok: false, error: { code: "internal", message: "SDK session attachment is stale." } });
 				}
 				const operations = ["turn.steer", ...(btw.startsWith("turn") ? ["turn.btw", "btw.ask"] : btw.startsWith("ask") ? ["btw.ask"] : [])];
-				const item = { operations, hostTools: false, ...(btw.endsWith("-exchanges") ? { btwAskExchangesVersion: 1 } : {}) };
+				// FAKE_SURFACE=sdk stands for a session gjc ACP hosts itself; by default a terminal hosts it, as the
+				// "terminal ..." steers below play.
+				const primaryControlSurface = process.env.FAKE_SURFACE ?? "cli";
+				const item = { operations, hostTools: false, primaryControlSurface, ...(btw.endsWith("-exchanges") ? { btwAskExchangesVersion: 1 } : {}) };
 				return reply({ type: "query_response", id: "q", ok: true, page: { items: [item], complete: true } });
 			}
 			if (params.query === "ask.requests.list") {
@@ -498,13 +505,21 @@ async function handle(msg: any) {
 				// "terminal esc" stands for the TUI's Esc on a run that carries the phone's prompt. Seen 2026-11-08 on pve3
 				// (gjc 0.19.3): the run stopped and the host went idle, but the ACP prompt was never answered and gjc reported
 				// working on.
-				if (text === "terminal esc") {
+				// "terminal esc, orphaned" also leaves the prompt out of gjc's sight (see `orphan`).
+				if (text === "terminal esc" || text === "terminal esc, orphaned") {
 					terminalTurns.delete(params.sessionId);
 					const waiting = queuedPrompts.get(params.sessionId);
 					if (waiting) {
 						waiting.taken = true;
+						waiting.orphan = text.endsWith("orphaned");
 						steers.set(params.sessionId, (steers.get(params.sessionId) ?? []).filter(s => s.id !== waiting.steerId));
 					}
+					return reply({ accepted: true });
+				}
+				// "host compacting" / "host compacted": gjc's auto-compaction, which `isStreaming` does not cover.
+				if (text === "host compacting" || text === "host compacted") {
+					const phase = text === "host compacting" ? "compacting" : "idle";
+					update(params.sessionId, { sessionUpdate: "session_info_update", _meta: { gjcPhase: phase, running: phase !== "idle" } });
 					return reply({ accepted: true });
 				}
 				// "terminal done" ends that TUI turn.

@@ -112,6 +112,8 @@ interface SessionState {
 	turnBehindHost?: boolean;
 	/** The text of that prompt when it carries attachments: still listed by gjc's queue means it waits there. */
 	turnAttachmentText?: string;
+	/** That prompt's own message while it waits in gjc's queue (see `#holdEcho`). */
+	echoHold?: EchoHold;
 	/**
 	 * Set by `interrupt()` from its cancel until its replacement prompt has started. Another prompt in that window
 	 * (a phone sending a held photo message as the cancelled turn ends) would take the turn the waiting steers are
@@ -147,6 +149,32 @@ export interface SessionStatus {
 	/** gjc's waiting steers and follow-ups, read once a second while the session works; empty when idle. */
 	queued: QueuedMessage[];
 }
+
+/** The echo of a phone prompt queued behind a TUI turn, held until gjc hands the prompt to the model. */
+interface EchoHold {
+	/** Echo blocks still to arrive (see `echoedBlocks`); only chunks matching them are held. */
+	blocks: EchoBlock[];
+	updates: Record<string, unknown>[];
+	/** The prompt's text as gjc's queue lists it (see `queueText`). */
+	text: string;
+	/** Queue ids already listed when the prompt went in, so an older message with the same text is not taken for it. */
+	before: Set<string>;
+	/** The prompt's id in gjc's queue once a read listed it. */
+	queueId?: string;
+	echoedAt?: number;
+	/** When `#lookForHandOver` last started a queue read. */
+	lookedAt?: number;
+	/** A cancel purges the queued prompt; it leaving the queue then is no hand-over. */
+	cancelled?: boolean;
+}
+
+type EchoBlock = { type: "text"; text: string } | { type: "image"; data: string };
+
+/** How often a streaming turn may trigger a queue read while a held echo waits to be handed over. */
+const ECHO_LOOK_MS = 300;
+
+/** How long after the echo a queue read must start for the prompt's absence to mean gjc already took it. */
+const ECHO_QUEUE_GRACE_MS = 1500;
 
 export interface QueuedMessage {
 	id: string;
@@ -323,7 +351,69 @@ export class SessionHub {
 	#onNotification(method: string, params: any): void {
 		if (method !== "session/update" || typeof params?.sessionId !== "string") return;
 		const state = this.#stateFor(params.sessionId);
+		if (this.#holdEcho(state, params.update)) return;
 		this.#append(state, params.update);
+		this.#lookForHandOver(state, params.update);
+	}
+
+	/**
+	 * Keeps back the echo of a phone prompt queued behind a TUI turn until gjc hands it to the model. gjc echoes a
+	 * prompt's text and image blocks as `user_message_chunk` the moment it receives it, before the prompt waits in
+	 * its queue (measured 2026-11-07 on pve3, gjc 0.19.3: echoed at once, listed as `steer:1` for 25s until the TUI
+	 * turn's tool ended, then answered; nothing announced the hand-over). Shown at once, the message sat in the
+	 * middle of the TUI turn's output while the phone also listed it as waiting; the TUI shows it only once
+	 * delivered. The echo is released when the queue no longer lists it (`#settleEchoHold`) or the prompt ends.
+	 */
+	#holdEcho(state: SessionState, update: any): boolean {
+		const hold = state.echoHold;
+		if (!hold || update?.sessionUpdate !== "user_message_chunk" || !sameBlock(hold.blocks[0], update.content)) return false;
+		hold.blocks.shift();
+		hold.updates.push(update);
+		if (hold.blocks.length === 0) hold.echoedAt = Date.now();
+		return true;
+	}
+
+	/**
+	 * gjc hands a queued message over at a step boundary: when a tool ends, or when the model's answer goes on.
+	 * Looks at once on a tool end and at most every [ECHO_LOOK_MS] while the turn streams, instead of waiting for
+	 * the once-a-second read. A read already in flight may predate the hand-over, so the look starts after it.
+	 */
+	#lookForHandOver(state: SessionState, update: any): void {
+		const hold = state.echoHold;
+		if (hold?.queueId === undefined) return;
+		const now = Date.now();
+		const toolEnded = update?.status === "completed" || update?.status === "failed";
+		if (!toolEnded && now - (hold.lookedAt ?? 0) < ECHO_LOOK_MS) return;
+		hold.lookedAt = now;
+		void (state.queueSample ?? Promise.resolve()).then(() => this.#sampleQueue(state));
+	}
+
+	/** Releases the held echo once gjc's queue (read at [sampledAt]) shows the prompt left it. */
+	#settleEchoHold(state: SessionState, queue: QueuedMessage[], sampledAt: number): void {
+		const hold = state.echoHold;
+		if (!hold || hold.echoedAt === undefined || hold.cancelled) return;
+		if (hold.queueId === undefined) {
+			// gjc lists it as a steer, or as a follow-up when one already waits ahead of it. Matched by text only: a
+			// steer typed in the TUI meanwhile is new to [before] too, and taking it for this prompt would hold the
+			// message until that one goes.
+			const listed = queue.find(m => !hold.before.has(m.id) && m.text.trim() === hold.text);
+			if (listed) {
+				hold.queueId = listed.id;
+				return;
+			}
+			// Never listed: taken straight away (the TUI turn was at a step boundary or had just ended). A read started
+			// right after the echo may predate the queueing, so only a later one counts.
+			if (sampledAt - hold.echoedAt < ECHO_QUEUE_GRACE_MS) return;
+		} else if (queue.some(m => m.id === hold.queueId)) {
+			return;
+		}
+		this.#releaseEcho(state);
+	}
+
+	#releaseEcho(state: SessionState): void {
+		const hold = state.echoHold;
+		state.echoHold = undefined;
+		for (const update of hold?.updates ?? []) this.#append(state, update);
 	}
 
 	async #onRequest(method: string, params: any): Promise<unknown> {
@@ -459,9 +549,12 @@ export class SessionHub {
 	 */
 	#sampleQueue(state: SessionState): Promise<void> {
 		if (!state.loaded) return Promise.resolve();
+		const sampledAt = Date.now();
 		state.queueSample ??= this.sdk({ sessionId: state.sessionId, kind: "query", op: "queue.messages.list", internal: true })
 			.then(result => {
-				if (isActive(state)) state.queued = queuedMessages(result);
+				const queue = queuedMessages(result);
+				if (isActive(state)) state.queued = queue;
+				this.#settleEchoHold(state, queue, sampledAt);
 			})
 			.catch(() => {})
 			.finally(() => {
@@ -709,12 +802,19 @@ export class SessionHub {
 		state.turnAttachmentText = params.prompt.some(block => (block as { type?: unknown } | null)?.type !== "text")
 			? promptText(params.prompt) || undefined
 			: undefined;
+		const echoed = echoedBlocks(params.prompt);
+		state.echoHold =
+			state.hostRunning && echoed.length > 0
+				? { blocks: echoed, updates: [], text: queueText(params.prompt), before: new Set(state.queued.map(m => m.id)) }
+				: undefined;
 		this.#track(state, { sessionUpdate: "x_gjcm_turn_start" });
 		state.turn = acp.request("session/prompt", { sessionId: params.sessionId, prompt: params.prompt }).then(
 			result => {
 				state.running = false;
 				state.turnBehindHost = false;
 				state.turnAttachmentText = undefined;
+				// Answered, so gjc took it: a hand-over the queue reads missed still shows the message, before the turn end.
+				this.#releaseEcho(state);
 				this.#append(state, { sessionUpdate: TURN_END, stopReason: result?.stopReason ?? "end_turn" });
 				this.#maybeRecycle();
 			},
@@ -722,6 +822,9 @@ export class SessionHub {
 				state.running = false;
 				state.turnBehindHost = false;
 				state.turnAttachmentText = undefined;
+				// Still held: it never reached the model (gjc 0.19.3 fails a queued prompt purged by a cancel as
+				// "Prompt submission failed."), so it is not shown as said.
+				state.echoHold = undefined;
 				if (String(error?.message ?? error).includes(STALE_ATTACHMENT)) state.loaded = false;
 				this.#append(state, { sessionUpdate: TURN_END, stopReason: "error", error: String(error?.message ?? error) });
 				this.#maybeRecycle();
@@ -731,6 +834,9 @@ export class SessionHub {
 	}
 
 	async cancel(params: { sessionId: string }): Promise<{ ok: true }> {
+		// gjc purges a prompt waiting behind a TUI turn on cancel: it leaving the queue now is no hand-over.
+		const hold = this.#sessions.get(params.sessionId)?.echoHold;
+		if (hold) hold.cancelled = true;
 		for (const permission of this.#permissions.values()) {
 			if (permission.sessionId === params.sessionId) permission.resolve({ outcome: "cancelled" });
 		}
@@ -1196,6 +1302,61 @@ export function supportedConfigOptions(options: unknown[]): unknown[] {
 		const choices = o.options.filter(choice => (choice as { value?: unknown })?.value !== "plan");
 		return choices.length > 1 ? [{ ...o, options: choices }] : [];
 	});
+}
+
+/** The prompt blocks gjc echoes back as `user_message_chunk`, in order (acp-agent: text with content and images). */
+function echoedBlocks(prompt: unknown[]): EchoBlock[] {
+	return prompt.flatMap((block): EchoBlock[] => {
+		const b = block as { type?: unknown; text?: unknown; data?: unknown } | null;
+		if (b?.type === "image" && typeof b.data === "string") return [{ type: "image", data: b.data }];
+		if (b?.type === "text" && typeof b.text === "string" && b.text.length > 0) return [{ type: "text", text: b.text }];
+		return [];
+	});
+}
+
+function sameBlock(expected: EchoBlock | undefined, content: unknown): boolean {
+	const c = content as { type?: unknown; text?: unknown; data?: unknown } | null | undefined;
+	if (!expected || c?.type !== expected.type) return false;
+	return expected.type === "text" ? c.text === expected.text : c.data === expected.data;
+}
+
+/**
+ * The text gjc 0.19.3 lists a prompt under in its queue: `acpPromptPayload` joins its text blocks and renders file
+ * links and text resources into the text, and an empty text with images is shown as "[Image]" (agent-session).
+ */
+function queueText(prompt: unknown[]): string {
+	const text: string[] = [];
+	let images = 0;
+	for (const block of prompt) {
+		const b = block as Record<string, any> | null;
+		switch (b?.type) {
+			case "text":
+				if (typeof b.text === "string") text.push(b.text);
+				break;
+			case "image":
+				images++;
+				break;
+			case "resource_link":
+				text.push(
+					[
+						`[Resource: ${b.name}]`,
+						`URI: ${b.uri}`,
+						...(b.title ? [`Title: ${b.title}`] : []),
+						...(b.description ? [b.description] : []),
+						...(b.mimeType ? [`MIME: ${b.mimeType}`] : []),
+						...(typeof b.size === "number" ? [`Size: ${b.size}`] : []),
+					].join("\n"),
+				);
+				break;
+			case "resource":
+				if (typeof b.resource?.text === "string")
+					text.push([`[Resource: ${b.resource.uri}]`, ...(b.resource.mimeType ? [`MIME: ${b.resource.mimeType}`] : []), b.resource.text].join("\n"));
+				else images++;
+				break;
+		}
+	}
+	const joined = text.join("\n");
+	return (joined || (images > 0 ? "[Image]" : "")).trim();
 }
 
 /** The text blocks of a prompt as gjc's queue lists it (attachments carry no text). */

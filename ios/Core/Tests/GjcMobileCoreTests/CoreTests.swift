@@ -112,6 +112,73 @@ final class TranscriptTests: XCTestCase {
     }
 }
 
+final class HostAskTests: XCTestCase {
+    private let input: JSONValue = ["questions": [["id": "q", "question": "배포할까요?", "options": [["label": "예"], ["label": "아니오"]], "multi": true]]]
+    private let meta: JSONValue = ["gjcm": ["hostAsk": true]]
+
+    private func askCall(_ t: SessionTranscript) -> ToolCall? {
+        guard t.items.count == 1, case let .tool(call) = t.items[0].kind else { return nil }
+        return call
+    }
+
+    func testHostAskToolCallParsesQuestionsAndOptions() throws {
+        var t = SessionTranscript()
+        t.apply(SequencedUpdate(seq: 1, update: ["sessionUpdate": "tool_call", "toolCallId": "a", "title": "ask: 배포할까요?", "status": "pending", "rawInput": input, "_meta": meta]))
+        let call = try XCTUnwrap(askCall(t))
+        XCTAssertTrue(call.hostAsk)
+        XCTAssertEqual(call.terminalQuestions, [TerminalQuestion(question: "배포할까요?", options: ["예", "아니오"], multi: true)])
+    }
+
+    func testHostAskAfterOriginalToolCallUpgradesSameRow() throws {
+        var t = SessionTranscript()
+        t.apply(SequencedUpdate(seq: 1, update: ["sessionUpdate": "tool_call", "toolCallId": "a", "title": "ask", "status": "pending", "rawInput": input]))
+        XCTAssertFalse(try XCTUnwrap(askCall(t)).hostAsk)
+        t.apply(SequencedUpdate(seq: 2, update: ["sessionUpdate": "tool_call", "toolCallId": "a", "title": "ask: 배포할까요?", "status": "pending", "rawInput": input, "_meta": meta]))
+        XCTAssertTrue(try XCTUnwrap(askCall(t)).hostAsk)
+    }
+
+    func testHostAskCompletedKeepsMarkerAndShowsAnswer() throws {
+        var t = SessionTranscript()
+        t.apply(SequencedUpdate(seq: 1, update: ["sessionUpdate": "tool_call", "toolCallId": "a", "title": "ask", "status": "pending", "rawInput": input, "_meta": meta]))
+        t.apply(SequencedUpdate(seq: 2, update: ["sessionUpdate": "tool_call_update", "toolCallId": "a", "status": "completed",
+                                                 "content": [["type": "content", "content": ["type": "text", "text": "예"]]]]))
+        let call = try XCTUnwrap(askCall(t))
+        XCTAssertTrue(call.hostAsk)
+        XCTAssertEqual(call.status, "completed")
+        XCTAssertEqual(call.output, "예")
+        XCTAssertEqual(call.terminalQuestions.count, 1)
+    }
+
+    func testAskWithoutHostMarkerStaysOrdinaryTool() throws {
+        var t = SessionTranscript()
+        t.apply(SequencedUpdate(seq: 1, update: ["sessionUpdate": "tool_call", "toolCallId": "a", "title": "ask", "status": "pending", "rawInput": input]))
+        t.apply(SequencedUpdate(seq: 2, update: ["sessionUpdate": "tool_call_update", "toolCallId": "a", "status": "completed"]))
+        let call = try XCTUnwrap(askCall(t))
+        XCTAssertFalse(call.hostAsk)
+        XCTAssertEqual(call.status, "completed")
+    }
+
+    func testTurnEndFailsOpenTerminalQuestionWithoutWaitingNotice() throws {
+        var t = SessionTranscript()
+        t.apply(SequencedUpdate(seq: 1, update: ["sessionUpdate": "tool_call", "toolCallId": "a", "title": "ask", "status": "pending", "rawInput": input, "_meta": meta,
+                                                 "content": [["type": "content", "content": ["type": "text", "text": "배포할까요?\n터미널에서 답을 기다리는 질문입니다."]]]]))
+        t.apply(SequencedUpdate(seq: 2, update: ["sessionUpdate": "x_gjcm_turn_end", "stopReason": "end_turn"]))
+        let call = try XCTUnwrap(t.items.compactMap { item -> ToolCall? in if case let .tool(c) = item.kind { return c } else { return nil } }.first)
+        XCTAssertEqual(call.status, "failed")
+        XCTAssertEqual(call.output, "")
+    }
+
+    func testReplayedFailedAskReturnsToPendingTerminalQuestion() throws {
+        // A reload replays a waiting ask as failed (no result yet); the bridge then shows it again as pending.
+        var t = SessionTranscript()
+        t.apply(SequencedUpdate(seq: 1, update: ["sessionUpdate": "tool_call", "toolCallId": "a", "title": "ask", "status": "failed", "rawInput": input]))
+        t.apply(SequencedUpdate(seq: 2, update: ["sessionUpdate": "tool_call", "toolCallId": "a", "title": "ask: 배포할까요?", "status": "pending", "rawInput": input, "_meta": meta]))
+        let call = try XCTUnwrap(askCall(t))
+        XCTAssertTrue(call.hostAsk)
+        XCTAssertEqual(call.status, "pending")
+    }
+}
+
 final class ModelTests: XCTestCase {
     func testPairingOfferParsing() throws {
         let offer: JSONValue = [

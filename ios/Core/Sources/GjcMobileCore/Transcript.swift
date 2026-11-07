@@ -34,8 +34,25 @@ public struct ToolCall: Equatable, Sendable {
     public var status: String
     public var rawInput: JSONValue?
     public var output: String
+    /// Sticky: set once any update for this call carried `_meta.gjcm.hostAsk` (question answered in the host terminal).
+    public var hostAsk = false
 
     public var isFinished: Bool { status == "completed" || status == "failed" }
+
+    /// Questions read from `rawInput.questions`; empty when absent (callers fall back to `output`).
+    public var terminalQuestions: [TerminalQuestion] {
+        (rawInput?["questions"]?.array ?? []).compactMap { q in
+            guard let text = q["question"]?.string else { return nil }
+            let options = (q["options"]?.array ?? []).compactMap { $0["label"]?.string ?? $0.string }
+            return TerminalQuestion(question: text, options: options, multi: q["multi"]?.bool ?? false)
+        }
+    }
+}
+
+public struct TerminalQuestion: Equatable, Sendable {
+    public let question: String
+    public let options: [String]
+    public let multi: Bool
 }
 
 public struct PlanEntry: Equatable, Sendable {
@@ -150,7 +167,13 @@ public struct SessionTranscript: Equatable, Sendable {
             if reason != "end_turn" { push(.turnEnded(stopReason: reason, error: u["error"]?.string)) }
             for index in toolIndex.values {
                 guard case var .tool(call) = items[index].kind, !call.isFinished else { continue }
-                call.status = reason == "end_turn" ? "completed" : "failed"
+                if call.hostAsk {
+                    // A terminal question still open when the turn ends got no answer; its output is only the waiting notice.
+                    call.status = "failed"
+                    call.output = ""
+                } else {
+                    call.status = reason == "end_turn" ? "completed" : "failed"
+                }
                 items[index].kind = .tool(call)
             }
         case "x_gjcm_permission_mode":
@@ -220,6 +243,7 @@ public struct SessionTranscript: Equatable, Sendable {
         if let kind = u["kind"]?.string { call.kind = kind }
         if let status = u["status"]?.string { call.status = status }
         if let input = u["rawInput"] { call.rawInput = input }
+        if u["_meta"]?["gjcm"]?["hostAsk"]?.bool == true { call.hostAsk = true }
         if let content = u["content"]?.array {
             let texts = content.compactMap { $0["content"]?["text"]?.string ?? $0["text"]?.string }
             if !texts.isEmpty { call.output = texts.joined(separator: "\n") }

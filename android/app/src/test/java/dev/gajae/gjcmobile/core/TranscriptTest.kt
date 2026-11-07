@@ -66,4 +66,69 @@ class TranscriptTest {
         assertEquals("B", option.currentChoiceName)
         assertTrue(ConfigTarget.MODEL.matches(option))
     }
+
+    private val askInput = """"rawInput":{"questions":[{"id":"q","question":"배포할까요?","options":[{"label":"예"},{"label":"아니오"}],"multi":true}]}"""
+    private val hostMeta = """"_meta":{"gjcm":{"hostAsk":true}}"""
+
+    @Test
+    fun hostAskToolCallParsesQuestionsAndOptions() {
+        val t = SessionTranscript()
+        t.apply(u(1, """{"sessionUpdate":"tool_call","toolCallId":"a","title":"ask: 배포할까요?","status":"pending",$askInput,$hostMeta}"""))
+        val call = (t.items.single().kind as TranscriptItem.Kind.Tool).call
+        assertTrue(call.hostAsk)
+        assertEquals(listOf(TerminalQuestion("배포할까요?", listOf("예", "아니오"), true)), call.terminalQuestions)
+    }
+
+    @Test
+    fun hostAskAfterOriginalToolCallUpgradesSameRow() {
+        val t = SessionTranscript()
+        t.apply(u(1, """{"sessionUpdate":"tool_call","toolCallId":"a","title":"ask","status":"pending",$askInput}"""))
+        assertFalse((t.items.single().kind as TranscriptItem.Kind.Tool).call.hostAsk)
+        t.apply(u(2, """{"sessionUpdate":"tool_call","toolCallId":"a","title":"ask: 배포할까요?","status":"pending",$askInput,$hostMeta}"""))
+        assertEquals(1, t.items.size)
+        assertTrue((t.items.single().kind as TranscriptItem.Kind.Tool).call.hostAsk)
+    }
+
+    @Test
+    fun hostAskCompletedKeepsMarkerAndShowsAnswer() {
+        val t = SessionTranscript()
+        t.apply(u(1, """{"sessionUpdate":"tool_call","toolCallId":"a","title":"ask","status":"pending",$askInput,$hostMeta}"""))
+        t.apply(u(2, """{"sessionUpdate":"tool_call_update","toolCallId":"a","status":"completed","content":[{"type":"content","content":{"type":"text","text":"예"}}]}"""))
+        val call = (t.items.single().kind as TranscriptItem.Kind.Tool).call
+        assertTrue(call.hostAsk)
+        assertEquals("completed", call.status)
+        assertEquals("예", call.output)
+        assertEquals(1, call.terminalQuestions.size)
+    }
+
+    @Test
+    fun askWithoutHostMarkerStaysOrdinaryTool() {
+        val t = SessionTranscript()
+        t.apply(u(1, """{"sessionUpdate":"tool_call","toolCallId":"a","title":"ask","status":"pending",$askInput}"""))
+        t.apply(u(2, """{"sessionUpdate":"tool_call_update","toolCallId":"a","status":"completed"}"""))
+        val call = (t.items.single().kind as TranscriptItem.Kind.Tool).call
+        assertFalse(call.hostAsk)
+        assertEquals("completed", call.status)
+    }
+
+    @Test
+    fun turnEndFailsOpenTerminalQuestionWithoutWaitingNotice() {
+        val t = SessionTranscript()
+        t.apply(u(1, """{"sessionUpdate":"tool_call","toolCallId":"a","title":"ask","status":"pending",$askInput,$hostMeta,"content":[{"type":"content","content":{"type":"text","text":"배포할까요?\n터미널에서 답을 기다리는 질문입니다."}}]}"""))
+        t.apply(u(2, """{"sessionUpdate":"x_gjcm_turn_end","stopReason":"end_turn"}"""))
+        val call = t.items.mapNotNull { (it.kind as? TranscriptItem.Kind.Tool)?.call }.single()
+        assertEquals("failed", call.status)
+        assertEquals("", call.output)
+    }
+
+    @Test
+    fun replayedFailedAskReturnsToPendingTerminalQuestion() {
+        // A reload replays a waiting ask as failed (no result yet); the bridge then shows it again as pending.
+        val t = SessionTranscript()
+        t.apply(u(1, """{"sessionUpdate":"tool_call","toolCallId":"a","title":"ask","status":"failed",$askInput}"""))
+        t.apply(u(2, """{"sessionUpdate":"tool_call","toolCallId":"a","title":"ask: 배포할까요?","status":"pending",$askInput,$hostMeta}"""))
+        val call = (t.items.single().kind as TranscriptItem.Kind.Tool).call
+        assertTrue(call.hostAsk)
+        assertEquals("pending", call.status)
+    }
 }

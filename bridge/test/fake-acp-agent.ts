@@ -32,7 +32,7 @@ const pending = new Map<number, (result: any) => void>();
 const cancellable = new Map<string, () => void>();
 // gjc's pending steers per session (queue.messages.list). Unlike real gjc (which drops them), a cancel keeps
 // them here, so the bridge's clean-up path is exercised.
-const steers = new Map<string, { id: string; text: string; mode: "steer"; label: "Steer" }[]>();
+const steers = new Map<string, { id: string; text: string; mode: "steer" | "followUp"; label: string }[]>();
 let nextSteer = 1;
 // Sessions with a turn typed in the TUI ("terminal turn" … "terminal done"), which no ACP prompt owns.
 const terminalTurns = new Set<string>();
@@ -42,7 +42,7 @@ const terminalTurns = new Set<string>();
 // `running: false` until the prompt settles.
 // session/cancel does not stop the terminal turn; it purges the queued prompt, which then fails as
 // "Prompt submission failed." ("Queued prompt was removed before consumption" in gjc's log).
-const queuedPrompts = new Map<string, { steerId: string; blocks: any[]; settle: (outcome: "consumed" | "removed") => void }>();
+const queuedPrompts = new Map<string, { steerId: string; blocks: any[]; taken?: boolean; settle: (outcome: "consumed" | "removed") => void }>();
 // gjc's SDK permission policy; every ACP attachment (session/new, session/load) resets it to prompt.
 const permissionModes = new Map<string, string>();
 
@@ -122,11 +122,42 @@ async function handle(msg: any) {
 			const sid = params.sessionId;
 			const texts = params.prompt.filter((b: any) => b.type === "text").map((b: any) => b.text);
 			if (terminalTurns.has(sid)) {
-				const steerId = `steer:${nextSteer++}`;
+				// Like gjc 0.19.3: the echo (text with content and images only) comes first, the queue entry after it (~0.1s
+				// measured; 0.4s here so a queue read can land in between).
+				// It is listed under acpPromptPayload's text ("[Image]" for photos only), and as a follow-up when one
+				// already waits ahead of it.
+				const ahead = (steers.get(sid) ?? []).some(s => s.mode === "followUp");
+				const steerId = `${ahead ? "followUp" : "steer"}:${nextSteer++}`;
+				for (const block of params.prompt)
+					if (block.type === "image" || (block.type === "text" && block.text.length > 0))
+						update(sid, { sessionUpdate: "user_message_chunk", content: block });
+				const listed = params.prompt
+					.flatMap((b: any) =>
+						b.type === "text"
+							? [b.text]
+							: b.type === "resource_link"
+								? [
+										[
+											`[Resource: ${b.name}]`,
+											`URI: ${b.uri}`,
+											...(b.title ? [`Title: ${b.title}`] : []),
+											...(b.description ? [b.description] : []),
+											...(b.mimeType ? [`MIME: ${b.mimeType}`] : []),
+											...(typeof b.size === "number" ? [`Size: ${b.size}`] : []),
+										].join("\n"),
+									]
+								: [],
+					)
+					.join("\n");
+				const hasImage = params.prompt.some((b: any) => b.type === "image");
 				// "즉시" stands for a prompt the TUI turn took at once (it was at a step boundary): never listed as queued.
 				if (!texts.join(" ").startsWith("즉시"))
-					steers.set(sid, [...(steers.get(sid) ?? []), { id: steerId, text: texts.join("\n"), mode: "steer", label: "Steer" }]);
-				for (const block of params.prompt) update(sid, { sessionUpdate: "user_message_chunk", content: block });
+					setTimeout(() => {
+						const waiting = queuedPrompts.get(sid);
+						if (waiting?.steerId !== steerId || waiting.taken) return; // purged or taken meanwhile
+						const entry = { id: steerId, text: listed || (hasImage ? "[Image]" : ""), mode: ahead ? "followUp" : "steer", label: ahead ? "Follow-up" : "Steer" } as const;
+						steers.set(sid, [...(steers.get(sid) ?? []), entry]);
+					}, 400);
 				const outcome = await new Promise<"consumed" | "removed">(settle => queuedPrompts.set(sid, { steerId, blocks: params.prompt, settle }));
 				if (outcome === "removed") return write({ jsonrpc: "2.0", id, error: { code: -32603, message: "Prompt submission failed." } });
 				update(sid, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: `받은 블록: ${params.prompt.map((b: any) => b.type).join(",")}` } });
@@ -250,7 +281,10 @@ async function handle(msg: any) {
 				// leaves the queue; the prompt still settles only with the turn.
 				if (text === "terminal step") {
 					const waiting = queuedPrompts.get(params.sessionId);
-					if (waiting) steers.set(params.sessionId, (steers.get(params.sessionId) ?? []).filter(s => s.id !== waiting.steerId));
+					if (waiting) {
+						waiting.taken = true;
+						steers.set(params.sessionId, (steers.get(params.sessionId) ?? []).filter(s => s.id !== waiting.steerId));
+					}
 					update(params.sessionId, { sessionUpdate: "tool_call_update", toolCallId: "terminal-tool", status: "completed" });
 					return reply({ accepted: true });
 				}
@@ -271,6 +305,11 @@ async function handle(msg: any) {
 				}
 				// "taken" stands for a steer the model consumed at its next step: it never stays queued.
 				if (text !== "taken") steers.set(params.sessionId, [...(steers.get(params.sessionId) ?? []), { id: `steer:${nextSteer++}`, text, mode: "steer", label: "Steer" }]);
+				return reply({ accepted: true });
+			}
+			if (params.operation === "turn.follow_up") {
+				const text = String(params.input?.text ?? "");
+				steers.set(params.sessionId, [...(steers.get(params.sessionId) ?? []), { id: `followUp:${nextSteer++}`, text, mode: "followUp", label: "Follow-up" }]);
 				return reply({ accepted: true });
 			}
 			if (params.operation === "queue.message.remove") {

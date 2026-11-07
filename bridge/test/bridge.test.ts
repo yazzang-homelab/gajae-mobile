@@ -639,38 +639,67 @@ describe("sessions over the bridge", () => {
 			return { client, sid, users };
 		};
 
-		test("shows its message only once gjc hands it to the model, not while it waits in the queue", async () => {
-			// Measured 2026-11-07 on pve3 (gjc 0.19.3): gjc echoed the photo+text at once, kept it queued as a steer for
-			// 25s until the TUI turn's tool ended, and announced no hand-over; the phone drew it mid-turn while also
-			// listing it as waiting.
-			const { client, sid, users } = await startTerminalTurn();
-			await client.request("session.prompt", { sessionId: sid, prompt: [{ type: "text", text: "이 사진 봐" }, photo] });
-			const waiting = await client.waitFor(
-				e => e.ev === "session.status" && e.p.sessionId === sid && e.p.queued.some((m: any) => m.text === "이 사진 봐"),
-				3000,
-			);
-			expect(waiting.p.running).toBe(true);
-			await Bun.sleep(1200); // another queue read: still waiting
-			expect(users()).toEqual([]);
-			const snap = await client.request("session.open", { sessionId: sid, afterSeq: 0 });
-			expect(snap.updates.filter((u: any) => u.update.sessionUpdate === "user_message_chunk")).toEqual([]);
+		// Measured 2026-11-07 on pve3 (gjc 0.19.3): gjc echoed the photo+text at once, kept it queued as a steer for
+		// 25s until the TUI turn's tool ended, and announced no hand-over; the phone drew it mid-turn while also
+		// listing it as waiting.
+		const file = { type: "resource_link", uri: "file:///tmp/gjcm/a.txt", name: "a.txt", mimeType: "text/plain", size: 3 };
+		// steerAhead: a steer typed in the TUI just before, so two new queue entries leave only the listed text to tell
+		// them apart.
+		const cases: { name: string; prompt: unknown[]; listed: string; echoed: string[]; followUpAhead?: boolean; steerAhead?: boolean }[] = [
+			{ name: "text and photo", prompt: [{ type: "text", text: "이 사진 봐" }, photo], listed: "이 사진 봐", echoed: ["text", "image"] },
+			// gjc lists a message without text as "[Image]".
+			{ name: "photo only", prompt: [photo], listed: "[Image]", echoed: ["image"], steerAhead: true },
+			// gjc renders file links into the listed text and does not echo them.
+			{ name: "file and photo", prompt: [{ type: "text", text: "파일" }, file, photo], listed: "파일\n[Resource: a.txt]", echoed: ["text", "image"], steerAhead: true },
+			// gjc queues it as a follow-up when one already waits ahead of it.
+			{ name: "behind a follow-up", prompt: [{ type: "text", text: "뒤에 줄 선 사진" }, photo], listed: "뒤에 줄 선 사진", echoed: ["text", "image"], followUpAhead: true },
+		];
+		for (const c of cases)
+			test(`shows its message only once gjc hands it to the model, not while it waits in the queue: ${c.name}`, async () => {
+				const { client, sid, users } = await startTerminalTurn();
+				if (c.followUpAhead) await client.request("sdk.control", { sessionId: sid, op: "turn.follow_up", input: { text: "먼저 온 후속" } });
+				if (c.steerAhead) await client.request("sdk.control", { sessionId: sid, op: "turn.steer", input: { text: "터미널 지시" } });
+				await client.request("session.prompt", { sessionId: sid, prompt: c.prompt });
+				const waiting = await client.waitFor(
+					e => e.ev === "session.status" && e.p.sessionId === sid && e.p.queued.some((m: any) => m.text.startsWith(c.listed)),
+					3000,
+				);
+				expect(waiting.p.running).toBe(true);
+				await Bun.sleep(2000); // past the grace for a message never listed, and more queue reads: still waiting
+				expect(users()).toEqual([]);
+				const snap = await client.request("session.open", { sessionId: sid, afterSeq: 0 });
+				expect(snap.updates.filter((u: any) => u.update.sessionUpdate === "user_message_chunk")).toEqual([]);
 
-			// Right after a once-a-second read, so the next one is ~1s away: the tool end that hands the prompt over
-			// triggers a read of its own.
+				// Right after a once-a-second read, so the next one is ~1s away: the tool end that hands the prompt over
+				// triggers a read of its own.
+				const ticks = client.events.length;
+				await client.waitFor(e => e.ev === "session.status" && e.p.sessionId === sid && client.events.indexOf(e) >= ticks, 3000);
+				await client.request("sdk.control", { sessionId: sid, op: "turn.steer", input: { text: "terminal step" } });
+				const shown = await client.waitFor(
+					e => e.ev === "session.update" && e.p.sessionId === sid && e.p.update.sessionUpdate === "user_message_chunk",
+					600,
+				);
+				const stepEnd = client.events.findIndex(e => e.ev === "session.update" && e.p.update.toolCallId === "terminal-tool");
+				expect(client.events.indexOf(shown)).toBeGreaterThan(stepEnd);
+				await client.request("sdk.control", { sessionId: sid, op: "turn.steer", input: { text: "terminal done" } });
+				expect((await client.waitFor(turnEnd(sid))).p.update.stopReason).toBe("end_turn");
+				expect(users()).toEqual(c.echoed);
+				const replay = await client.request("session.open", { sessionId: sid, afterSeq: 0 });
+				expect(replay.updates.filter((u: any) => u.update.sessionUpdate === "user_message_chunk")).toHaveLength(c.echoed.length);
+			});
+
+		test("is not shown when a queue read lands between gjc's echo and its queueing", async () => {
+			// The fake, like gjc, queues the prompt only after echoing it (here 400ms later, see fake-acp-agent.ts).
+			const { client, sid, users } = await startTerminalTurn();
 			const ticks = client.events.length;
 			await client.waitFor(e => e.ev === "session.status" && e.p.sessionId === sid && client.events.indexOf(e) >= ticks, 3000);
-			await client.request("sdk.control", { sessionId: sid, op: "turn.steer", input: { text: "terminal step" } });
-			const shown = await client.waitFor(
-				e => e.ev === "session.update" && e.p.sessionId === sid && e.p.update.sessionUpdate === "user_message_chunk",
-				600,
-			);
-			const stepEnd = client.events.findIndex(e => e.ev === "session.update" && e.p.update.toolCallId === "terminal-tool");
-			expect(client.events.indexOf(shown)).toBeGreaterThan(stepEnd);
+			await Bun.sleep(800); // the next once-a-second read lands inside the 400ms gap
+			await client.request("session.prompt", { sessionId: sid, prompt: [photo] });
+			await Bun.sleep(1200);
+			expect(users()).toEqual([]);
 			await client.request("sdk.control", { sessionId: sid, op: "turn.steer", input: { text: "terminal done" } });
-			expect((await client.waitFor(turnEnd(sid))).p.update.stopReason).toBe("end_turn");
-			expect(users()).toEqual(["text", "image"]);
-			const replay = await client.request("session.open", { sessionId: sid, afterSeq: 0 });
-			expect(replay.updates.filter((u: any) => u.update.sessionUpdate === "user_message_chunk")).toHaveLength(2);
+			await client.waitFor(turnEnd(sid));
+			expect(users()).toEqual(["image"]);
 		});
 
 		test("shows its message when gjc took it before any queue read listed it", async () => {

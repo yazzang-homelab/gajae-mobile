@@ -110,6 +110,8 @@ const queuedPrompts = new Map<
 	string,
 	{ steerId: string; blocks: any[]; taken?: boolean; orphan?: boolean; settle: (outcome: "consumed" | "removed" | "closed") => void }
 >();
+// Sessions whose next session/load fails once ("fail next load").
+const failNextLoad = new Set<string>();
 // gjc's SDK permission policy; every ACP attachment (session/new, session/load) resets it to prompt.
 const permissionModes = new Map<string, string>();
 
@@ -200,6 +202,8 @@ async function handle(msg: any) {
 			return;
 		}
 		case "session/load": {
+			if (failNextLoad.delete(params.sessionId))
+				return write({ jsonrpc: "2.0", id, error: { code: -32603, message: "Internal error: load failed" } });
 			if (params.sessionId === "broker-lost")
 				return write({ jsonrpc: "2.0", id, error: { code: -32603, message: "Internal error: SDK request outcome is uncertain after the frame was sent." } });
 			const history = sessions.get(params.sessionId);
@@ -394,8 +398,14 @@ async function handle(msg: any) {
 				const operations = ["turn.steer", ...(btw.startsWith("turn") ? ["turn.btw", "btw.ask"] : btw.startsWith("ask") ? ["btw.ask"] : [])];
 				// FAKE_SURFACE=sdk stands for a session gjc ACP hosts itself; by default a terminal hosts it, as the
 				// "terminal ..." steers below play.
-				const primaryControlSurface = process.env.FAKE_SURFACE ?? "cli";
-				const item = { operations, hostTools: false, primaryControlSurface, ...(btw.endsWith("-exchanges") ? { btwAskExchangesVersion: 1 } : {}) };
+				// FAKE_SURFACE=none stands for a host that does not say (no such field).
+				const surface = process.env.FAKE_SURFACE ?? "cli";
+				const item = {
+					operations,
+					hostTools: false,
+					...(surface === "none" ? {} : { primaryControlSurface: surface }),
+					...(btw.endsWith("-exchanges") ? { btwAskExchangesVersion: 1 } : {}),
+				};
 				return reply({ type: "query_response", id: "q", ok: true, page: { items: [item], complete: true } });
 			}
 			if (params.query === "ask.requests.list") {
@@ -514,6 +524,10 @@ async function handle(msg: any) {
 						waiting.orphan = text.endsWith("orphaned");
 						steers.set(params.sessionId, (steers.get(params.sessionId) ?? []).filter(s => s.id !== waiting.steerId));
 					}
+					return reply({ accepted: true });
+				}
+				if (text === "fail next load") {
+					failNextLoad.add(params.sessionId);
 					return reply({ accepted: true });
 				}
 				// "host compacting" / "host compacted": gjc's auto-compaction, which `isStreaming` does not cover.

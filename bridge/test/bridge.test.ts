@@ -846,6 +846,29 @@ describe("sessions over the bridge", () => {
 			expect(await client.request("session.cancel", { sessionId: sid })).toEqual({ ok: true });
 		});
 
+		test("still keeps a waiting phone prompt when the host cannot say what it is, and stops anything else as before", async () => {
+			const { client, sid } = await terminalTurn({ FAKE_SURFACE: "none" });
+			expect(await client.request("session.cancel", { sessionId: sid })).toEqual({ ok: true });
+			await client.request("session.prompt", { sessionId: sid, prompt: [photo, { type: "text", text: "모르는 호스트" }] });
+			await client.waitFor(e => e.ev === "session.status" && e.p.sessionId === sid && e.p.queued.length > 0, 3000);
+			const refused = await client.request("session.cancel", { sessionId: sid }).catch((e: any) => e);
+			expect(refused.code).toBe(-32004);
+			expect((await client.request("sdk.query", { sessionId: sid, op: "queue.messages.list" })).items.map((m: any) => m.text)).toEqual(["모르는 호스트"]);
+		});
+
+		test("a released turn stays ended when loading the session again fails; the next open loads it", async () => {
+			const { client, sid } = await stuckPhoneTurn();
+			await client.request("sdk.control", { sessionId: sid, op: "turn.steer", input: { text: "fail next load" } });
+			expect(await client.request("session.cancel", { sessionId: sid })).toEqual({ ok: true });
+			const end = client.events.find(turnEnd(sid));
+			expect(end?.p.update.stopReason).toBe("cancelled");
+			const gone = await client.request("session.prompt", { sessionId: sid, prompt: [{ type: "text", text: "다시 됐나" }] }).catch((e: any) => e);
+			expect(gone.code).toBe(-32002);
+			expect((await client.request("session.open", { sessionId: sid, afterSeq: 0 })).running).toBe(false);
+			await client.request("session.prompt", { sessionId: sid, prompt: [{ type: "text", text: "다시 됐나" }] });
+			expect((await client.waitFor(e => turnEnd(sid)(e) && e !== end, 3000)).p.update.stopReason).toBe("end_turn");
+		});
+
 		test("does not release a turn by itself in a session gjc ACP hosts itself, where closing it would close the host", async () => {
 			const { client, sid } = await stuckPhoneTurn({ GJCM_TEST_STUCK_TURN_MS: "200", FAKE_SURFACE: "sdk" });
 			await Bun.sleep(3500);

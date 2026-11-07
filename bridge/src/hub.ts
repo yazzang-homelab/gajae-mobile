@@ -1322,8 +1322,9 @@ export class SessionHub {
 	 * purged it, photos included ("Prompt submission failed."); a held photo message went back to the composer while
 	 * the turn went on. Such a phone turn whose host has nothing left to do is one gjc ACP no longer ends: it is
 	 * released (`#releaseTurn`). All this is for a session a terminal hosts (`primaryControlSurface` `cli`); in one gjc
-	 * ACP hosts itself (`sdk`, measured: a session the bridge created) and when the host cannot say, the stop is the
-	 * plain `session/cancel` as before.
+	 * ACP hosts itself (`sdk`, measured: a session the bridge created) the stop is the plain `session/cancel` as before.
+	 * When the host cannot say, a phone prompt that went in behind another turn is still refused (`session/cancel`
+	 * could purge it), and anything else gets the plain stop.
 	 */
 	async cancel(params: { sessionId: string }): Promise<{ ok: true }> {
 		const state = this.#sessions.get(params.sessionId);
@@ -1341,7 +1342,7 @@ export class SessionHub {
 					return { ok: true };
 				}
 				if (state.running || !host.idle) throw hostTurnStop(state.running);
-			}
+			} else if (!host && state.running) throw hostTurnStop(true);
 		}
 		return this.#cancelTurn(params.sessionId);
 	}
@@ -1404,7 +1405,11 @@ export class SessionHub {
 				state.echoHold = undefined;
 				this.#endTurn(state, { sessionUpdate: TURN_END, stopReason: "cancelled" });
 			}
-			await this.#load(state, true);
+			// The turn is over either way; a failed load leaves the session closed, and the phone's next call (-32002)
+			// opens it again.
+			await this.#load(state, true).catch(error =>
+				this.#options.log?.(`loading ${state.sessionId} again after releasing its turn failed: ${error instanceof Error ? error.message : String(error)}`),
+			);
 		})().finally(() => {
 			state.releasing = undefined;
 		});

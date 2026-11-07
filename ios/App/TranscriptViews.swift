@@ -184,7 +184,7 @@ struct TerminalAskView: View {
                 Label(call.output.isEmpty ? "답을 받지 못했습니다." : call.output, systemImage: "xmark.octagon.fill")
                     .font(.caption).foregroundStyle(Palette.gajaeRed)
             default:
-                Text("터미널에서 답하세요").font(.caption.bold()).foregroundStyle(Palette.strawGold)
+                Text("터미널에서 답하세요. 승인 카드가 뜨면 폰에서도 고를 수 있습니다.").font(.caption.bold()).foregroundStyle(Palette.strawGold)
             }
         }
         .padding(10)

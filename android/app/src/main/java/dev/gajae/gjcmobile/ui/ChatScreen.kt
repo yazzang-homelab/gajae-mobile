@@ -474,7 +474,7 @@ private fun TerminalAskView(call: ToolCall) {
         when (call.status) {
             "completed" -> Text("✓ " + call.output.ifEmpty { "터미널에서 답했습니다." }, style = MaterialTheme.typography.labelMedium, color = Palette.visorGreen)
             "failed" -> Text("⚠ " + call.output.ifEmpty { "답을 받지 못했습니다." }, style = MaterialTheme.typography.labelMedium, color = Palette.gajaeRed)
-            else -> Text("터미널에서 답하세요", style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.Bold, color = Palette.strawGold)
+            else -> Text("터미널에서 답하세요. 승인 카드가 뜨면 폰에서도 고를 수 있습니다.", style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.Bold, color = Palette.strawGold)
         }
     }
 }

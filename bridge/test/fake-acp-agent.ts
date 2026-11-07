@@ -6,17 +6,17 @@ import fs from "node:fs";
 import path from "node:path";
 
 // Launched by the bridge's tmux path as the TUI (`<agent> --resume <id>`): like gjc, publish the session's SDK
-// endpoint under <cwd>/.gjc/state/sdk with this process's pid and stay up. `--tui=exit` quits at once,
-// `--tui=silent` never publishes.
+// endpoint under <cwd>/.gjc/state/sdk with this process's pid (and the agent dir it got) and stay up. It refuses
+// a session ACP still holds (no session/close yet). `--tui=exit` quits at once, `--tui=silent` never publishes.
 const resumeAt = process.argv.indexOf("--resume");
 if (resumeAt >= 0) {
 	const mode = process.argv.find(arg => arg.startsWith("--tui="))?.slice("--tui=".length);
-	if (mode === "exit") process.exit(1);
+	const dir = path.join(process.cwd(), ".gjc", "state", "sdk");
+	const sessionId = process.argv[resumeAt + 1];
+	if (mode === "exit" || !fs.existsSync(path.join(dir, `${sessionId}.closed`))) process.exit(1);
 	if (mode !== "silent") {
-		const dir = path.join(process.cwd(), ".gjc", "state", "sdk");
-		fs.mkdirSync(dir, { recursive: true });
-		const sessionId = process.argv[resumeAt + 1];
-		fs.writeFileSync(path.join(dir, `${sessionId}.json`), JSON.stringify({ version: 1, sessionId, pid: process.pid }));
+		const agentDir = process.env.GJC_CODING_AGENT_DIR;
+		fs.writeFileSync(path.join(dir, `${sessionId}.json`), JSON.stringify({ version: 1, sessionId, pid: process.pid, agentDir }));
 	}
 	setInterval(() => {}, 60_000);
 	await new Promise(() => {});
@@ -141,6 +141,8 @@ async function handle(msg: any) {
 		}
 		case "session/close": {
 			attached.delete(params.sessionId);
+			const cwd = sessionCwds.get(params.sessionId);
+			if (cwd && process.env.GJCM_TEST_TMUX) fs.writeFileSync(path.join(cwd, ".gjc", "state", "sdk", `${params.sessionId}.closed`), "");
 			return reply({});
 		}
 		case "session/delete": {

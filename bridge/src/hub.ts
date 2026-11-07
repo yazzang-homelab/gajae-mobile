@@ -24,7 +24,7 @@ import {
 } from "./host-asks";
 import { SavedSessionIndex } from "./saved-sessions";
 import { Throughput } from "./throughput";
-import { TmuxLauncher, type TmuxOptions, tuiCommand } from "./tmux";
+import { TmuxError, TmuxLauncher, type TmuxOptions, tuiCommand } from "./tmux";
 
 export const TURN_END = "x_gjcm_turn_end";
 
@@ -260,7 +260,8 @@ export class SessionHub {
 	constructor(options: HubOptions) {
 		this.#options = { maxBufferedUpdates: 5000, maxBufferedBytes: 48 * 1024 * 1024, ...options };
 		this.#saved = new SavedSessionIndex(options.agentDir);
-		if (options.tmux) this.#tmux = new TmuxLauncher(options.tmux, tuiCommand(options.acp.command));
+		// The window gets the tmux server's environment; point gjc there at the agent dir the ACP side uses.
+		if (options.tmux) this.#tmux = new TmuxLauncher(options.tmux, tuiCommand(options.acp.command), { GJC_CODING_AGENT_DIR: options.agentDir });
 	}
 
 	// ── clients ──────────────────────────────────────────────────────────────
@@ -816,12 +817,15 @@ export class SessionHub {
 		const result = await acp.request("session/new", { cwd, mcpServers: [] });
 		if (this.#tmux && !tmuxSkipped) {
 			// ACP lets go of the session it just wrote, and gjc in the window resumes it; the phone then attaches
-			// to that TUI host like to any terminal session.
-			await acp.request("session/close", { sessionId: result.sessionId });
+			// to that TUI host like to any terminal session. A failure leaves the (empty) session saved.
 			try {
+				await acp.request("session/close", { sessionId: result.sessionId });
 				await this.#tmux.open(result.sessionId, cwd);
 			} catch (error) {
-				throw new AcpError(-32021, error instanceof Error ? error.message : String(error));
+				const message = error instanceof Error ? error.message : String(error);
+				throw new AcpError(-32021, `새 세션을 tmux 창으로 열지 못했습니다(${result.sessionId}): ${message}`, {
+					code: error instanceof TmuxError ? error.code : "tmux_handoff_failed",
+				});
 			}
 			this.#stateFor(result.sessionId, cwd).inTmux = true;
 			return this.openSession(clientId, { sessionId: result.sessionId, cwd });

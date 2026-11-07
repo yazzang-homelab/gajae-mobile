@@ -106,7 +106,8 @@ export function hostAskToolCall(ask: TranscriptAsk): Record<string, unknown> {
  * where to answer. Other updates pass through unchanged.
  */
 export function terminalAsk(update: Record<string, unknown>): Record<string, unknown> {
-	if (update.sessionUpdate !== "tool_call") return update;
+	// A finished ask replayed by session/load has its answer in the update that follows; leave it be.
+	if (update.sessionUpdate !== "tool_call" || update.status !== "pending") return update;
 	const questions = askQuestions(update.rawInput);
 	if (questions.length === 0) return update;
 	const meta = (update._meta as Record<string, unknown> | undefined) ?? {};

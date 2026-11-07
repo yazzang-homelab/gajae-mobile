@@ -5,7 +5,8 @@
  * bridge creates the session over ACP (which writes it at once), lets go of it, and hands it to the TUI.
  *
  * The bridge never starts a tmux server: a server started from the bridge's systemd unit would live in the
- * bridge's cgroup and die with every bridge restart, taking the phone's sessions with it.
+ * bridge's cgroup and die with every bridge restart, taking the phone's sessions with it. Every tmux call carries
+ * `-N` (tmux 3.2+), so a server that goes away between the check and the window is not started again.
  */
 import fs from "node:fs";
 import path from "node:path";
@@ -19,8 +20,22 @@ export interface TmuxOptions {
 	readyTimeoutMs?: number;
 }
 
+/** Why a window did not become the session's host; the bridge passes it to the phone as -32021 `data.code`. */
+export type TmuxFailure = "tmux_failed" | "tmux_window_exited" | "tmux_ready_timeout";
+
+export class TmuxError extends Error {
+	constructor(
+		readonly code: TmuxFailure,
+		message: string,
+	) {
+		super(message);
+	}
+}
+
 const DEFAULT_READY_TIMEOUT_MS = 30_000;
 const POLL_MS = 200;
+/** tmux turns `.` and `:` in session names into `_`, so such a name would never be found again. */
+const SESSION_NAME = /^[A-Za-z0-9_-]+$/;
 
 interface Run {
 	code: number;
@@ -43,15 +58,25 @@ export function tuiCommand(acpCommand: string[]): string[] {
 	return argv;
 }
 
+function parentPid(pid: number): number | undefined {
+	try {
+		// /proc/<pid>/stat: "pid (comm) state ppid …"; comm may hold spaces and parentheses.
+		const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+		return Number(stat.slice(stat.lastIndexOf(")") + 2).split(" ")[1]);
+	} catch {
+		// No procfs (macOS): ask ps.
+		const ps = Bun.spawnSync(["ps", "-o", "ppid=", "-p", String(pid)]);
+		const parent = Number(ps.stdout.toString().trim());
+		return Number.isInteger(parent) && parent > 0 ? parent : undefined;
+	}
+}
+
 /** Whether `pid` is `ancestor` or runs below it (the launcher may be a wrapper that starts gjc as a child). */
 function descendsFrom(pid: number, ancestor: number): boolean {
-	let current = pid;
-	for (let depth = 0; depth < 16 && current > 1; depth++) {
+	let current: number | undefined = pid;
+	for (let depth = 0; depth < 16 && current !== undefined && current > 1; depth++) {
 		if (current === ancestor) return true;
-		const ps = Bun.spawnSync(["ps", "-o", "ppid=", "-p", String(current)]);
-		const parent = Number(ps.stdout.toString().trim());
-		if (!Number.isInteger(parent) || parent <= 0) return false;
-		current = parent;
+		current = parentPid(current);
 	}
 	return false;
 }
@@ -68,19 +93,19 @@ function alive(pid: number): boolean {
 export class TmuxLauncher {
 	readonly #options: TmuxOptions;
 	readonly #tui: string[];
-	#queue: Promise<unknown> = Promise.resolve();
+	readonly #env: Record<string, string>;
+	#creating: Promise<unknown> = Promise.resolve();
 
-	constructor(options: TmuxOptions, tui: string[]) {
+	/** `env` goes into the window: tmux gives it the server's environment, not the bridge's. */
+	constructor(options: TmuxOptions, tui: string[], env: Record<string, string> = {}) {
+		if (!SESSION_NAME.test(options.session)) throw new Error(`tmux session name must match ${SESSION_NAME}: ${options.session}`);
 		this.#options = options;
 		this.#tui = tui;
-	}
-
-	get session(): string {
-		return this.#options.session;
+		this.#env = env;
 	}
 
 	async #run(args: string[]): Promise<Run> {
-		const argv = ["tmux", ...(this.#options.socket ? ["-L", this.#options.socket] : []), ...args];
+		const argv = ["tmux", "-N", ...(this.#options.socket ? ["-L", this.#options.socket] : []), ...args];
 		try {
 			const proc = Bun.spawn(argv, { stdin: "ignore", stdout: "pipe", stderr: "pipe" });
 			const [stdout, stderr, code] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]);
@@ -99,44 +124,57 @@ export class TmuxLauncher {
 
 	/**
 	 * Starts `gjc --resume <sessionId>` in a new window of the dedicated session and waits until that process
-	 * publishes the session's SDK endpoint. Removes the window and throws when it does not.
+	 * publishes the session's SDK endpoint. Removes the window and throws a TmuxError when it does not.
 	 */
-	open(sessionId: string, cwd: string): Promise<void> {
-		// One window at a time, so two phones starting sessions together do not both create the tmux session.
-		const opened = this.#queue.then(() => this.#open(sessionId, cwd));
-		this.#queue = opened.catch(() => {});
-		return opened;
+	async open(sessionId: string, cwd: string): Promise<void> {
+		// Window creation runs one at a time, so two phones starting sessions together do not both create the
+		// tmux session; waiting for gjc does not hold the next phone up.
+		const created = this.#creating.then(() => this.#create(sessionId, cwd));
+		this.#creating = created.catch(() => {});
+		const { panePid, pane } = await created;
+		try {
+			await this.#waitReady(sessionId, cwd, panePid);
+		} catch (error) {
+			await this.#run(["kill-pane", "-t", pane]);
+			throw error;
+		}
 	}
 
-	async #open(sessionId: string, cwd: string): Promise<void> {
+	async #create(sessionId: string, cwd: string): Promise<{ panePid: number; pane: string }> {
 		const { session } = this.#options;
+		const env = Object.entries(this.#env).flatMap(([key, value]) => ["-e", `${key}=${value}`]);
+		// tmux expands formats in -c; a literal `#` in the path is written `##`.
+		const start = ["-c", cwd.replaceAll("#", "##"), ...env, "-P", "-F", "#{pane_pid} #{pane_id}"];
 		const command = [...this.#tui, "--resume", sessionId];
-		const format = ["-P", "-F", "#{pane_pid} #{pane_id}"];
 		const exists = (await this.#run(["has-session", "-t", `=${session}`])).code === 0;
 		const created = exists
-			? await this.#run(["new-window", "-d", "-t", `=${session}:`, "-c", cwd, ...format, ...command])
-			: await this.#run(["new-session", "-d", "-s", session, "-c", cwd, ...format, ...command]);
-		if (created.code !== 0) throw new Error(`tmux ${exists ? "new-window" : "new-session"} failed: ${created.stderr || created.code}`);
+			? await this.#run(["new-window", "-d", "-t", `=${session}:`, ...start, ...command])
+			: await this.#run(["new-session", "-d", "-s", session, ...start, ...command]);
+		const verb = exists ? "new-window" : "new-session";
+		if (created.code !== 0) throw new TmuxError("tmux_failed", `tmux ${verb} 실패: ${created.stderr || `exit ${created.code}`}`);
 		const [pidText, pane] = created.stdout.split(" ");
 		const panePid = Number(pidText);
-		if (!Number.isInteger(panePid) || !pane) throw new Error(`tmux returned no pane: ${created.stdout}`);
+		if (!Number.isInteger(panePid) || !pane) throw new TmuxError("tmux_failed", `tmux ${verb}가 창 정보를 주지 않았습니다: ${created.stdout}`);
+		return { panePid, pane };
+	}
 
+	async #waitReady(sessionId: string, cwd: string, panePid: number): Promise<void> {
+		const { session } = this.#options;
 		const endpoint = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
 		const timeoutMs = this.#options.readyTimeoutMs ?? DEFAULT_READY_TIMEOUT_MS;
 		const deadline = Date.now() + timeoutMs;
-		let reason = `gjc가 ${Math.round(timeoutMs / 1000)}초 안에 준비되지 않았습니다`;
+		// The endpoint the ACP host left behind names a process outside the window; check each pid once.
+		const foreign = new Set<number>();
 		while (Date.now() < deadline) {
-			if (!alive(panePid)) {
-				reason = "gjc가 창에서 바로 끝났습니다";
-				break;
-			}
+			if (!alive(panePid)) throw new TmuxError("tmux_window_exited", `tmux 세션 ${session}의 새 창에서 gjc가 바로 끝났습니다`);
 			const pid = this.#endpointPid(endpoint);
-			// A stale endpoint of the ACP host that created the session names another process.
-			if (pid !== undefined && descendsFrom(pid, panePid)) return;
+			if (pid !== undefined && !foreign.has(pid)) {
+				if (descendsFrom(pid, panePid)) return;
+				foreign.add(pid);
+			}
 			await Bun.sleep(POLL_MS);
 		}
-		await this.#run(["kill-pane", "-t", pane]);
-		throw new Error(`tmux 창(${session})에서 ${reason}`);
+		throw new TmuxError("tmux_ready_timeout", `tmux 세션 ${session}의 새 창에서 gjc가 ${Math.round(timeoutMs / 1000)}초 안에 준비되지 않았습니다`);
 	}
 
 	#endpointPid(file: string): number | undefined {

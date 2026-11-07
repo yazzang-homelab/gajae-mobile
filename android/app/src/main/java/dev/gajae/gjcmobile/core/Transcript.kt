@@ -30,9 +30,21 @@ data class ToolCall(
     val status: String,
     val rawInput: JsonElement?,
     val output: String,
+    /** Sticky: set once any update for this call carried `_meta.gjcm.hostAsk` (question answered in the host terminal). */
+    val hostAsk: Boolean = false,
 ) {
     val isFinished: Boolean get() = status == "completed" || status == "failed"
+
+    /** Questions read from `rawInput.questions`; empty when absent (callers fall back to [output]). */
+    val terminalQuestions: List<TerminalQuestion>
+        get() = rawInput["questions"].array.orEmpty().mapNotNull { q ->
+            val text = q["question"].str ?: return@mapNotNull null
+            val options = q["options"].array.orEmpty().mapNotNull { it["label"].str ?: it.str }
+            TerminalQuestion(text, options, q["multi"].bool ?: false)
+        }
 }
+
+data class TerminalQuestion(val question: String, val options: List<String>, val multi: Boolean)
 
 data class PlanEntry(val content: String, val status: String, val priority: String?)
 
@@ -179,6 +191,7 @@ class SessionTranscript {
         u["kind"].str?.let { call = call.copy(kind = it) }
         u["status"].str?.let { call = call.copy(status = it) }
         u["rawInput"]?.let { call = call.copy(rawInput = it) }
+        if (u["_meta"]["gjcm"]["hostAsk"].bool == true) call = call.copy(hostAsk = true)
         u["content"].array?.let { content ->
             val texts = content.mapNotNull { it["content"]["text"].str ?: it["text"].str }
             if (texts.isNotEmpty()) call = call.copy(output = texts.joinToString("\n"))

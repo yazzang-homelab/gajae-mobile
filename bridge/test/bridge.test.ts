@@ -213,6 +213,41 @@ describe("sessions over the bridge", () => {
 		expect((await client.waitFor(turnEnd(sid))).p.update.stopReason).toBe("end_turn");
 	});
 
+	test("the replay buffer counts the UTF-8 bytes a snapshot sends, so Korean text cannot swell it past its cap", async () => {
+		const cap = 4000;
+		const bridge = await useBridge({ GJCM_TEST_MAX_BUFFERED_BYTES: String(cap) });
+		const { client } = await bridge.pairedClient();
+		const sid = (await client.request("session.new", {})).sessionId;
+		// 1000 Hangul syllables: 1000 UTF-16 units, 3000 UTF-8 bytes.
+		for (const word of ["가", "나"]) {
+			await client.request("session.prompt", { sessionId: sid, prompt: [{ type: "text", text: word.repeat(1000) }] });
+			await client.waitFor(e => turnEnd(sid)(e) && client.events.filter(turnEnd(sid)).length === (word === "가" ? 1 : 2));
+		}
+		const snap = await client.request("session.open", { sessionId: sid, afterSeq: 0 });
+		const sent = snap.updates.reduce((sum: number, u: any) => sum + Buffer.byteLength(JSON.stringify(u.update)), 0);
+		expect(sent).toBeLessThanOrEqual(cap);
+		const said = snap.updates.map((u: any) => u.update.content?.text).filter((t: unknown) => typeof t === "string" && t.length === 1000);
+		expect(said).toEqual(["나".repeat(1000)]);
+	});
+
+	test("an answer over the frame limit is an error the phone can show, not a frame that drops its connection", async () => {
+		// The buffer limit is raised here so that one update over the frame limit stays in the buffer: then neither the
+		// live event nor a snapshot holding it fits a frame.
+		const bridge = await useBridge({ GJCM_TEST_MAX_BUFFERED_BYTES: String(64 * 1024 * 1024) });
+		const { client } = await bridge.pairedClient();
+		const sid = (await client.request("session.new", {})).sessionId;
+		await client.request("session.prompt", { sessionId: sid, prompt: [{ type: "text", text: "huge" }] });
+		expect((await client.waitFor(turnEnd(sid), 20_000)).p.update.stopReason).toBe("end_turn");
+		expect(client.events.some(e => e.ev === "session.update" && (e.p.update.content?.text?.length ?? 0) > 1024 * 1024)).toBe(false);
+		const refused = await client.request("session.open", { sessionId: sid, afterSeq: 0 }).catch((e: any) => e);
+		expect(refused.code).toBe(-32030);
+		expect(refused.data).toMatchObject({ code: "response_too_large", limit: 32 * 1024 * 1024 });
+		expect(refused.data.bytes).toBeGreaterThan(33 * 1024 * 1024);
+		expect(refused.message).toContain("폰으로 보낼 수 없습니다");
+		// Still connected: the next call is answered on the same connection.
+		expect((await client.request("session.list", {})).sessions.map((s: any) => s.sessionId)).toContain(sid);
+	}, 30_000);
+
 	test("session.open on a session not loaded in this process replays history via session/load", async () => {
 		const bridge = await useBridge();
 		const { client } = await bridge.pairedClient();

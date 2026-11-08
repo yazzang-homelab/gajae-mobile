@@ -86,6 +86,12 @@ export const PERMISSION_MODE_UPDATE = "x_gjcm_permission_mode";
 export const PERMISSION_MODES = ["prompt", "allow", "deny"] as const;
 export type PermissionMode = (typeof PERMISSION_MODES)[number];
 const STALE_ATTACHMENT = "SDK session attachment is stale";
+/**
+ * How gjc fails a prompt stopped before it ran (0.19.3 and 0.20.0, a session a terminal hosts): `session/prompt` fails with
+ * this instead of settling as cancelled, and the prompt never reaches the transcript (measured 2026-11-08, stop 0ms
+ * after a photo prompt; 800ms later it settled as cancelled and was kept).
+ */
+const PREFLIGHT_CANCELLED = "Prompt preflight was cancelled before execution";
 
 export interface BufferedUpdate {
 	seq: number;
@@ -117,6 +123,8 @@ interface SessionState {
 	running: boolean;
 	/** Settles when the bridge-started `session/prompt` in flight resolves or rejects. */
 	turn?: Promise<void>;
+	/** That turn's id, given to the phone that sent it (`session.prompt` reply) and repeated on its turn end. */
+	turnId?: string;
 	/**
 	 * Whether that prompt went in while a turn started elsewhere (the TUI) was running. gjc then queues it as a
 	 * steer of that turn instead of starting a turn the bridge owns. Held until the prompt settles: gjc 0.19.3
@@ -337,7 +345,7 @@ export class SessionHub {
 	#stopped = false;
 
 	constructor(options: HubOptions) {
-		this.#options = { maxBufferedUpdates: 5000, maxBufferedBytes: 48 * 1024 * 1024, stuckTurnCheckMs: STUCK_TURN_CHECK_MS, ...options };
+		this.#options = { maxBufferedUpdates: 5000, maxBufferedBytes: MAX_BUFFERED_BYTES, stuckTurnCheckMs: STUCK_TURN_CHECK_MS, ...options };
 		this.#saved = new SavedSessionIndex(options.agentDir);
 		// The window gets the tmux server's environment; point gjc there at the agent dir the ACP side uses.
 		if (options.tmux) {
@@ -768,13 +776,13 @@ export class SessionHub {
 		this.#track(state, update);
 		const entry = { seq: ++state.seq, update };
 		state.buffer.push(entry);
-		state.bufferBytes += approxBytes(update);
+		state.bufferBytes += jsonBytes(update);
 		while (
 			state.buffer.length > this.#options.maxBufferedUpdates ||
 			(state.bufferBytes > this.#options.maxBufferedBytes && state.buffer.length > 1)
 		) {
 			const dropped = state.buffer.shift()!;
-			state.bufferBytes -= approxBytes(dropped.update);
+			state.bufferBytes -= jsonBytes(dropped.update);
 		}
 		// A phone showing the chat already has the history a reload of the bridge's own replays.
 		if (state.quietReplay) return;
@@ -1261,7 +1269,7 @@ export class SessionHub {
 		throw new AcpError(-32020, message, { code: response.error?.code ?? "internal" });
 	}
 
-	async prompt(params: { sessionId: string; prompt: unknown[] }, interrupting = false): Promise<{ accepted: true }> {
+	async prompt(params: { sessionId: string; prompt: unknown[] }, interrupting = false): Promise<{ accepted: true; turnId: string }> {
 		const acp = await this.agent();
 		const state = this.#sessions.get(params.sessionId);
 		// A released turn ends before its session is loaded again; the phone may already send the next message.
@@ -1273,6 +1281,8 @@ export class SessionHub {
 		const promptBytes = Buffer.byteLength(JSON.stringify(params.prompt));
 		if (promptBytes > PROMPT_BYTES_LIMIT) throw promptTooLarge(params.prompt, promptBytes);
 		state.running = true;
+		const turnId = crypto.randomUUID();
+		state.turnId = turnId;
 		state.turnBehindHost = state.hostRunning;
 		state.turnAttachmentText = params.prompt.some(block => (block as { type?: unknown } | null)?.type !== "text")
 			? promptText(params.prompt) || undefined
@@ -1297,21 +1307,27 @@ export class SessionHub {
 				// Still held: it never reached the model (gjc 0.19.3 fails a queued prompt purged from its queue as
 				// "Prompt submission failed."), so it is not shown as said.
 				state.echoHold = undefined;
-				if (String(error?.message ?? error).includes(STALE_ATTACHMENT)) state.loaded = false;
-				this.#endTurn(state, { sessionUpdate: TURN_END, stopReason: "error", error: String(error?.message ?? error) });
+				const message = String(error?.message ?? error);
+				if (message.includes(STALE_ATTACHMENT)) state.loaded = false;
+				// A stop, not a failure; `undelivered` tells the phone that sent it to put the message back in its composer.
+				if (message.includes(PREFLIGHT_CANCELLED)) this.#endTurn(state, { sessionUpdate: TURN_END, stopReason: "cancelled", undelivered: true });
+				else this.#endTurn(state, { sessionUpdate: TURN_END, stopReason: "error", error: message });
 			},
 		);
 		state.turn = turn;
-		return { accepted: true };
+		return { accepted: true, turnId };
 	}
 
 	#endTurn(state: SessionState, turnEnd: Record<string, unknown>): void {
+		// Only the phone that sent the prompt knows this id, so only it takes an `undelivered` message back.
+		const turnId = state.turnId;
 		state.turn = undefined;
+		state.turnId = undefined;
 		state.running = false;
 		state.turnBehindHost = false;
 		state.turnAttachmentText = undefined;
 		state.stuckCheck = undefined;
-		this.#append(state, turnEnd);
+		this.#append(state, turnId ? { ...turnEnd, turnId } : turnEnd);
 		this.#maybeRecycle();
 	}
 
@@ -1800,6 +1816,12 @@ const INTERRUPT_SETTLE_TIMEOUT_MS = 10_000;
 const RELEASE_SETTLE_TIMEOUT_MS = 5000;
 /** Spacing of the host checks `#watchStuckTurn` needs twice in a row (a host step rarely goes 15s without an update). */
 const STUCK_TURN_CHECK_MS = 15_000;
+/**
+ * A session.open from scratch sends the whole buffer as one frame, and a phone drops the connection on a frame over
+ * 32 MiB (server MAX_FRAME_BYTES, iOS maximumMessageSize). The buffer stays well under it, room left for the rest of
+ * the snapshot (2026-11-08, pve1: a buffer then counted in UTF-16 units under a 48MB cap answered 28.2MB of UTF-8).
+ */
+const MAX_BUFFERED_BYTES = 24 * 1024 * 1024;
 /** `gjcPhase` values gjc 0.19.3 reports while the host works with `isStreaming` false (acp-event-mapper). */
 const HOST_BUSY_PHASES = new Set(["compacting", "retrying"]);
 /**
@@ -2031,8 +2053,9 @@ function isDirectory(dir: string): boolean {
 	}
 }
 
-function approxBytes(value: unknown): number {
-	return JSON.stringify(value).length;
+/** UTF-8 bytes of `value` as JSON, as it goes out: `length` counts UTF-16 units, a third of that for Korean text. */
+function jsonBytes(value: unknown): number {
+	return Buffer.byteLength(JSON.stringify(value));
 }
 
 function stripUndefined<T extends object>(value: T): T {

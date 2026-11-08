@@ -301,8 +301,10 @@ public extension BridgeClient {
         _ = try await request("session.close", ["sessionId": .string(sessionId)])
     }
 
-    func prompt(_ sessionId: String, blocks: [PromptBlock]) async throws {
-        _ = try await request("session.prompt", ["sessionId": .string(sessionId), "prompt": .array(blocks.map(\.json))])
+    /// Returns the bridge's id for the turn the prompt starts (`nil` from bridges older than `turnId`).
+    @discardableResult
+    func prompt(_ sessionId: String, blocks: [PromptBlock]) async throws -> String? {
+        try await request("session.prompt", ["sessionId": .string(sessionId), "prompt": .array(blocks.map(\.json))])["turnId"]?.string
     }
 
     /// Stops the busy turn and runs the steers still waiting in gjc's queue as the next turn (TUI Esc with a

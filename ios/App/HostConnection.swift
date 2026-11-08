@@ -39,7 +39,14 @@ final class HostConnection {
     @ObservationIgnored private var client: BridgeClient?
     @ObservationIgnored private var eventTask: Task<Void, Never>?
     @ObservationIgnored private var connectTask: Task<Void, Never>?
-    @ObservationIgnored private var retryDelay: Duration = .seconds(1)
+    @ObservationIgnored private var backoff = ReconnectBackoff()
+    /// The backoff's clock: `ContinuousClock` keeps counting while the phone sleeps (`systemUptime` does not), like
+    /// Android's `elapsedRealtime`, so a connection that lived across a locked screen is not a drop right after attaching.
+    private static let clockStart = ContinuousClock.now
+    private static var clockSeconds: TimeInterval {
+        let elapsed = clockStart.duration(to: .now).components
+        return TimeInterval(elapsed.seconds) + TimeInterval(elapsed.attoseconds) / 1e18
+    }
     @ObservationIgnored private var alerts = ActivityAlerts()
     /// The widget may only record what this connection fully knows: the unfiltered list and every waiting ask.
     @ObservationIgnored private var listKnown = false
@@ -70,9 +77,9 @@ final class HostConnection {
         onHostChange(host)
     }
 
-    func ensureConnected() {
+    func ensureConnected(after wait: TimeInterval = 0) {
         guard status != .connected, connectTask == nil else { return }
-        connectTask = Task { await connectLoop() }
+        connectTask = Task { await connectLoop(after: wait) }
     }
 
     func disconnect() {
@@ -93,9 +100,13 @@ final class HostConnection {
         attach(client, endpoint: endpoint)
     }
 
-    private func connectLoop() async {
+    private func connectLoop(after wait: TimeInterval) async {
         // A cancelled loop may still be finishing after a newer one started; it must not clear that one's handle.
         defer { if !Task.isCancelled { connectTask = nil } }
+        if wait > 0 {
+            try? await Task.sleep(for: .seconds(wait))
+            guard !Task.isCancelled else { return }
+        }
         while !Task.isCancelled {
             status = .connecting
             do {
@@ -113,9 +124,8 @@ final class HostConnection {
                 guard !Task.isCancelled else { return }
                 status = .failed((error as? LocalizedError)?.errorDescription ?? error.localizedDescription)
                 if case BridgeError.rejected = error { return } // unpaired: retrying cannot help
-                try? await Task.sleep(for: retryDelay)
+                try? await Task.sleep(for: .seconds(backoff.failedDial()))
                 guard !Task.isCancelled else { return }
-                retryDelay = min(retryDelay * 2, .seconds(30))
             }
         }
     }
@@ -126,7 +136,7 @@ final class HostConnection {
         listKnown = false
         waitingKnown = false
         arrivedSinceAttach = []
-        retryDelay = .seconds(1)
+        backoff.attached(at: Self.clockSeconds)
         if host.lastEndpoint != endpoint {
             host.lastEndpoint = endpoint
             onHostChange(host)
@@ -184,7 +194,8 @@ final class HostConnection {
             listKnown = false
             waitingKnown = false
             status = .failed(reason)
-            ensureConnected()
+            // A drop right after attaching waits before the next dial (see ReconnectBackoff).
+            ensureConnected(after: backoff.dropped(at: Self.clockSeconds))
         }
     }
 

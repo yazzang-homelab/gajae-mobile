@@ -232,12 +232,12 @@ class BridgeClient private constructor(private val transport: FrameTransport) {
 
     suspend fun deleteSession(sessionId: String) { request("session.delete", buildJsonObject { put("sessionId", sessionId) }) }
 
-    suspend fun prompt(sessionId: String, blocks: List<JsonElement>) {
+    /** Returns the bridge's id for the turn the prompt starts (`null` from bridges older than `turnId`). */
+    suspend fun prompt(sessionId: String, blocks: List<JsonElement>): String? =
         request("session.prompt", buildJsonObject {
             put("sessionId", sessionId)
             put("prompt", JsonArray(blocks))
-        })
-    }
+        })["turnId"].str
 
     /** Stops the busy turn and runs the waiting steers as the next turn; `-32005` means the model already took them. */
     suspend fun interrupt(sessionId: String): String = request("session.interrupt", buildJsonObject { put("sessionId", sessionId) })["text"].str ?: ""

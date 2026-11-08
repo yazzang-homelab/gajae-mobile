@@ -15,6 +15,7 @@ import dev.gajae.gjcmobile.core.PermissionOption
 import dev.gajae.gjcmobile.core.PermissionRequest
 import dev.gajae.gjcmobile.core.QueuedMessage
 import dev.gajae.gjcmobile.core.QueuedMessages
+import dev.gajae.gjcmobile.core.SentPrompt
 import dev.gajae.gjcmobile.core.SequencedUpdate
 import dev.gajae.gjcmobile.core.SessionStatus
 import dev.gajae.gjcmobile.core.SessionTranscript
@@ -93,6 +94,9 @@ class ChatModel(
     private var heldWakePending = false
     /** The held message is on its way (taken out of [heldPhotoMessage] until the bridge answers). */
     private var heldInFlight = false
+    /** This phone's prompt of the running turn, until its turn end: one marked `undelivered` (stopped before gjc ran
+     *  it, so it never reached the model) puts it back in the composer. See [SentPrompt]. */
+    private var promptInTurn: SentPrompt<HeldPhotoMessage>? = null
     var errorMessage by mutableStateOf<String?>(null)
     var isVisible = false
 
@@ -145,8 +149,23 @@ class ChatModel(
     fun apply(snapshot: OpenSnapshot) {
         transcript.apply(snapshot)
         permissions = snapshot.permissions
+        // Its turn end may have come while this chat was away (reconnect, back from the background).
+        settlePrompt(snapshot.updates, turnOver = !snapshot.running)
         publish()
         sendHeldPhotoMessageIfIdle()
+    }
+
+    private fun settlePrompt(updates: List<SequencedUpdate>, turnOver: Boolean) {
+        val sent = promptInTurn ?: return
+        when (sent.settle(updates, turnOver)) {
+            SentPrompt.Settled.WAITING -> return
+            SentPrompt.Settled.DONE -> promptInTurn = null
+            SentPrompt.Settled.GIVE_BACK -> {
+                promptInTurn = null
+                restore(sent.message)
+                transcript.appendNotice("멈춘 메시지는 모델에 닿지 않아 입력창으로 돌려놓았습니다.")
+            }
+        }
     }
 
     fun apply(update: SequencedUpdate) {
@@ -154,6 +173,7 @@ class ChatModel(
         if (update.update["sessionUpdate"].str == "x_gjcm_turn_end") {
             sentQueue = emptyList()
             hostQueue = hostQueue?.let { emptyList() }
+            settlePrompt(listOf(update), turnOver = false)
         }
         publish()
         // `running` covers turns started anywhere (the bridge's own and the terminal's), so this catches the end of
@@ -228,7 +248,8 @@ class ChatModel(
         try {
             val fitted = fitInlinePhotos(message.attachments, message.text)
             val blocks = client.promptBlocks(message.text, fitted, sessionId) { f -> scope.launch { uploadProgress = f } }
-            reopening(client) { client.prompt(sessionId, blocks) }
+            val turnId = reopening(client) { client.prompt(sessionId, blocks) }
+            promptInTurn = turnId?.let { SentPrompt(message, it) }
             transcript.markRunning()
             publish()
         } finally {
@@ -258,7 +279,8 @@ class ChatModel(
             reopening(client) {
                 client.sdkControl(sessionId, if (followUp) "turn.follow_up" else "turn.steer", buildJsonObject { put("text", text) })
             }
-            draft = ""
+            // Keeps what came back to the composer meanwhile (a stopped message) or was typed since.
+            if (draft.trim() == text) draft = ""
             sentQueue = sentQueue + QueuedMessage(text, followUp, System.currentTimeMillis())
             transcript.appendNotice(if (followUp) "턴이 끝나면 보낼 메시지를 대기열에 넣었습니다." else "진행 중인 턴에 지시를 끼워 넣었습니다.")
             publish()

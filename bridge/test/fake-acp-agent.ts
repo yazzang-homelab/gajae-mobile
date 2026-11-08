@@ -302,11 +302,23 @@ async function handle(msg: any) {
 				update(sid, { sessionUpdate: "session_info_update", _meta: { gjcPhase: "idle", running: false } });
 				return;
 			}
+			if (texts.join(" ").startsWith("preflight")) {
+				// Like gjc 0.19.3/0.20.0 in a session a terminal hosts, stopped before the prompt ran (measured 2026-11-08): the
+				// echo comes, the transcript never gets the message, and session/prompt fails instead of settling as cancelled.
+				for (const block of params.prompt) update(sid, { sessionUpdate: "user_message_chunk", content: block });
+				await new Promise<void>(resolve => cancellable.set(sid, resolve));
+				return write({ jsonrpc: "2.0", id, error: { code: -32603, message: "Internal error: Prompt preflight was cancelled before execution." } });
+			}
 			sessions.get(sid)?.push(texts.join("\n"));
 			persist();
 			saveTranscript(sid, sessionCwds.get(sid) ?? "/tmp");
 			for (const block of params.prompt) update(sid, { sessionUpdate: "user_message_chunk", content: block });
 			if (texts.join(" ") === "crash") process.exit(3);
+			// "huge" stands for a single update bigger than any frame (a tool's output, say): 33 MiB of text.
+			if (texts.join(" ") === "huge") {
+				update(sid, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "x".repeat(33 * 1024 * 1024) } });
+				return reply({ stopReason: "end_turn" });
+			}
 			if (texts.join(" ").includes("slow")) {
 				update(sid, { sessionUpdate: "session_info_update", _meta: { gjcPhase: "working", running: true } });
 				update(sid, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "one\ntwo\n" } });

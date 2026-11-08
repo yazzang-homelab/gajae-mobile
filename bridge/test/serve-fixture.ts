@@ -21,6 +21,7 @@ const hub = new SessionHub({
 	version: "test",
 	...(tmux ? { tmux: JSON.parse(tmux) } : {}),
 	...(process.env.GJCM_TEST_STUCK_TURN_MS ? { stuckTurnCheckMs: Number(process.env.GJCM_TEST_STUCK_TURN_MS) } : {}),
+	...(process.env.GJCM_TEST_MAX_BUFFERED_BYTES ? { maxBufferedBytes: Number(process.env.GJCM_TEST_MAX_BUFFERED_BYTES) } : {}),
 	// stdout carries only the port line; the log goes where the test can read it.
 	log: line => console.error(`[bridge] ${line}`),
 });

@@ -83,7 +83,7 @@ describe.skipIf(!hasTmux)("new sessions as tmux windows (gm#58)", () => {
 		expect(windows()[0]).not.toContain("--mode=acp");
 
 		const sid = first.sessionId;
-		expect(await client.request("session.prompt", { sessionId: sid, prompt: [{ type: "text", text: "hello" }] })).toEqual({ accepted: true });
+		expect(await client.request("session.prompt", { sessionId: sid, prompt: [{ type: "text", text: "hello" }] })).toEqual({ accepted: true, turnId: expect.any(String) });
 		const end = await client.waitFor(turnEnd(sid));
 		expect(end.p.update.stopReason).toBe("end_turn");
 
@@ -126,7 +126,7 @@ describe.skipIf(!hasTmux)("new sessions as tmux windows (gm#58)", () => {
 	test("opens over ACP when no tmux server runs, without starting one", async () => {
 		const { socket, client, windows } = await tmuxBridge({ server: false });
 		const sid = (await client.request("session.new", {})).sessionId;
-		expect(await client.request("session.prompt", { sessionId: sid, prompt: [{ type: "text", text: "ask me" }] })).toEqual({ accepted: true });
+		expect(await client.request("session.prompt", { sessionId: sid, prompt: [{ type: "text", text: "ask me" }] })).toEqual({ accepted: true, turnId: expect.any(String) });
 		await client.waitFor(turnEnd(sid));
 		expect(windows()).toEqual([]);
 		expect(tmux(socket, "list-sessions").code).not.toBe(0);

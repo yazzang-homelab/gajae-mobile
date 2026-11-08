@@ -86,6 +86,12 @@ export const PERMISSION_MODE_UPDATE = "x_gjcm_permission_mode";
 export const PERMISSION_MODES = ["prompt", "allow", "deny"] as const;
 export type PermissionMode = (typeof PERMISSION_MODES)[number];
 const STALE_ATTACHMENT = "SDK session attachment is stale";
+/**
+ * How gjc fails a prompt stopped before it ran (0.19.3 and 0.20.0, a session a terminal hosts): `session/prompt` fails with
+ * this instead of settling as cancelled, and the prompt never reaches the transcript (measured 2026-11-08, stop 0ms
+ * after a photo prompt; 800ms later it settled as cancelled and was kept).
+ */
+const PREFLIGHT_CANCELLED = "Prompt preflight was cancelled before execution";
 
 export interface BufferedUpdate {
 	seq: number;
@@ -117,6 +123,8 @@ interface SessionState {
 	running: boolean;
 	/** Settles when the bridge-started `session/prompt` in flight resolves or rejects. */
 	turn?: Promise<void>;
+	/** That turn's id, given to the phone that sent it (`session.prompt` reply) and repeated on its turn end. */
+	turnId?: string;
 	/**
 	 * Whether that prompt went in while a turn started elsewhere (the TUI) was running. gjc then queues it as a
 	 * steer of that turn instead of starting a turn the bridge owns. Held until the prompt settles: gjc 0.19.3
@@ -1261,7 +1269,7 @@ export class SessionHub {
 		throw new AcpError(-32020, message, { code: response.error?.code ?? "internal" });
 	}
 
-	async prompt(params: { sessionId: string; prompt: unknown[] }, interrupting = false): Promise<{ accepted: true }> {
+	async prompt(params: { sessionId: string; prompt: unknown[] }, interrupting = false): Promise<{ accepted: true; turnId: string }> {
 		const acp = await this.agent();
 		const state = this.#sessions.get(params.sessionId);
 		// A released turn ends before its session is loaded again; the phone may already send the next message.
@@ -1273,6 +1281,8 @@ export class SessionHub {
 		const promptBytes = Buffer.byteLength(JSON.stringify(params.prompt));
 		if (promptBytes > PROMPT_BYTES_LIMIT) throw promptTooLarge(params.prompt, promptBytes);
 		state.running = true;
+		const turnId = crypto.randomUUID();
+		state.turnId = turnId;
 		state.turnBehindHost = state.hostRunning;
 		state.turnAttachmentText = params.prompt.some(block => (block as { type?: unknown } | null)?.type !== "text")
 			? promptText(params.prompt) || undefined
@@ -1297,21 +1307,27 @@ export class SessionHub {
 				// Still held: it never reached the model (gjc 0.19.3 fails a queued prompt purged from its queue as
 				// "Prompt submission failed."), so it is not shown as said.
 				state.echoHold = undefined;
-				if (String(error?.message ?? error).includes(STALE_ATTACHMENT)) state.loaded = false;
-				this.#endTurn(state, { sessionUpdate: TURN_END, stopReason: "error", error: String(error?.message ?? error) });
+				const message = String(error?.message ?? error);
+				if (message.includes(STALE_ATTACHMENT)) state.loaded = false;
+				// A stop, not a failure; `undelivered` tells the phone that sent it to put the message back in its composer.
+				if (message.includes(PREFLIGHT_CANCELLED)) this.#endTurn(state, { sessionUpdate: TURN_END, stopReason: "cancelled", undelivered: true });
+				else this.#endTurn(state, { sessionUpdate: TURN_END, stopReason: "error", error: message });
 			},
 		);
 		state.turn = turn;
-		return { accepted: true };
+		return { accepted: true, turnId };
 	}
 
 	#endTurn(state: SessionState, turnEnd: Record<string, unknown>): void {
+		// Only the phone that sent the prompt knows this id, so only it takes an `undelivered` message back.
+		const turnId = state.turnId;
 		state.turn = undefined;
+		state.turnId = undefined;
 		state.running = false;
 		state.turnBehindHost = false;
 		state.turnAttachmentText = undefined;
 		state.stuckCheck = undefined;
-		this.#append(state, turnEnd);
+		this.#append(state, turnId ? { ...turnEnd, turnId } : turnEnd);
 		this.#maybeRecycle();
 	}
 

@@ -70,6 +70,9 @@ final class ChatModel: Identifiable {
     @ObservationIgnored private var heldWakePending = false
     /// The held message is on its way (taken out of `heldPhotoMessage` until the bridge answers).
     @ObservationIgnored private var heldInFlight = false
+    /// This phone's prompt of the running turn, until its turn end: one marked `undelivered` (stopped before gjc ran
+    /// it, so it never reached the model) puts it back in the composer. See `SentPrompt`.
+    @ObservationIgnored private var promptInTurn: SentPrompt<HeldPhotoMessage>?
     var hasQueuedSteer: Bool { queued.contains { !$0.followUp } }
     var infoSheet: InfoSheet?
     var configPicker: ConfigTarget?
@@ -158,7 +161,23 @@ final class ChatModel: Identifiable {
     func apply(snapshot: OpenSnapshot) {
         transcript.apply(snapshot: snapshot)
         permissions = snapshot.permissions
+        // Its turn end may have come while this chat was away (reconnect, back from the background).
+        settlePrompt(after: snapshot.updates, turnOver: !snapshot.running)
         sendHeldPhotoMessageIfIdle()
+    }
+
+    private func settlePrompt(after updates: [SequencedUpdate], turnOver: Bool) {
+        guard let sent = promptInTurn else { return }
+        switch sent.settle(after: updates, turnOver: turnOver) {
+        case .waiting:
+            return
+        case .done:
+            promptInTurn = nil
+        case .giveBack:
+            promptInTurn = nil
+            restore(sent.message)
+            transcript.appendNotice("멈춘 메시지는 모델에 닿지 않아 입력창으로 돌려놓았습니다.")
+        }
     }
 
     func apply(_ update: SequencedUpdate) {
@@ -167,6 +186,7 @@ final class ChatModel: Identifiable {
         case "x_gjcm_turn_end":
             sentQueue = []
             if hostQueue != nil { hostQueue = [] }
+            settlePrompt(after: [update], turnOver: false)
             Task { await refreshInsights() }
         case "plan":
             Task { await refreshTodos() }
@@ -272,7 +292,8 @@ final class ChatModel: Identifiable {
         let blocks = try await client.promptBlocks(text: message.text, attachments: fitted, sessionId: sessionId) { fraction in
             Task { @MainActor [weak self] in self?.uploadProgress = fraction }
         }
-        try await reopening(client) { try await client.prompt(sessionId, blocks: blocks) }
+        let turnId = try await reopening(client) { try await client.prompt(sessionId, blocks: blocks) }
+        promptInTurn = turnId.map { SentPrompt(message: message, turnId: $0) }
         transcript.markRunning()
     }
 
@@ -295,7 +316,8 @@ final class ChatModel: Identifiable {
             _ = try await reopening(client) {
                 try await client.sdkControl(sessionId, followUp ? "turn.follow_up" : "turn.steer", input: ["text": .string(text)])
             }
-            draft = ""
+            // Keeps what came back to the composer meanwhile (a stopped message) or was typed since.
+            if trimmedDraft == text { draft = "" }
             sentQueue.append(QueuedMessage(text: text, followUp: followUp, sentAt: Date().timeIntervalSince1970))
             transcript.appendNotice(followUp ? "턴이 끝나면 보낼 메시지를 대기열에 넣었습니다." : "진행 중인 턴에 지시를 끼워 넣었습니다.")
         } catch {

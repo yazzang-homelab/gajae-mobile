@@ -23,7 +23,11 @@ struct TranscriptRow: View {
         case let .thought(text):
             ThoughtView(text: text)
         case let .tool(call):
-            ToolCallView(call: call)
+            if call.hostAsk {
+                TerminalAskView(call: call)
+            } else {
+                ToolCallView(call: call)
+            }
         case let .plan(entries):
             PlanView(entries: entries)
         case let .turnEnded(stopReason, error):
@@ -147,6 +151,47 @@ struct ToolCallView: View {
         case "failed": Image(systemName: "xmark.octagon.fill").foregroundStyle(Palette.gajaeRed)
         default: ProgressView().controlSize(.mini).tint(Palette.strawGold)
         }
+    }
+}
+
+/// Question answered in the host terminal (gjc TUI): read-only, never button-like.
+struct TerminalAskView: View {
+    let call: ToolCall
+
+    var body: some View {
+        let questions = call.terminalQuestions
+        VStack(alignment: .leading, spacing: 6) {
+            Label("터미널 질문", systemImage: "terminal").font(.caption.bold()).foregroundStyle(Palette.strawGold)
+            if questions.isEmpty {
+                // Without questions to show, the bridge's text stands in while waiting; once settled, output is the answer.
+                if !call.isFinished && !call.output.isEmpty {
+                    Text(call.output).font(.caption).foregroundStyle(Palette.cream).textSelection(.enabled)
+                }
+            } else {
+                ForEach(Array(questions.enumerated()), id: \.offset) { _, q in
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(q.question).font(.callout).foregroundStyle(Palette.cream).textSelection(.enabled)
+                        if q.multi { Text("여러 개 선택").font(.caption2).foregroundStyle(Palette.muted) }
+                        ForEach(Array(q.options.enumerated()), id: \.offset) { _, option in
+                            Text("• " + option).font(.caption).foregroundStyle(Palette.muted)
+                        }
+                    }
+                }
+            }
+            switch call.status {
+            case "completed":
+                Label(call.output.isEmpty ? "터미널에서 답했습니다." : call.output, systemImage: "checkmark.circle.fill")
+                    .font(.caption).foregroundStyle(Palette.visorGreen)
+            case "failed":
+                Label(call.output.isEmpty ? "답을 받지 못했습니다." : call.output, systemImage: "xmark.octagon.fill")
+                    .font(.caption).foregroundStyle(Palette.gajaeRed)
+            default:
+                Text("터미널에서 답하세요. 승인 카드가 뜨면 폰에서도 고를 수 있습니다.").font(.caption.bold()).foregroundStyle(Palette.strawGold)
+            }
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .card(stroke: call.status == "failed" ? Palette.gajaeRed : call.status == "completed" ? Palette.shellLine : Palette.strawGold)
     }
 }
 

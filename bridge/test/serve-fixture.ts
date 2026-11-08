@@ -13,7 +13,17 @@ import { UploadStore } from "../src/uploads";
 const command = JSON.parse(process.env.GJCM_TEST_AGENT!);
 const cwd = process.env.GJCM_TEST_CWD!;
 const state = new BridgeState();
-const hub = new SessionHub({ acp: { command, cwd }, defaultCwd: cwd, agentDir: process.env.GJC_CODING_AGENT_DIR || `${process.env.HOME}/.gjc/agent`, version: "test" });
+const tmux = process.env.GJCM_TEST_TMUX;
+const hub = new SessionHub({
+	acp: { command, cwd },
+	defaultCwd: cwd,
+	agentDir: process.env.GJC_CODING_AGENT_DIR || `${process.env.HOME}/.gjc/agent`,
+	version: "test",
+	...(tmux ? { tmux: JSON.parse(tmux) } : {}),
+	...(process.env.GJCM_TEST_STUCK_TURN_MS ? { stuckTurnCheckMs: Number(process.env.GJCM_TEST_STUCK_TURN_MS) } : {}),
+	// stdout carries only the port line; the log goes where the test can read it.
+	log: line => console.error(`[bridge] ${line}`),
+});
 const demoEndpoint = process.env.GJCM_TEST_DEMO_ENDPOINT;
 const server = startBridgeServer({
 	hostname: "127.0.0.1",

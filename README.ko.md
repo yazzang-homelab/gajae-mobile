@@ -55,7 +55,7 @@ bunx gjcm-bridge serve
 bunx gjcm-bridge pair
 ```
 
-기본값은 `--host 0.0.0.0 --port 7787 --gjc "gjc --mode=acp"`입니다. 새 버전은 `bunx gjcm-bridge@latest serve`로 받습니다. 소스에서 실행하려면 `git clone https://github.com/yazzang-homelab/gajae-mobile.git && cd gajae-mobile/bridge && bun install && bun src/cli.ts serve`.
+기본값은 `--host 0.0.0.0 --port 7787 --gjc "gjc --mode=acp"`입니다. tmux를 쓰는 호스트에서 `--tmux-session gjcm`을 주면 앱에서 연 새 세션이 그 tmux 세션의 창으로 열려 PC에서 이어 볼 수 있습니다([bridge/README.md](bridge/README.md#새-세션을-tmux-창으로-열기-옵트인)). 새 버전은 `bunx gjcm-bridge@latest serve`로 받습니다. 소스에서 실행하려면 `git clone https://github.com/yazzang-homelab/gajae-mobile.git && cd gajae-mobile/bridge && bun install && bun src/cli.ts serve`.
 
 앱을 열고 코드를 찍으면 연결됩니다. 브리지를 상시 실행하려면 예시 systemd 유닛 `deploy/gjcm-bridge.service`를 참고하세요.
 

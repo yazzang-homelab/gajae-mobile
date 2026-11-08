@@ -3,6 +3,59 @@
  * fixtures/acp-echo-permission.trace (real gjc 0.18.7 output).
  */
 import fs from "node:fs";
+import path from "node:path";
+
+// Launched by the bridge's tmux path as the TUI (`<agent> --resume <id>`): like gjc, publish the session's SDK
+// endpoint under <cwd>/.gjc/state/sdk with this process's pid (and the agent dir it got) and stay up. It refuses
+// a session ACP still holds (no session/close yet). `--tui=exit` quits at once, `--tui=silent` never publishes.
+const resumeAt = process.argv.indexOf("--resume");
+if (resumeAt >= 0) {
+	const mode = process.argv.find(arg => arg.startsWith("--tui="))?.slice("--tui=".length);
+	const dir = path.join(process.cwd(), ".gjc", "state", "sdk");
+	const sessionId = process.argv[resumeAt + 1];
+	if (mode === "exit" || !fs.existsSync(path.join(dir, `${sessionId}.closed`))) process.exit(1);
+	if (mode !== "silent") {
+		const agentDir = process.env.GJC_CODING_AGENT_DIR;
+		fs.writeFileSync(path.join(dir, `${sessionId}.json`), JSON.stringify({ version: 1, sessionId, pid: process.pid, agentDir }));
+	}
+	setInterval(() => {}, 60_000);
+	await new Promise(() => {});
+}
+
+// Launched by the bridge as gjc's session CLI (`<agent> sdk session raw control|query <id> … --json`, see
+// sdk-cli.ts) for the permission approval channel of a session a tmux window hosts. Like gjc 0.19.3, the channel is
+// the host's: files under <cwd>/.gjc/state/sdk stand for it (`<id>.channel` on, `<id>.requests.json` the pending
+// requests, `<id>.answer.json` the last response), shared with the ACP process that runs the turns here.
+const rawAt = process.argv.indexOf("raw");
+if (process.argv.includes("sdk") && process.argv.includes("session") && rawAt >= 0) {
+	const [verb, sessionId] = [process.argv[rawAt + 1], process.argv[rawAt + 2]];
+	const op = process.argv[process.argv.indexOf(verb === "control" ? "--op" : "--query") + 1];
+	const input = verb === "control" ? JSON.parse(process.argv[process.argv.indexOf("--json-input") + 1]!) : undefined;
+	const file = (suffix: string) => path.join(process.cwd(), ".gjc", "state", "sdk", `${sessionId}.${suffix}`);
+	const out = (result: unknown) => process.stdout.write(`${JSON.stringify({ type: `${verb}_response`, id: "c", ok: true, result })}\n`);
+	const failed = (code: string, message: string) => process.stdout.write(`${JSON.stringify({ type: `${verb}_response`, id: "c", ok: false, error: { code, message } })}\n`);
+	if (process.env.FAKE_CLI_FAIL) failed("resource_gone", "No live session.");
+	else if (op === "permission.channel.set") {
+		if (input.enabled) fs.writeFileSync(file("channel"), "");
+		else fs.rmSync(file("channel"), { force: true });
+		out({ enabled: Boolean(input.enabled) });
+	} else if (op === "permission.requests.list") {
+		const requests = fs.existsSync(file("requests.json")) ? JSON.parse(fs.readFileSync(file("requests.json"), "utf8")) : [];
+		out({ sessionId, enabled: fs.existsSync(file("channel")), requests });
+	} else if (op === "permission.respond") {
+		const requests: Array<{ id: string }> = fs.existsSync(file("requests.json")) ? JSON.parse(fs.readFileSync(file("requests.json"), "utf8")) : [];
+		// `<id>.respond-fail` stands for one call that never reached the host (the CLI or broker failed).
+		if (fs.existsSync(file("respond-fail"))) {
+			fs.rmSync(file("respond-fail"));
+			failed("internal", "Broker request failed.");
+		} else if (!requests.some(r => r.id === input.id)) failed("invalid_input", "Permission request is stale or already answered");
+		else {
+			fs.writeFileSync(file("answer.json"), JSON.stringify(input));
+			out({ accepted: true });
+		}
+	} else failed("unknown_operation", `Unknown control operation: ${op}.`);
+	process.exit(0);
+}
 
 // Sessions persist across restarts like ~/.gjc/agent/sessions does for real gjc.
 const stateFile = process.env.FAKE_ACP_STATE;
@@ -32,8 +85,18 @@ const pending = new Map<number, (result: any) => void>();
 const cancellable = new Map<string, () => void>();
 // gjc's pending steers per session (queue.messages.list). Unlike real gjc (which drops them), a cancel keeps
 // them here, so the bridge's clean-up path is exercised.
-const steers = new Map<string, { id: string; text: string; mode: "steer"; label: "Steer" }[]>();
+const steers = new Map<string, { id: string; text: string; mode: "steer" | "followUp"; label: string }[]>();
 let nextSteer = 1;
+/** What ask.requests.list lists per session; `toolCallId` and `next` (listed after a non-final pick) stay in the fake. */
+interface FakeAskRequest {
+	id: string;
+	toolCallId: string;
+	next?: FakeAskRequest;
+	failOnce?: boolean;
+	[key: string]: unknown;
+}
+const remoteAsks = new Map<string, FakeAskRequest[]>();
+const askAnswers: { sessionId: string; id: string; answer: unknown }[] = [];
 // Sessions with a turn typed in the TUI ("terminal turn" … "terminal done"), which no ACP prompt owns.
 const terminalTurns = new Set<string>();
 // ACP prompts that arrived during a terminal turn. Like gjc 0.19.3 (measured 2026-11-06 on pve3): such a prompt waits
@@ -42,7 +105,13 @@ const terminalTurns = new Set<string>();
 // `running: false` until the prompt settles.
 // session/cancel does not stop the terminal turn; it purges the queued prompt, which then fails as
 // "Prompt submission failed." ("Queued prompt was removed before consumption" in gjc's log).
-const queuedPrompts = new Map<string, { steerId: string; blocks: any[]; settle: (outcome: "consumed" | "removed") => void }>();
+// `orphan`: gjc no longer tracks it as the session's active prompt, so session/close does not settle it either.
+const queuedPrompts = new Map<
+	string,
+	{ steerId: string; blocks: any[]; taken?: boolean; orphan?: boolean; settle: (outcome: "consumed" | "removed" | "closed") => void }
+>();
+// Sessions whose next session/load fails once ("fail next load").
+const failNextLoad = new Set<string>();
 // gjc's SDK permission policy; every ACP attachment (session/new, session/load) resets it to prompt.
 const permissionModes = new Map<string, string>();
 
@@ -65,6 +134,49 @@ const configOptions = [
 // Like gjc, set_config_option for thinking is slow (it rebuilds the model catalog); thinking.set is not.
 const thinkingLevels = new Map<string, string>();
 
+// A tool approval through the host's permission channel (see the CLI mode above) instead of session/request_permission:
+// listed as a request, answered by `permission.respond`. A request left alone fails when "expire" is steered.
+const channelOptions = [
+	{ optionId: "allow_once", name: "Allow once", kind: "allow_once" },
+	{ optionId: "reject_once", name: "Reject", kind: "reject_once" },
+];
+let nextChannelRequest = 1;
+const expiring = new Map<string, () => void>();
+function channelOn(sid: string): string | undefined {
+	const cwd = sessionCwds.get(sid);
+	const dir = cwd && path.join(cwd, ".gjc", "state", "sdk");
+	return dir && fs.existsSync(path.join(dir, `${sid}.channel`)) ? dir : undefined;
+}
+async function channelApproval(sid: string, dir: string, toolCall: Record<string, unknown>): Promise<string | undefined> {
+	const id = `req-${nextChannelRequest++}`;
+	const requests = path.join(dir, `${sid}.requests.json`);
+	const answer = path.join(dir, `${sid}.answer.json`);
+	// gjc lists the request a moment after the pending tool call arrives over ACP (measured ~1.4s).
+	await Bun.sleep(1200);
+	fs.writeFileSync(requests, JSON.stringify([{ id, sessionId: sid, expiresAt: new Date(Date.now() + 60_000).toISOString(), options: channelOptions, toolCall: { ...toolCall, toolName: "bash" } }]));
+	const answered = (): string | undefined => {
+		if (!fs.existsSync(answer)) return undefined;
+		const given = JSON.parse(fs.readFileSync(answer, "utf8"));
+		fs.rmSync(answer);
+		return given.id === id ? given.optionId : undefined;
+	};
+	// Like gjc, the request settles at once: by the response that landed first, or by the expiry or cancellation,
+	// after which a response finds it gone.
+	let settled: { optionId?: string } | undefined;
+	expiring.set(sid, () => (settled ??= { optionId: answered() }));
+	try {
+		for (;;) {
+			if (settled) return settled.optionId;
+			const optionId = answered();
+			if (optionId) return optionId;
+			await Bun.sleep(30);
+		}
+	} finally {
+		expiring.delete(sid);
+		fs.rmSync(requests, { force: true });
+	}
+}
+
 async function handle(msg: any) {
 	const { id, method, params } = msg;
 	const reply = (result: unknown) => write({ jsonrpc: "2.0", id, result });
@@ -78,11 +190,20 @@ async function handle(msg: any) {
 			attached.add(sessionId);
 			permissionModes.delete(sessionId);
 			persist();
+			// Like gjc's ACP session host, publish the SDK endpoint (it stays behind after session/close). Only the
+			// tmux tests, whose cwd is a scratch dir, need it.
+			const sdkDir = path.join(params.cwd, ".gjc", "state", "sdk");
+			if (process.env.GJCM_TEST_TMUX) {
+				fs.mkdirSync(sdkDir, { recursive: true });
+				fs.writeFileSync(path.join(sdkDir, `${sessionId}.json`), JSON.stringify({ version: 1, sessionId, pid: process.pid }));
+			}
 			reply({ sessionId, configOptions });
 			update(sessionId, { sessionUpdate: "session_info_update", _meta: { gjcPhase: "idle" } });
 			return;
 		}
 		case "session/load": {
+			if (failNextLoad.delete(params.sessionId))
+				return write({ jsonrpc: "2.0", id, error: { code: -32603, message: "Internal error: load failed" } });
 			if (params.sessionId === "broker-lost")
 				return write({ jsonrpc: "2.0", id, error: { code: -32603, message: "Internal error: SDK request outcome is uncertain after the frame was sent." } });
 			const history = sessions.get(params.sessionId);
@@ -90,6 +211,7 @@ async function handle(msg: any) {
 			staleAttachments.delete(params.sessionId);
 			attached.add(params.sessionId);
 			permissionModes.delete(params.sessionId);
+			sessionCwds.set(params.sessionId, params.cwd);
 			for (const text of history) update(params.sessionId, { sessionUpdate: "user_message_chunk", content: { type: "text", text } });
 			return reply({ configOptions });
 		}
@@ -103,6 +225,20 @@ async function handle(msg: any) {
 			persist();
 			saveTranscript(sessionId, params.cwd);
 			return reply({ sessionId, configOptions });
+		}
+		case "session/close": {
+			attached.delete(params.sessionId);
+			// Like gjc 0.19.3 (measured with a TUI host): closing the attachment settles a prompt still waiting on it as
+			// cancelled; the host's own turn is left alone.
+			const waiting = queuedPrompts.get(params.sessionId);
+			if (waiting && !waiting.orphan) {
+				queuedPrompts.delete(params.sessionId);
+				steers.set(params.sessionId, (steers.get(params.sessionId) ?? []).filter(s => s.id !== waiting.steerId));
+				waiting.settle("closed");
+			}
+			const cwd = sessionCwds.get(params.sessionId);
+			if (cwd && process.env.GJCM_TEST_TMUX) fs.writeFileSync(path.join(cwd, ".gjc", "state", "sdk", `${params.sessionId}.closed`), "");
+			return reply({});
 		}
 		case "session/delete": {
 			sessions.delete(params.sessionId);
@@ -122,11 +258,45 @@ async function handle(msg: any) {
 			const sid = params.sessionId;
 			const texts = params.prompt.filter((b: any) => b.type === "text").map((b: any) => b.text);
 			if (terminalTurns.has(sid)) {
-				const steerId = `steer:${nextSteer++}`;
-				steers.set(sid, [...(steers.get(sid) ?? []), { id: steerId, text: texts.join("\n"), mode: "steer", label: "Steer" }]);
-				for (const block of params.prompt) update(sid, { sessionUpdate: "user_message_chunk", content: block });
-				const outcome = await new Promise<"consumed" | "removed">(settle => queuedPrompts.set(sid, { steerId, blocks: params.prompt, settle }));
+				// Like gjc 0.19.3: the echo (text with content and images only) comes first, the queue entry after it (~0.1s
+				// measured; 0.4s here so a queue read can land in between).
+				// It is listed under acpPromptPayload's text ("[Image]" for photos only), and as a follow-up when one
+				// already waits ahead of it.
+				const ahead = (steers.get(sid) ?? []).some(s => s.mode === "followUp");
+				const steerId = `${ahead ? "followUp" : "steer"}:${nextSteer++}`;
+				for (const block of params.prompt)
+					if (block.type === "image" || (block.type === "text" && block.text.length > 0))
+						update(sid, { sessionUpdate: "user_message_chunk", content: block });
+				const listed = params.prompt
+					.flatMap((b: any) =>
+						b.type === "text"
+							? [b.text]
+							: b.type === "resource_link"
+								? [
+										[
+											`[Resource: ${b.name}]`,
+											`URI: ${b.uri}`,
+											...(b.title ? [`Title: ${b.title}`] : []),
+											...(b.description ? [b.description] : []),
+											...(b.mimeType ? [`MIME: ${b.mimeType}`] : []),
+											...(typeof b.size === "number" ? [`Size: ${b.size}`] : []),
+										].join("\n"),
+									]
+								: [],
+					)
+					.join("\n");
+				const hasImage = params.prompt.some((b: any) => b.type === "image");
+				// "즉시" stands for a prompt the TUI turn took at once (it was at a step boundary): never listed as queued.
+				if (!texts.join(" ").startsWith("즉시"))
+					setTimeout(() => {
+						const waiting = queuedPrompts.get(sid);
+						if (waiting?.steerId !== steerId || waiting.taken) return; // purged or taken meanwhile
+						const entry = { id: steerId, text: listed || (hasImage ? "[Image]" : ""), mode: ahead ? "followUp" : "steer", label: ahead ? "Follow-up" : "Steer" } as const;
+						steers.set(sid, [...(steers.get(sid) ?? []), entry]);
+					}, 400);
+				const outcome = await new Promise<"consumed" | "removed" | "closed">(settle => queuedPrompts.set(sid, { steerId, blocks: params.prompt, settle }));
 				if (outcome === "removed") return write({ jsonrpc: "2.0", id, error: { code: -32603, message: "Prompt submission failed." } });
+				if (outcome === "closed") return reply({ stopReason: "cancelled" });
 				update(sid, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: `받은 블록: ${params.prompt.map((b: any) => b.type).join(",")}` } });
 				reply({ stopReason: "end_turn" });
 				update(sid, { sessionUpdate: "session_info_update", _meta: { gjcPhase: "idle", running: false } });
@@ -145,12 +315,26 @@ async function handle(msg: any) {
 				return reply({ stopReason: "cancelled" });
 			}
 			const kinds = params.prompt.map((b: any) => b.type).join(",");
+			if (texts.join(" ") === "ask me") {
+				// What gjc sends for an ask of an ACP turn in a session the TUI hosts: a bare tool_call, answered in the terminal.
+				const rawInput = { questions: [{ id: "fruit", question: "사과와 배 중 하나를 고르세요", options: [{ label: "사과" }, { label: "배" }], recommended: 0 }] };
+				update(sid, { sessionUpdate: "tool_call", toolCallId: "ask1", title: "과일 선택", kind: "other", status: "pending", rawInput });
+				update(sid, { sessionUpdate: "tool_call_update", toolCallId: "ask1", status: "completed", content: [{ type: "content", content: { type: "text", text: "User selected: 배" } }] });
+			}
 			if (texts.join(" ").includes("tool")) {
 				const toolCall = { toolCallId: "t1", title: "echo hi", kind: "execute", status: "pending", rawInput: { command: "echo hi" } };
 				update(sid, { sessionUpdate: "tool_call", ...toolCall });
 				const mode = permissionModes.get(sid) ?? "prompt";
-				const res =
-					mode === "prompt"
+				const channel = mode === "prompt" ? channelOn(sid) : undefined;
+				// Measured on gjc 0.19.3: a TUI host (the session ACP closed for the tmux window) does not ask over ACP; without
+				// its approval channel it runs the tool unasked.
+				const sdkDir = path.join(sessionCwds.get(sid) ?? process.cwd(), ".gjc", "state", "sdk");
+				const tuiHost = fs.existsSync(path.join(sdkDir, `${sid}.closed`));
+				const res = channel
+					? { outcome: { outcome: "selected", optionId: (await channelApproval(sid, channel, toolCall)) ?? "reject_once" } }
+					: tuiHost && mode === "prompt"
+						? { outcome: { outcome: "selected", optionId: "allow_once" } }
+					: mode === "prompt"
 						? await request("session/request_permission", {
 								sessionId: sid,
 								toolCall,
@@ -181,7 +365,8 @@ async function handle(msg: any) {
 			if (waiting) {
 				queuedPrompts.delete(params.sessionId);
 				steers.set(params.sessionId, (steers.get(params.sessionId) ?? []).filter(s => s.id !== waiting.steerId));
-				waiting.settle("removed");
+				// The purged prompt fails a moment later, after a queue read can already see it gone.
+				setTimeout(() => waiting.settle("removed"), 1500);
 			}
 			cancellable.get(params.sessionId)?.();
 			cancellable.delete(params.sessionId);
@@ -211,11 +396,38 @@ async function handle(msg: any) {
 					return reply({ type: "query_response", id: "q", ok: false, error: { code: "internal", message: "SDK session attachment is stale." } });
 				}
 				const operations = ["turn.steer", ...(btw.startsWith("turn") ? ["turn.btw", "btw.ask"] : btw.startsWith("ask") ? ["btw.ask"] : [])];
-				const item = { operations, hostTools: false, ...(btw.endsWith("-exchanges") ? { btwAskExchangesVersion: 1 } : {}) };
+				// FAKE_SURFACE=sdk stands for a session gjc ACP hosts itself; by default a terminal hosts it, as the
+				// "terminal ..." steers below play.
+				// FAKE_SURFACE=none stands for a host that does not say (no such field).
+				const surface = process.env.FAKE_SURFACE ?? "cli";
+				const item = {
+					operations,
+					hostTools: false,
+					...(surface === "none" ? {} : { primaryControlSurface: surface }),
+					...(btw.endsWith("-exchanges") ? { btwAskExchangesVersion: 1 } : {}),
+				};
 				return reply({ type: "query_response", id: "q", ok: true, page: { items: [item], complete: true } });
 			}
-			if (params.query === "context.get")
-				return reply({ type: "query_response", id: "q", ok: true, page: { items: [{ usage: { tokens: 1200, contextWindow: 100000, percent: 1.2 }, systemPrompt: ["abc", "de"] }], complete: true } });
+			if (params.query === "ask.requests.list") {
+				if (agentDir) fs.appendFileSync(`${agentDir}/ask-list-calls`, "x");
+				// FAKE_ASK_LIST=q34 stands for a session host with gajae-code#7611; without it, as gjc 0.19.3, no such query.
+				if (process.env.FAKE_ASK_LIST !== "q34")
+					return reply({ type: "query_response", id: "q", ok: false, error: { code: "unknown_operation", message: `Unknown query operation: ${params.query}` } });
+				const items = (remoteAsks.get(params.sessionId) ?? []).map(({ toolCallId: _, next: __, failOnce: ___, ...item }) => item);
+				return reply({ type: "query_response", id: "q", ok: true, page: { items, complete: true, revision: "r" } });
+			}
+			if (params.query === "context.get") {
+				// Like gjc 0.19.3: the host's own run state, apart from the ACP phase a pending prompt keeps at working.
+				const queue = steers.get(params.sessionId) ?? [];
+				const item = {
+					usage: { tokens: 1200, contextWindow: 100000, percent: 1.2 },
+					isStreaming: terminalTurns.has(params.sessionId) || cancellable.has(params.sessionId),
+					steeringQueueDepth: queue.filter(s => s.mode === "steer").length,
+					followupQueueDepth: queue.filter(s => s.mode === "followUp").length,
+					systemPrompt: ["abc", "de"],
+				};
+				return reply({ type: "query_response", id: "q", ok: true, page: { items: [item], complete: true } });
+			}
 			return reply({ type: "query_response", id: "q", ok: false, error: { code: "unsupported", message: `no ${params.query}` } });
 		case "_gjc/sdk/control":
 			if (params.operation === "session.rename") {
@@ -228,19 +440,100 @@ async function handle(msg: any) {
 			if (params.operation === "permission_mode.set") {
 				if (staleAttachments.has(params.sessionId))
 					return reply({ ok: false, error: { code: "internal", message: "SDK session attachment is stale." } });
+				const changed = (permissionModes.get(params.sessionId) ?? "prompt") !== params.input?.mode;
 				permissionModes.set(params.sessionId, params.input?.mode);
-				return reply({ changed: true, mode: params.input?.mode });
+				// Like gjc (external-permissions.ts), a mode change cancels the channel's waiting requests.
+				if (changed) expiring.get(params.sessionId)?.();
+				return reply({ changed, mode: params.input?.mode });
 			}
 			if (params.operation === "thinking.set") {
 				thinkingLevels.set(params.sessionId, params.input.level);
 				return reply({ changed: true });
 			}
+			if (params.operation === "ask.answer") {
+				// The listed request leaves; a commit writes the ask's toolResult as gjc does, a toggle/next lists `next`.
+				const asks = remoteAsks.get(params.sessionId) ?? [];
+				const request = asks.find(r => r.id === params.input?.id);
+				if (!request) return reply({ ok: false, error: { code: "stale_request", message: "stale" } });
+				// `failOnce`: the first answer fails short of the question (a transport error, not a stale id).
+				if (request.failOnce) {
+					request.failOnce = false;
+					return reply({ ok: false, error: { code: "internal", message: "transport lost" } });
+				}
+				askAnswers.push({ sessionId: params.sessionId, id: request.id, answer: params.input.answer });
+				remoteAsks.set(params.sessionId, [...asks.filter(r => r !== request), ...(request.next ? [request.next] : [])]);
+				if (!request.next) {
+					const value = params.input.answer?.value ?? params.input.answer?.controlId;
+					const file = `${agentDir}/sessions/v2-fake/2026-10-26T00-00-00-000Z_${params.sessionId}.jsonl`;
+					fs.appendFileSync(
+						file,
+						`${JSON.stringify({ type: "message", message: { role: "toolResult", toolCallId: request.toolCallId, toolName: "ask", content: [{ type: "text", text: `User selected: ${value} (${askAnswers.length} answers)` }] } })}\n`,
+					);
+				}
+				return reply({ id: request.id, sessionId: params.sessionId, settlement: { kind: request.next ? "resolve_without_commit" : "commit" } });
+			}
 			if (params.operation === "turn.steer") {
 				const text = String(params.input?.text ?? "");
+				// "host ask <json>" stands for the TUI showing those ask requests (what ask.requests.list lists).
+				if (text.startsWith("host ask ")) {
+					remoteAsks.set(params.sessionId, JSON.parse(text.slice("host ask ".length)));
+					return reply({ accepted: true });
+				}
+				// "terminal tool" stands for a bash call of the TUI turn that waits on the permission channel; "expire" lets
+				// a waiting channel request time out.
+				if (text === "terminal tool") {
+					const dir = channelOn(params.sessionId);
+					const toolCall = { toolCallId: "tt1", title: "rm -f x", kind: "execute", status: "pending", rawInput: { command: "rm -f x" } };
+					update(params.sessionId, { sessionUpdate: "tool_call", ...toolCall });
+					if (dir)
+						void channelApproval(params.sessionId, dir, toolCall).then(optionId =>
+							update(params.sessionId, { sessionUpdate: "tool_call_update", toolCallId: "tt1", status: optionId === "allow_once" ? "completed" : "failed" }),
+						);
+					return reply({ accepted: true });
+				}
+				if (text === "expire") {
+					expiring.get(params.sessionId)?.();
+					return reply({ accepted: true });
+				}
 				// "terminal turn" stands for a turn typed in the TUI: gjc reports it working, but no ACP prompt owns it.
 				if (text === "terminal turn") {
 					terminalTurns.add(params.sessionId);
 					update(params.sessionId, { sessionUpdate: "session_info_update", _meta: { gjcPhase: "working", running: true } });
+					return reply({ accepted: true });
+				}
+				// "terminal step" stands for the TUI turn's next step boundary: gjc hands a queued prompt to the model, which
+				// leaves the queue; the prompt still settles only with the turn.
+				if (text === "terminal step") {
+					const waiting = queuedPrompts.get(params.sessionId);
+					if (waiting) {
+						waiting.taken = true;
+						steers.set(params.sessionId, (steers.get(params.sessionId) ?? []).filter(s => s.id !== waiting.steerId));
+					}
+					update(params.sessionId, { sessionUpdate: "tool_call_update", toolCallId: "terminal-tool", status: "completed" });
+					return reply({ accepted: true });
+				}
+				// "terminal esc" stands for the TUI's Esc on a run that carries the phone's prompt. Seen 2026-11-08 on pve3
+				// (gjc 0.19.3): the run stopped and the host went idle, but the ACP prompt was never answered and gjc reported
+				// working on.
+				// "terminal esc, orphaned" also leaves the prompt out of gjc's sight (see `orphan`).
+				if (text === "terminal esc" || text === "terminal esc, orphaned") {
+					terminalTurns.delete(params.sessionId);
+					const waiting = queuedPrompts.get(params.sessionId);
+					if (waiting) {
+						waiting.taken = true;
+						waiting.orphan = text.endsWith("orphaned");
+						steers.set(params.sessionId, (steers.get(params.sessionId) ?? []).filter(s => s.id !== waiting.steerId));
+					}
+					return reply({ accepted: true });
+				}
+				if (text === "fail next load") {
+					failNextLoad.add(params.sessionId);
+					return reply({ accepted: true });
+				}
+				// "host compacting" / "host compacted": gjc's auto-compaction, which `isStreaming` does not cover.
+				if (text === "host compacting" || text === "host compacted") {
+					const phase = text === "host compacting" ? "compacting" : "idle";
+					update(params.sessionId, { sessionUpdate: "session_info_update", _meta: { gjcPhase: phase, running: phase !== "idle" } });
 					return reply({ accepted: true });
 				}
 				// "terminal done" ends that TUI turn.
@@ -260,6 +553,11 @@ async function handle(msg: any) {
 				}
 				// "taken" stands for a steer the model consumed at its next step: it never stays queued.
 				if (text !== "taken") steers.set(params.sessionId, [...(steers.get(params.sessionId) ?? []), { id: `steer:${nextSteer++}`, text, mode: "steer", label: "Steer" }]);
+				return reply({ accepted: true });
+			}
+			if (params.operation === "turn.follow_up") {
+				const text = String(params.input?.text ?? "");
+				steers.set(params.sessionId, [...(steers.get(params.sessionId) ?? []), { id: `followUp:${nextSteer++}`, text, mode: "followUp", label: "Follow-up" }]);
 				return reply({ accepted: true });
 			}
 			if (params.operation === "queue.message.remove") {

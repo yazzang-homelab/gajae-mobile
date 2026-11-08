@@ -624,6 +624,288 @@ describe("sessions over the bridge", () => {
 		expect(texts).toEqual(["이 사진 봐"]);
 	});
 
+	describe("a phone prompt queued behind a TUI turn", () => {
+		const photo = { type: "image", mimeType: "image/png", data: "iVBORw0KGgo=" };
+		const startTerminalTurn = async () => {
+			const bridge = await useBridge();
+			const { client } = await bridge.pairedClient();
+			const sid = (await client.request("session.new", {})).sessionId;
+			await client.request("sdk.control", { sessionId: sid, op: "turn.steer", input: { text: "terminal turn" } });
+			await client.waitFor(e => e.ev === "session.status" && e.p.sessionId === sid && e.p.running);
+			const users = () =>
+				client.events
+					.filter(e => e.ev === "session.update" && e.p.sessionId === sid && e.p.update.sessionUpdate === "user_message_chunk")
+					.map(e => e.p.update.content.type);
+			return { client, sid, users };
+		};
+
+		// Measured 2026-11-07 on pve3 (gjc 0.19.3): gjc echoed the photo+text at once, kept it queued as a steer for
+		// 25s until the TUI turn's tool ended, and announced no hand-over; the phone drew it mid-turn while also
+		// listing it as waiting.
+		const file = { type: "resource_link", uri: "file:///tmp/gjcm/a.txt", name: "a.txt", mimeType: "text/plain", size: 3 };
+		// steerAhead: a steer typed in the TUI just before, so two new queue entries leave only the listed text to tell
+		// them apart.
+		const cases: { name: string; prompt: unknown[]; listed: string; echoed: string[]; followUpAhead?: boolean; steerAhead?: boolean }[] = [
+			{ name: "text and photo", prompt: [{ type: "text", text: "이 사진 봐" }, photo], listed: "이 사진 봐", echoed: ["text", "image"] },
+			// gjc lists a message without text as "[Image]".
+			{ name: "photo only", prompt: [photo], listed: "[Image]", echoed: ["image"], steerAhead: true },
+			// gjc renders file links into the listed text and does not echo them.
+			{ name: "file and photo", prompt: [{ type: "text", text: "파일" }, file, photo], listed: "파일\n[Resource: a.txt]", echoed: ["text", "image"], steerAhead: true },
+			// gjc queues it as a follow-up when one already waits ahead of it.
+			{ name: "behind a follow-up", prompt: [{ type: "text", text: "뒤에 줄 선 사진" }, photo], listed: "뒤에 줄 선 사진", echoed: ["text", "image"], followUpAhead: true },
+		];
+		for (const c of cases)
+			test(`shows its message only once gjc hands it to the model, not while it waits in the queue: ${c.name}`, async () => {
+				const { client, sid, users } = await startTerminalTurn();
+				if (c.followUpAhead) await client.request("sdk.control", { sessionId: sid, op: "turn.follow_up", input: { text: "먼저 온 후속" } });
+				if (c.steerAhead) await client.request("sdk.control", { sessionId: sid, op: "turn.steer", input: { text: "터미널 지시" } });
+				await client.request("session.prompt", { sessionId: sid, prompt: c.prompt });
+				const waiting = await client.waitFor(
+					e => e.ev === "session.status" && e.p.sessionId === sid && e.p.queued.some((m: any) => m.text.startsWith(c.listed)),
+					3000,
+				);
+				expect(waiting.p.running).toBe(true);
+				await Bun.sleep(2000); // past the grace for a message never listed, and more queue reads: still waiting
+				expect(users()).toEqual([]);
+				const snap = await client.request("session.open", { sessionId: sid, afterSeq: 0 });
+				expect(snap.updates.filter((u: any) => u.update.sessionUpdate === "user_message_chunk")).toEqual([]);
+
+				// Right after a once-a-second read, so the next one is ~1s away: the tool end that hands the prompt over
+				// triggers a read of its own.
+				const ticks = client.events.length;
+				await client.waitFor(e => e.ev === "session.status" && e.p.sessionId === sid && client.events.indexOf(e) >= ticks, 3000);
+				await client.request("sdk.control", { sessionId: sid, op: "turn.steer", input: { text: "terminal step" } });
+				const shown = await client.waitFor(
+					e => e.ev === "session.update" && e.p.sessionId === sid && e.p.update.sessionUpdate === "user_message_chunk",
+					600,
+				);
+				const stepEnd = client.events.findIndex(e => e.ev === "session.update" && e.p.update.toolCallId === "terminal-tool");
+				expect(client.events.indexOf(shown)).toBeGreaterThan(stepEnd);
+				await client.request("sdk.control", { sessionId: sid, op: "turn.steer", input: { text: "terminal done" } });
+				expect((await client.waitFor(turnEnd(sid))).p.update.stopReason).toBe("end_turn");
+				expect(users()).toEqual(c.echoed);
+				const replay = await client.request("session.open", { sessionId: sid, afterSeq: 0 });
+				expect(replay.updates.filter((u: any) => u.update.sessionUpdate === "user_message_chunk")).toHaveLength(c.echoed.length);
+			});
+
+		test("is not shown when a queue read lands between gjc's echo and its queueing", async () => {
+			// The fake, like gjc, queues the prompt only after echoing it (here 400ms later, see fake-acp-agent.ts).
+			const { client, sid, users } = await startTerminalTurn();
+			const ticks = client.events.length;
+			await client.waitFor(e => e.ev === "session.status" && e.p.sessionId === sid && client.events.indexOf(e) >= ticks, 3000);
+			await Bun.sleep(800); // the next once-a-second read lands inside the 400ms gap
+			// A steer typed in the TUI meanwhile is the only new entry that read sees; it is not this prompt.
+			await client.request("sdk.control", { sessionId: sid, op: "turn.steer", input: { text: "터미널 지시" } });
+			await client.request("session.prompt", { sessionId: sid, prompt: [photo] });
+			await Bun.sleep(1200);
+			expect(users()).toEqual([]);
+			const later = client.events.length;
+			await client.waitFor(e => e.ev === "session.status" && e.p.sessionId === sid && client.events.indexOf(e) >= later, 3000);
+			await client.request("sdk.control", { sessionId: sid, op: "turn.steer", input: { text: "terminal step" } });
+			await client.waitFor(
+				e => e.ev === "session.update" && e.p.sessionId === sid && e.p.update.sessionUpdate === "user_message_chunk",
+				600,
+			);
+			await client.request("sdk.control", { sessionId: sid, op: "turn.steer", input: { text: "terminal done" } });
+			await client.waitFor(turnEnd(sid));
+			expect(users()).toEqual(["image"]);
+		});
+
+		test("shows its message when gjc took it before any queue read listed it", async () => {
+			const { client, sid, users } = await startTerminalTurn();
+			await client.request("session.prompt", { sessionId: sid, prompt: [{ type: "text", text: "즉시 받음" }, photo] });
+			await client.waitFor(
+				e => e.ev === "session.update" && e.p.sessionId === sid && e.p.update.sessionUpdate === "user_message_chunk",
+				4000,
+			);
+			await Bun.sleep(50);
+			expect(users()).toEqual(["text", "image"]);
+			await client.request("sdk.control", { sessionId: sid, op: "turn.steer", input: { text: "terminal done" } });
+			await client.waitFor(turnEnd(sid));
+			expect(users()).toEqual(["text", "image"]);
+		});
+
+		test("stays queued, photo included, when the phone's stop is refused instead of letting gjc purge it", async () => {
+			// Measured 2026-11-08 on gjc 0.19.3: session/cancel left the TUI turn running and purged this prompt.
+			const { client, sid, users } = await startTerminalTurn();
+			await client.request("session.prompt", { sessionId: sid, prompt: [photo, { type: "text", text: "멈추려던 사진" }] });
+			await client.waitFor(e => e.ev === "session.status" && e.p.sessionId === sid && e.p.queued.length > 0, 3000);
+			const started = Date.now();
+			const refused = await client.request("session.cancel", { sessionId: sid }).catch((e: any) => e);
+			expect(refused.code).toBe(-32004);
+			expect(refused.data).toEqual({ code: "host_turn" });
+			expect(refused.message).toContain("터미널에서 Esc");
+			expect(Date.now() - started).toBeLessThan(1000);
+			await Bun.sleep(1700); // past the 1.5s a purged prompt takes to fail
+			expect(client.events.some(turnEnd(sid))).toBe(false);
+			const queued = (await client.request("sdk.query", { sessionId: sid, op: "queue.messages.list" })).items.map((m: any) => m.text);
+			expect(queued).toEqual(["멈추려던 사진"]);
+			await client.request("sdk.control", { sessionId: sid, op: "turn.steer", input: { text: "terminal done" } });
+			expect((await client.waitFor(turnEnd(sid))).p.update.stopReason).toBe("end_turn");
+			expect(users()).toEqual(["image", "text"]);
+		});
+	});
+
+	describe("the phone's stop on a turn only the terminal can stop", () => {
+		const photo = { type: "image", mimeType: "image/png", data: "iVBORw0KGgo=" };
+		const terminalTurn = async (env: Record<string, string> = {}) => {
+			const bridge = await useBridge(env);
+			const { client } = await bridge.pairedClient();
+			const sid = (await client.request("session.new", {})).sessionId;
+			await client.request("sdk.control", { sessionId: sid, op: "turn.steer", input: { text: "terminal turn" } });
+			await client.waitFor(e => e.ev === "session.status" && e.p.sessionId === sid && e.p.running);
+			return { client, sid };
+		};
+		/** A phone prompt the TUI turn took, then the terminal's Esc: the host is idle but gjc never answers the prompt. */
+		const stuckPhoneTurn = async (env: Record<string, string> = {}) => {
+			const { client, sid } = await terminalTurn(env);
+			await client.request("session.prompt", { sessionId: sid, prompt: [photo, { type: "text", text: "이어진 사진" }] });
+			await client.waitFor(e => e.ev === "session.status" && e.p.sessionId === sid && e.p.queued.length > 0, 3000);
+			await client.request("sdk.control", { sessionId: sid, op: "turn.steer", input: { text: "terminal step" } });
+			await client.request("sdk.control", { sessionId: sid, op: "turn.steer", input: { text: "terminal esc" } });
+			return { client, sid };
+		};
+		const stillStuck = async (client: BridgeClient, sid: string) =>
+			((await client.request("session.prompt", { sessionId: sid, prompt: [{ type: "text", text: "다음" }] }).catch((e: any) => e)) as any).code === -32003;
+
+		test("is refused at once on a turn typed in the TUI", async () => {
+			const { client, sid } = await terminalTurn();
+			const refused = await client.request("session.cancel", { sessionId: sid }).catch((e: any) => e);
+			expect(refused.code).toBe(-32004);
+			expect(refused.data).toEqual({ code: "host_turn" });
+			expect(refused.message).toBe("터미널에서 시작한 턴은 앱에서 멈출 수 없습니다. 터미널에서 Esc로 멈추세요.");
+			await client.request("sdk.control", { sessionId: sid, op: "turn.steer", input: { text: "terminal done" } });
+			await client.waitFor(e => e.ev === "session.status" && e.p.sessionId === sid && !e.p.running, 3000);
+			// Once the terminal is done, the stop is the plain one again (nothing to stop, nothing refused).
+			expect(await client.request("session.cancel", { sessionId: sid })).toEqual({ ok: true });
+		});
+
+		test("is refused on the phone's prompt the TUI turn took while that turn still runs", async () => {
+			const { client, sid } = await terminalTurn();
+			await client.request("session.prompt", { sessionId: sid, prompt: [photo, { type: "text", text: "받은 사진" }] });
+			await client.waitFor(e => e.ev === "session.status" && e.p.sessionId === sid && e.p.queued.length > 0, 3000);
+			await client.request("sdk.control", { sessionId: sid, op: "turn.steer", input: { text: "terminal step" } });
+			const refused = await client.request("session.cancel", { sessionId: sid }).catch((e: any) => e);
+			expect(refused.code).toBe(-32004);
+			expect(refused.message).toBe("보낸 메시지는 터미널에서 시작한 턴에 이어져 있어 앱에서 멈출 수 없습니다. 터미널에서 Esc로 멈추세요.");
+			await client.request("sdk.control", { sessionId: sid, op: "turn.steer", input: { text: "terminal done" } });
+			expect((await client.waitFor(turnEnd(sid))).p.update.stopReason).toBe("end_turn");
+		});
+
+		test("releases a phone turn gjc ACP never ends once the terminal stopped it, and the chat goes on", async () => {
+			const { client, sid } = await stuckPhoneTurn();
+			expect(await stillStuck(client, sid)).toBe(true);
+			expect(await client.request("session.cancel", { sessionId: sid })).toEqual({ ok: true });
+			const end = client.events.find(turnEnd(sid));
+			expect(end?.p.update.stopReason).toBe("cancelled");
+			await client.waitFor(e => e.ev === "session.status" && e.p.sessionId === sid && !e.p.running, 3000);
+			await client.request("session.prompt", { sessionId: sid, prompt: [{ type: "text", text: "다시 됐나" }] });
+			const next = await client.waitFor(e => turnEnd(sid)(e) && e !== end, 3000);
+			expect(next.p.update.stopReason).toBe("end_turn");
+		});
+
+		test("releases such a turn by itself once the host stays idle with nothing new", async () => {
+			const { client, sid } = await stuckPhoneTurn({ GJCM_TEST_STUCK_TURN_MS: "200" });
+			const end = await client.waitFor(turnEnd(sid), 6000);
+			expect(end.p.update.stopReason).toBe("cancelled");
+			// Sent the moment the phone sees the turn end: it waits for the session to be loaded again.
+			await client.request("session.prompt", { sessionId: sid, prompt: [{ type: "text", text: "다시 됐나" }] });
+			expect((await client.waitFor(e => turnEnd(sid)(e) && e !== end, 3000)).p.update.stopReason).toBe("end_turn");
+		}, 15_000);
+
+		test("ends a released turn itself when gjc's close leaves it unanswered, and a late answer ends nothing", async () => {
+			const { client, sid } = await terminalTurn();
+			await client.request("session.prompt", { sessionId: sid, prompt: [photo, { type: "text", text: "잊힌 사진" }] });
+			await client.request("sdk.control", { sessionId: sid, op: "turn.steer", input: { text: "terminal step" } });
+			await client.request("sdk.control", { sessionId: sid, op: "turn.steer", input: { text: "terminal esc, orphaned" } });
+			const started = Date.now();
+			expect(await client.request("session.cancel", { sessionId: sid })).toEqual({ ok: true });
+			expect(Date.now() - started).toBeGreaterThan(4000); // waited for gjc's answer first
+			const ends = () => client.events.filter(turnEnd(sid));
+			expect(ends().map(e => e.p.update.stopReason)).toEqual(["cancelled"]);
+			// gjc answers the old prompt after all: the turn already ended once.
+			await client.request("sdk.control", { sessionId: sid, op: "turn.steer", input: { text: "terminal done" } });
+			await Bun.sleep(300);
+			expect(ends()).toHaveLength(1);
+			await client.request("session.prompt", { sessionId: sid, prompt: [{ type: "text", text: "다시 됐나" }] });
+			await client.waitFor(e => turnEnd(sid)(e) && ends().length === 2, 3000);
+			expect(ends()[1]!.p.update.stopReason).toBe("end_turn");
+		}, 15_000);
+
+		test("does not release a turn by itself while the host compacts, which isStreaming does not cover", async () => {
+			const { client, sid } = await stuckPhoneTurn({ GJCM_TEST_STUCK_TURN_MS: "200" });
+			await client.request("sdk.control", { sessionId: sid, op: "turn.steer", input: { text: "host compacting" } });
+			await Bun.sleep(3500);
+			expect(client.events.some(turnEnd(sid))).toBe(false);
+			await client.request("sdk.control", { sessionId: sid, op: "turn.steer", input: { text: "host compacted" } });
+			expect((await client.waitFor(turnEnd(sid), 6000)).p.update.stopReason).toBe("cancelled");
+		}, 15_000);
+
+		test("stops as before in a session gjc ACP hosts itself: no terminal to point at", async () => {
+			const { client, sid } = await terminalTurn({ FAKE_SURFACE: "sdk" });
+			expect(await client.request("session.cancel", { sessionId: sid })).toEqual({ ok: true });
+		});
+
+		test("still keeps a waiting phone prompt when the host cannot say what it is, and stops anything else as before", async () => {
+			const { client, sid } = await terminalTurn({ FAKE_SURFACE: "none" });
+			expect(await client.request("session.cancel", { sessionId: sid })).toEqual({ ok: true });
+			await client.request("session.prompt", { sessionId: sid, prompt: [photo, { type: "text", text: "모르는 호스트" }] });
+			await client.waitFor(e => e.ev === "session.status" && e.p.sessionId === sid && e.p.queued.length > 0, 3000);
+			const refused = await client.request("session.cancel", { sessionId: sid }).catch((e: any) => e);
+			expect(refused.code).toBe(-32004);
+			expect((await client.request("sdk.query", { sessionId: sid, op: "queue.messages.list" })).items.map((m: any) => m.text)).toEqual(["모르는 호스트"]);
+		});
+
+		test("a released turn stays ended when loading the session again fails; the next open loads it", async () => {
+			const { client, sid } = await stuckPhoneTurn();
+			await client.request("sdk.control", { sessionId: sid, op: "turn.steer", input: { text: "fail next load" } });
+			expect(await client.request("session.cancel", { sessionId: sid })).toEqual({ ok: true });
+			const end = client.events.find(turnEnd(sid));
+			expect(end?.p.update.stopReason).toBe("cancelled");
+			const gone = await client.request("session.prompt", { sessionId: sid, prompt: [{ type: "text", text: "다시 됐나" }] }).catch((e: any) => e);
+			expect(gone.code).toBe(-32002);
+			expect((await client.request("session.open", { sessionId: sid, afterSeq: 0 })).running).toBe(false);
+			await client.request("session.prompt", { sessionId: sid, prompt: [{ type: "text", text: "다시 됐나" }] });
+			expect((await client.waitFor(e => turnEnd(sid)(e) && e !== end, 3000)).p.update.stopReason).toBe("end_turn");
+		});
+
+		test("does not release a turn by itself in a session gjc ACP hosts itself, where closing it would close the host", async () => {
+			const { client, sid } = await stuckPhoneTurn({ GJCM_TEST_STUCK_TURN_MS: "200", FAKE_SURFACE: "sdk" });
+			await Bun.sleep(3500);
+			expect(client.events.some(turnEnd(sid))).toBe(false);
+		});
+
+		test("a chat opened while a turn is being released waits and shows it ended", async () => {
+			const { client, sid } = await terminalTurn();
+			await client.request("session.prompt", { sessionId: sid, prompt: [photo, { type: "text", text: "열면서 푸는 사진" }] });
+			await client.request("sdk.control", { sessionId: sid, op: "turn.steer", input: { text: "terminal step" } });
+			await client.request("sdk.control", { sessionId: sid, op: "turn.steer", input: { text: "terminal esc, orphaned" } });
+			const stopped = client.request("session.cancel", { sessionId: sid });
+			await Bun.sleep(300); // the release is waiting on gjc's answer (5s)
+			const snap = await client.request("session.open", { sessionId: sid, afterSeq: 0 });
+			expect(snap.running).toBe(false);
+			expect(await stopped).toEqual({ ok: true });
+		}, 15_000);
+
+		test("does not release a turn by itself while its host still works or anything new arrives", async () => {
+			const { client, sid } = await terminalTurn({ GJCM_TEST_STUCK_TURN_MS: "200" });
+			await client.request("session.prompt", { sessionId: sid, prompt: [photo, { type: "text", text: "기다리는 사진" }] });
+			await client.request("sdk.control", { sessionId: sid, op: "turn.steer", input: { text: "terminal step" } });
+			await Bun.sleep(3000); // the TUI turn runs on: several checks, all working
+			expect(client.events.some(turnEnd(sid))).toBe(false);
+			await client.request("sdk.control", { sessionId: sid, op: "turn.steer", input: { text: "terminal esc" } });
+			// Idle by the host's word, but updates keep coming (the session is not quiet): still not released.
+			const until = Date.now() + 3000;
+			while (Date.now() < until) {
+				await client.request("sdk.control", { sessionId: sid, op: "turn.steer", input: { text: "terminal step" } });
+				await Bun.sleep(100);
+			}
+			expect(client.events.some(turnEnd(sid))).toBe(false);
+			expect(await stillStuck(client, sid)).toBe(true);
+			await client.waitFor(turnEnd(sid), 6000);
+		}, 20_000);
+	});
+
 	test("session.interrupt also refuses a text-only phone prompt queued behind a TUI turn instead of failing it", async () => {
 		const bridge = await useBridge();
 		const { client } = await bridge.pairedClient();
@@ -727,6 +1009,124 @@ describe("sessions over the bridge", () => {
 		await client.request("sdk.control", { sessionId: sid, op: "turn.steer", input: { text: "terminal done" } });
 		const failed = await client.waitFor(e => e.ev === "session.update" && e.p.update.toolCallId === ask.id && e.p.update.status === "failed", 3000);
 		expect(failed.p.update.content[0].content.text).toContain("턴이 끝났습니다");
+	});
+
+	describe("a TUI ask the session host lists (ask.requests.list, gajae-code#7611)", () => {
+		/** A session whose transcript shows `ask` pending in a TUI turn, with the requests the host lists for it. */
+		const hostAsk = async (env: Record<string, string>, requests: unknown[]) => {
+			const bridge = await useBridge(env);
+			const { client } = await bridge.pairedClient();
+			const sid = (await client.request("session.new", {})).sessionId;
+			const dir = path.join(bridge.home, "agent", "sessions", "v2-fake");
+			fs.mkdirSync(dir, { recursive: true });
+			const file = path.join(dir, `2026-10-26T00-00-00-000Z_${sid}.jsonl`);
+			const askId = "toolu_ask|fc_9";
+			const ask = { questions: [{ id: "ab", question: "A와 B 중 무엇?", options: [{ label: "A" }, { label: "B" }] }] };
+			fs.writeFileSync(
+				file,
+				`${JSON.stringify({ type: "session", version: 5, id: sid, cwd: "/tmp" })}\n${JSON.stringify({ type: "message", message: { role: "assistant", content: [{ type: "toolCall", id: askId, name: "ask", arguments: ask }] } })}\n`,
+			);
+			await client.request("sdk.control", { sessionId: sid, op: "turn.steer", input: { text: `host ask ${JSON.stringify(requests)}` } });
+			await client.request("sdk.control", { sessionId: sid, op: "turn.steer", input: { text: "terminal turn" } });
+			const askUpdate = (status: string) => (e: { ev: string; p: any }) =>
+				e.ev === "session.update" && e.p.sessionId === sid && e.p.update.toolCallId === askId && e.p.update.status === status;
+			return { bridge, client, sid, file, askId, askUpdate };
+		};
+		const selector = (id: string, extra: Record<string, unknown> = {}) => ({
+			id,
+			toolCallId: "toolu_ask|fc_9",
+			questionId: "qid",
+			sessionId: undefined as string | undefined,
+			question: "A와 B 중 무엇?",
+			options: ["A", "B", "Other (type your own)"],
+			interaction: "selector",
+			transitionCount: 1,
+			controls: [],
+			...extra,
+		});
+
+		test("becomes a permission card whose pick goes back as ask.answer and settles the ask row", async () => {
+			const { client, sid, askId, askUpdate } = await hostAsk({ FAKE_ASK_LIST: "q34" }, [selector("req-1", { recommendedIndex: 1 })]);
+			await client.waitFor(askUpdate("pending"), 3000);
+			const card = (await client.waitFor(e => e.ev === "permission.request" && e.p.sessionId === sid, 3000)).p;
+			// Like gjc's own ask-to-permission bridge: the free-text "Other" entry is left out, the recommended one marked.
+			expect(card.options).toEqual([
+				{ optionId: "option:0", name: "A", kind: "allow_once" },
+				{ optionId: "option:1", name: "B (추천)", kind: "allow_once" },
+			]);
+			expect(card.toolCall).toMatchObject({ toolCallId: askId, toolName: "ask", title: "A와 B 중 무엇?" });
+			expect((await client.request("permission.list", {})).requests.map((p: any) => p.requestId)).toEqual([card.requestId]);
+			// An ask is not a guarded tool: switching to "allow" must not pick an answer for the user.
+			await client.request("session.setPermissionMode", { sessionId: sid, mode: "allow" });
+			await Bun.sleep(1500);
+			expect(client.events.some(e => e.ev === "permission.resolved" && e.p.requestId === card.requestId)).toBe(false);
+
+			await client.request("permission.respond", { requestId: card.requestId, optionId: "option:0" });
+			await client.waitFor(e => e.ev === "permission.resolved" && e.p.requestId === card.requestId, 3000);
+			const answered = await client.waitFor(askUpdate("completed"), 4000);
+			expect(answered.p.update.content[0].content.text).toBe("User selected: A (1 answers)");
+			await Bun.sleep(1500);
+			expect(client.events.filter(e => e.ev === "permission.request")).toHaveLength(1);
+		}, 20_000);
+
+		test("a multi-select takes one toggle per card, then the enabled control", async () => {
+			const done = { id: "navigation_forward", label: "완료", enabled: true };
+			const second = selector("req-2", { multi: true, options: ["A", "B"], transitionCount: 0, selectedOptions: ["A"], controls: [done] });
+			const first = selector("req-1", { multi: true, options: ["A", "B"], transitionCount: 0, selectedOptions: [], controls: [{ ...done, enabled: false }], next: second });
+			const { client, sid, askUpdate } = await hostAsk({ FAKE_ASK_LIST: "q34" }, [first]);
+			const card1 = (await client.waitFor(e => e.ev === "permission.request" && e.p.sessionId === sid, 3000)).p;
+			expect(card1.options.map((o: any) => o.name)).toEqual(["[ ] A", "[ ] B"]);
+			await client.request("permission.respond", { requestId: card1.requestId, optionId: "option:0" });
+			const card2 = (await client.waitFor(e => e.ev === "permission.request" && e.p.requestId !== card1.requestId, 3000)).p;
+			expect(card2.options).toEqual([
+				{ optionId: "option:0", name: "[x] A", kind: "allow_once" },
+				{ optionId: "option:1", name: "[ ] B", kind: "allow_once" },
+				{ optionId: "control:navigation_forward", name: "완료", kind: "allow_once" },
+			]);
+			await client.request("permission.respond", { requestId: card2.requestId, optionId: "control:navigation_forward" });
+			const answered = await client.waitFor(askUpdate("completed"), 4000);
+			expect(answered.p.update.content[0].content.text).toBe("User selected: navigation_forward (2 answers)");
+		}, 20_000);
+
+		test("dismissing the card leaves the question to the terminal, and a terminal answer takes the card down", async () => {
+			const { client, sid, file, askId, askUpdate } = await hostAsk({ FAKE_ASK_LIST: "q34" }, [selector("req-1")]);
+			const card = (await client.waitFor(e => e.ev === "permission.request" && e.p.sessionId === sid, 3000)).p;
+			await client.request("permission.respond", { requestId: card.requestId });
+			await client.waitFor(e => e.ev === "permission.resolved" && e.p.requestId === card.requestId, 3000);
+			// Still listed by the host, but never shown again.
+			await Bun.sleep(2500);
+			expect(client.events.filter(e => e.ev === "permission.request")).toHaveLength(1);
+
+			// A terminal toggle gives the same question a new id: still left to the terminal.
+			await client.request("sdk.control", { sessionId: sid, op: "turn.steer", input: { text: `host ask ${JSON.stringify([selector("req-1b")])}` } });
+			await Bun.sleep(2500);
+			expect(client.events.filter(e => e.ev === "permission.request")).toHaveLength(1);
+			// The next question is shown; the terminal then answers the ask.
+			await client.request("sdk.control", { sessionId: sid, op: "turn.steer", input: { text: `host ask ${JSON.stringify([selector("req-2", { questionId: "q2" })])}` } });
+			const next = (await client.waitFor(e => e.ev === "permission.request" && e.p.requestId !== card.requestId, 3000)).p;
+			fs.appendFileSync(file, `${JSON.stringify({ type: "message", message: { role: "toolResult", toolCallId: askId, toolName: "ask", content: [{ type: "text", text: "User selected: B" }] } })}\n`);
+			await client.waitFor(askUpdate("completed"), 3000);
+			await client.waitFor(e => e.ev === "permission.resolved" && e.p.requestId === next.requestId, 3000);
+			expect(await client.request("permission.list", {})).toEqual({ requests: [] });
+		}, 20_000);
+
+		test("a host without it (gjc 0.19.3) keeps the read-only row and no card, asked once", async () => {
+			const { bridge, client, askUpdate } = await hostAsk({}, [selector("req-1")]);
+			await client.waitFor(askUpdate("pending"), 3000);
+			await Bun.sleep(2500);
+			expect(client.events.filter(e => e.ev === "permission.request")).toEqual([]);
+			expect(fs.readFileSync(path.join(bridge.home, "agent", "ask-list-calls"), "utf8")).toBe("x");
+		}, 20_000);
+
+		test("an answer that fails short of the question shows the card again", async () => {
+			const { client, sid, askUpdate } = await hostAsk({ FAKE_ASK_LIST: "q34" }, [selector("req-1", { failOnce: true })]);
+			const card = (await client.waitFor(e => e.ev === "permission.request" && e.p.sessionId === sid, 3000)).p;
+			await client.request("permission.respond", { requestId: card.requestId, optionId: "option:1" });
+			const again = (await client.waitFor(e => e.ev === "permission.request" && e.p.requestId !== card.requestId, 3000)).p;
+			await client.request("permission.respond", { requestId: again.requestId, optionId: "option:1" });
+			const answered = await client.waitFor(askUpdate("completed"), 4000);
+			expect(answered.p.update.content[0].content.text).toBe("User selected: B (1 answers)");
+		}, 20_000);
 	});
 
 	test("session.status carries gjc's queue while the session works, whoever queued the message", async () => {

@@ -18,6 +18,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
+      # test/tmux.test.ts skips without tmux.
+      - run: command -v tmux || (sudo apt-get update -q && sudo apt-get install -y -q tmux)
       - run: bun install --frozen-lockfile
       - run: bun x tsc --noEmit
       - run: bun test

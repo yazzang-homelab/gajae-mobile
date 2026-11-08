@@ -25,7 +25,11 @@ import type { HubClient, SessionHub } from "./hub";
 import type { BridgeState } from "./state";
 import type { UploadStore } from "./uploads";
 
+/** The largest frame either side takes (the apps' iOS `maximumMessageSize` is the same 32 MiB). */
 export const MAX_FRAME_BYTES = 32 * 1024 * 1024;
+/** Room for a sealed frame's counter and tag around its JSON. */
+const SEAL_OVERHEAD_BYTES = 64;
+const mib = (bytes: number) => `${(bytes / (1024 * 1024)).toFixed(1)}MiB`;
 /** RPCs slower than this are logged; a resume waits on gjc spawning a session host. */
 const SLOW_RPC_MS = 5_000;
 
@@ -70,10 +74,23 @@ export function startBridgeServer(options: BridgeServerOptions): Server<Conn> {
 	const log = options.log ?? (() => {});
 	const host = state.host();
 
-	const send = (ws: ServerWebSocket<Conn>, message: unknown) => {
+	/**
+	 * A phone drops the connection on a frame over its limit and dials again into the same frame (2026-11-08, pve1: 32
+	 * reconnects 0.55s apart). So nothing over it goes out: an event that big is skipped, and an answer that big becomes
+	 * a `response_too_large` error (see `onFrame`).
+	 */
+	const fitsFrame = (body: Buffer) => body.length <= MAX_FRAME_BYTES - SEAL_OVERHEAD_BYTES;
+	const sendBody = (ws: ServerWebSocket<Conn>, body: Buffer) => {
 		const conn = ws.data;
 		if (conn.phase !== "open" || !conn.cipher) return;
-		ws.sendBinary(conn.cipher.seal(Buffer.from(JSON.stringify(message))));
+		ws.sendBinary(conn.cipher.seal(body));
+	};
+	const send = (ws: ServerWebSocket<Conn>, message: { id?: number; e?: unknown; ev?: string; p?: unknown }) => {
+		const body = Buffer.from(JSON.stringify(message));
+		if (fitsFrame(body)) return sendBody(ws, body);
+		const sessionId = (message.p as { sessionId?: unknown } | undefined)?.sessionId;
+		const what = message.ev ? `event ${message.ev} session=${String(sessionId ?? "-")}` : `reply id=${message.id}`;
+		log(`skipped ${what}: ${body.length} bytes over the ${MAX_FRAME_BYTES}-byte frame limit`);
 	};
 
 	const fail = (ws: ServerWebSocket<Conn>, code: string, message: string) => {
@@ -229,7 +246,14 @@ export function startBridgeServer(options: BridgeServerOptions): Server<Conn> {
 		if (typeof id !== "number" || typeof m !== "string") return;
 		const started = performance.now();
 		try {
-			send(ws, { id, r: (await dispatch(ws, m, p)) ?? null });
+			const body = Buffer.from(JSON.stringify({ id, r: (await dispatch(ws, m, p)) ?? null }));
+			if (!fitsFrame(body))
+				throw new AcpError(-32030, `응답이 너무 커서(${mib(body.length)}) 폰으로 보낼 수 없습니다. 한도는 ${mib(MAX_FRAME_BYTES)}입니다.`, {
+					code: "response_too_large",
+					bytes: body.length,
+					limit: MAX_FRAME_BYTES,
+				});
+			sendBody(ws, body);
 			const ms = Math.round(performance.now() - started);
 			if (ms >= SLOW_RPC_MS) log(`slow rpc ${m} ${ms}ms`);
 		} catch (error: any) {
@@ -279,7 +303,11 @@ export function startBridgeServer(options: BridgeServerOptions): Server<Conn> {
 				}
 				void onFrame(ws, Buffer.from(raw));
 			},
-			close(ws) {
+			close(ws, code, reason) {
+				// Who closed tells a drop the app chose (it closes with 1000, e.g. on a frame over its limit) from a lost network
+				// (1006) or the bridge's own 44xx (#88).
+				// The reason comes from the peer, maybe before it proved its key: quoted so it cannot add a log line.
+				if (ws.data.deviceKey) log(`disconnected device=${ws.data.deviceKey.slice(0, 8)} code=${code}${reason ? ` reason=${JSON.stringify(reason)}` : ""}`);
 				clearTimeout(ws.data.timer);
 				ws.data.phase = "closed";
 				hub.detach(ws.data.id);
@@ -289,6 +317,6 @@ export function startBridgeServer(options: BridgeServerOptions): Server<Conn> {
 	});
 }
 
-function clientFor(ws: ServerWebSocket<Conn>, send: (ws: ServerWebSocket<Conn>, m: unknown) => void): HubClient {
+function clientFor(ws: ServerWebSocket<Conn>, send: (ws: ServerWebSocket<Conn>, m: { ev: string; p: unknown }) => void): HubClient {
 	return { id: ws.data.id, device: ws.data.deviceKey, deliver: (ev, p) => send(ws, { ev, p }) };
 }

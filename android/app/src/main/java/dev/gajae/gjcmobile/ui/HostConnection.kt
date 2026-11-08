@@ -1,5 +1,6 @@
 package dev.gajae.gjcmobile.ui
 
+import android.os.SystemClock
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
@@ -11,6 +12,7 @@ import dev.gajae.gjcmobile.core.DeviceIdentity
 import dev.gajae.gjcmobile.core.HostInfo
 import dev.gajae.gjcmobile.core.PairedHost
 import dev.gajae.gjcmobile.core.PermissionRequest
+import dev.gajae.gjcmobile.core.ReconnectBackoff
 import dev.gajae.gjcmobile.core.SessionSummary
 import dev.gajae.gjcmobile.widget.WidgetStore
 import kotlinx.coroutines.CoroutineScope
@@ -59,7 +61,7 @@ class HostConnection(
     private var client: BridgeClient? = null
     private var eventJob: Job? = null
     private var connectJob: Job? = null
-    private var retryDelayMs = 1_000L
+    private val backoff = ReconnectBackoff()
     private val alerts = ActivityAlerts()
     /** The widget may only record what this connection fully knows: the unfiltered list and every waiting ask. */
     private var listKnown = false
@@ -69,9 +71,9 @@ class HostConnection(
 
     val connectedClient: BridgeClient? get() = if (status == Status.Connected) client else null
 
-    fun ensureConnected() {
+    fun ensureConnected(afterMs: Long = 0) {
         if (status == Status.Connected || connectJob?.isActive == true) return
-        connectJob = scope.launch { connectLoop() }
+        connectJob = scope.launch { connectLoop(afterMs) }
     }
 
     fun disconnect() {
@@ -94,7 +96,8 @@ class HostConnection(
         attach(client, endpoint)
     }
 
-    private suspend fun connectLoop() {
+    private suspend fun connectLoop(afterMs: Long) {
+        if (afterMs > 0) delay(afterMs)
         while (scope.isActive) {
             status = Status.Connecting
             try {
@@ -115,8 +118,7 @@ class HostConnection(
                 if (e is kotlinx.coroutines.CancellationException) throw e
                 currentCoroutineContext().ensureActive()
                 status = Status.Failed(e.userMessage())
-                delay(retryDelayMs)
-                retryDelayMs = minOf(retryDelayMs * 2, 30_000)
+                delay(backoff.failedDial())
             }
         }
     }
@@ -127,7 +129,7 @@ class HostConnection(
         listKnown = false
         waitingKnown = false
         arrivedSinceAttach.clear()
-        retryDelayMs = 1_000
+        backoff.attached(SystemClock.elapsedRealtime())
         if (host.lastEndpoint != endpoint) {
             host = host.copy(lastEndpoint = endpoint)
             onHostChange(host)
@@ -179,7 +181,8 @@ class HostConnection(
                 listKnown = false
                 waitingKnown = false
                 status = Status.Failed(event.reason)
-                ensureConnected()
+                // A drop right after attaching waits before the next dial (see ReconnectBackoff).
+                ensureConnected(backoff.dropped(SystemClock.elapsedRealtime()))
             }
         }
     }

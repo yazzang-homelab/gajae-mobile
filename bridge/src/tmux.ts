@@ -2,9 +2,11 @@
  * Opens a phone-started session as a window of one dedicated tmux session (gm#58), so the terminal shows the
  * same TUI the phone drives. The window runs plain `gjc`, which starts a new session itself; the bridge learns its
  * id from the SDK endpoint that process publishes and attaches with ACP `session/load`, which reaches a live host
- * through the broker before any transcript exists (gjc registers the session with the broker before it writes the
- * endpoint; measured on 0.19.3 and 0.20.0). One gjc start instead of creating the session over ACP first and resuming
- * it in the window: bridge `session.new` measured 2026-11-09 in /root/tmp, pve3 22–27s → 14–15s, lab 8.3s → 5.3–7.4s.
+ * through the broker before any transcript exists (measured on 0.19.3 and 0.20.0). gjc writes the endpoint first and
+ * registers the session with the broker after it, without waiting (`session-runtime.ts`: `runtime.start()`, then
+ * `registerBroker()`); until then the load answers `not_found`, so the hub tries it again while the window lives. One
+ * gjc start instead of creating the session over ACP first and resuming it in the window: bridge `session.new`
+ * measured 2026-11-09 in /root/tmp, pve3 22–27s → 14–15s, lab 8.3s → 5.3–7.4s.
  *
  * The bridge never starts a tmux server: a server started from the bridge's systemd unit would live in the
  * bridge's cgroup and die with every bridge restart, taking the phone's sessions with it. Every tmux call carries
@@ -20,10 +22,18 @@ export interface TmuxOptions {
 	socket?: string;
 	/** How long gjc in the window may take to publish its SDK endpoint (measured 2026-11-09 in /root/tmp: lab 3.6–3.8s, pve3 10–11s, pve1 7.7–8.3s). */
 	readyTimeoutMs?: number;
+	/**
+	 * How long the hub tries `session/load` while gjc in the window registers its session with the broker, which waits on
+	 * the broker and its session index lock: a busy host may take seconds.
+	 */
+	attachTimeoutMs?: number;
 }
 
-/** Why a window did not become the session's host; the bridge passes it to the phone as -32021 `data.code`. */
-export type TmuxFailure = "tmux_failed" | "tmux_window_exited" | "tmux_ready_timeout";
+/**
+ * Why a window did not become the session's host; the bridge passes it to the phone as -32021 `data.code`.
+ * `tmux_attach_failed` is the hub's: the window's gjc published its endpoint, but `session/load` never attached.
+ */
+export type TmuxFailure = "tmux_failed" | "tmux_window_exited" | "tmux_ready_timeout" | "tmux_attach_failed";
 
 export class TmuxError extends Error {
 	constructor(
@@ -35,6 +45,7 @@ export class TmuxError extends Error {
 }
 
 const DEFAULT_READY_TIMEOUT_MS = 30_000;
+const DEFAULT_ATTACH_TIMEOUT_MS = 15_000;
 const POLL_MS = 200;
 /** tmux turns `.` and `:` in session names into `_`, so such a name would never be found again. */
 const SESSION_NAME = /^[A-Za-z0-9_-]+$/;
@@ -63,16 +74,21 @@ export function tuiCommand(acpCommand: string[]): string[] {
 	return argv;
 }
 
+const PROCFS = fs.existsSync("/proc/self/stat");
+
 function parentPid(pid: number): number | undefined {
 	try {
-		// /proc/<pid>/stat: "pid (comm) state ppid …"; comm may hold spaces and parentheses.
-		const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
-		return Number(stat.slice(stat.lastIndexOf(")") + 2).split(" ")[1]);
-	} catch {
+		if (PROCFS) {
+			// /proc/<pid>/stat: "pid (comm) state ppid …"; comm may hold spaces and parentheses.
+			const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+			return Number(stat.slice(stat.lastIndexOf(")") + 2).split(" ")[1]);
+		}
 		// No procfs (macOS): ask ps.
-		const ps = Bun.spawnSync(["ps", "-o", "ppid=", "-p", String(pid)]);
-		const parent = Number(ps.stdout.toString().trim());
+		const parent = Number(Bun.spawnSync(["ps", "-o", "ppid=", "-p", String(pid)]).stdout.toString().trim());
 		return Number.isInteger(parent) && parent > 0 ? parent : undefined;
+	} catch {
+		// The process is gone (or ps is missing).
+		return undefined;
 	}
 }
 
@@ -120,6 +136,10 @@ export class TmuxLauncher {
 		}
 	}
 
+	get attachTimeoutMs(): number {
+		return this.#options.attachTimeoutMs ?? DEFAULT_ATTACH_TIMEOUT_MS;
+	}
+
 	/** Why a new session cannot go to tmux now (no tmux, no server running), or undefined when it can. */
 	async unavailable(): Promise<string | undefined> {
 		const listed = await this.#run(["list-sessions", "-F", "#{session_name}"]);
@@ -129,24 +149,32 @@ export class TmuxLauncher {
 
 	/**
 	 * Starts gjc in a new window of the dedicated session, waits until that process publishes the SDK endpoint of the
-	 * session it started, and returns that session's id. Removes the window and throws a TmuxError when it does not.
+	 * session it started, and returns that session's id with the window's pane. Removes the window and throws a
+	 * TmuxError when it does not.
 	 */
-	async open(cwd: string): Promise<string> {
+	async open(cwd: string): Promise<{ sessionId: string; pane: string }> {
+		// An endpoint written before the window existed is another process's; the second covers coarse mtimes.
+		const since = Date.now() - 1000;
 		// Window creation runs one at a time, so two phones starting sessions together do not both create the
 		// tmux session; waiting for gjc does not hold the next phone up.
 		const created = this.#creating.then(() => this.#create(cwd));
 		this.#creating = created.catch(() => {});
 		const { panePid, pane } = await created;
 		try {
-			const sessionId = await this.#waitReady(cwd, panePid);
+			const sessionId = await this.#waitReady(cwd, panePid, since);
 			// Untagged, the window would not be found again: its tool approvals would reach no phone.
 			const tagged = await this.#run(["set-option", "-w", "-t", pane, SESSION_TAG, sessionId]);
 			if (tagged.code !== 0) throw new TmuxError("tmux_failed", `tmux 창에 세션 표시를 못 달았습니다: ${tagged.stderr || `exit ${tagged.code}`}`);
-			return sessionId;
+			return { sessionId, pane };
 		} catch (error) {
-			await this.#run(["kill-pane", "-t", pane]);
+			await this.close(pane);
 			throw error;
 		}
+	}
+
+	/** Removes a window `open` made (tmux sends its gjc SIGHUP). */
+	async close(pane: string): Promise<void> {
+		await this.#run(["kill-pane", "-t", pane]);
 	}
 
 	/**
@@ -196,10 +224,10 @@ export class TmuxLauncher {
 	}
 
 	/**
-	 * The id of the session gjc in the window started: the one whose SDK endpoint names that process. Endpoints other
-	 * processes left behind name a pid outside the window; each is read once.
+	 * The id of the session gjc in the window started: the one whose SDK endpoint names that process. Endpoints written
+	 * before the window are skipped; others name a pid outside the window (or a gone one), and each is read once.
 	 */
-	async #waitReady(cwd: string, panePid: number): Promise<string> {
+	async #waitReady(cwd: string, panePid: number, since: number): Promise<string> {
 		const { session } = this.#options;
 		const dir = path.join(cwd, ".gjc", "state", "sdk");
 		const timeoutMs = this.#options.readyTimeoutMs ?? DEFAULT_READY_TIMEOUT_MS;
@@ -207,12 +235,12 @@ export class TmuxLauncher {
 		const foreign = new Set<string>();
 		while (Date.now() < deadline) {
 			if (!alive(panePid)) throw new TmuxError("tmux_window_exited", `tmux 세션 ${session}의 새 창에서 gjc가 바로 끝났습니다`);
-			for (const sessionId of this.#endpointIds(dir)) {
+			for (const sessionId of this.#endpointIds(dir, since)) {
 				const pid = this.#endpointPid(path.join(dir, `${sessionId}.json`));
 				if (pid === undefined) continue;
 				const key = `${sessionId}\t${pid}`;
 				if (foreign.has(key)) continue;
-				if (descendsFrom(pid, panePid)) return sessionId;
+				if (alive(pid) && descendsFrom(pid, panePid)) return sessionId;
 				foreign.add(key);
 			}
 			await Bun.sleep(POLL_MS);
@@ -220,17 +248,23 @@ export class TmuxLauncher {
 		throw new TmuxError("tmux_ready_timeout", `tmux 세션 ${session}의 새 창에서 gjc가 ${Math.round(timeoutMs / 1000)}초 안에 준비되지 않았습니다`);
 	}
 
-	/** Session ids with an SDK endpoint file (`<id>.json`) in `dir`. */
-	#endpointIds(dir: string): string[] {
+	/** Session ids with an SDK endpoint file (`<id>.json`) in `dir` written at `since` or later. */
+	#endpointIds(dir: string, since: number): string[] {
+		let names: string[];
 		try {
-			return fs
-				.readdirSync(dir)
-				.filter(name => name.endsWith(".json"))
-				.map(name => name.slice(0, -".json".length))
-				.filter(id => SESSION_ID.test(id));
+			names = fs.readdirSync(dir);
 		} catch {
 			return [];
 		}
+		return names.flatMap(name => {
+			const id = name.endsWith(".json") ? name.slice(0, -".json".length) : "";
+			if (!SESSION_ID.test(id)) return [];
+			try {
+				return fs.statSync(path.join(dir, name)).mtimeMs >= since ? [id] : [];
+			} catch {
+				return [];
+			}
+		});
 	}
 
 	#endpointPid(file: string): number | undefined {

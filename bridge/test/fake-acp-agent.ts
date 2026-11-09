@@ -6,10 +6,13 @@ import fs from "node:fs";
 import path from "node:path";
 
 // Launched by the bridge's tmux path as the TUI (the tmux tests' agent command, which carries `--tui=<mode>`, without
-// `--mode=acp`): like gjc, start a new session and publish its SDK endpoint under <cwd>/.gjc/state/sdk with this
-// process's pid (and the agent dir it got), then stay up. `<id>.tui` marks the session as hosted by a TUI for the ACP
-// process below: like gjc's broker, it attaches a live host on session/load before any transcript exists.
-// `--tui=run` does that, `--tui=exit` quits at once, `--tui=silent` never publishes.
+// `--mode=acp`): like gjc, start a new session, publish its SDK endpoint under <cwd>/.gjc/state/sdk with this
+// process's pid (and the agent dir it got), and only then register the session with the broker, without waiting
+// (gjc 0.19.3/0.20.0 `session-runtime.ts`: `runtime.start()`, then `registerBroker()`). `<id>.tui` stands for that
+// registration for the ACP process below: like gjc's broker, it attaches a live host on session/load before any
+// transcript exists, and answers not_found until then. The registration goes with this process.
+// `--tui=run` registers 400ms after publishing, `--tui=late` publishes 800ms after starting, `--tui=unregistered`
+// never registers, `--tui=exit` quits at once, `--tui=silent` never publishes.
 const tuiMode = process.argv.find(arg => arg.startsWith("--tui="))?.slice("--tui=".length);
 if (tuiMode && !process.argv.includes("--mode=acp") && !process.argv.includes("sdk")) {
 	if (tuiMode === "exit") process.exit(1);
@@ -17,9 +20,20 @@ if (tuiMode && !process.argv.includes("--mode=acp") && !process.argv.includes("s
 		const dir = path.join(process.cwd(), ".gjc", "state", "sdk");
 		const sessionId = `tui-${process.pid}`;
 		const agentDir = process.env.GJC_CODING_AGENT_DIR;
-		fs.mkdirSync(dir, { recursive: true });
-		fs.writeFileSync(path.join(dir, `${sessionId}.tui`), "");
-		fs.writeFileSync(path.join(dir, `${sessionId}.json`), JSON.stringify({ version: 1, sessionId, pid: process.pid, agentDir }));
+		const registration = path.join(dir, `${sessionId}.tui`);
+		const publish = () => {
+			fs.mkdirSync(dir, { recursive: true });
+			fs.writeFileSync(path.join(dir, `${sessionId}.json`), JSON.stringify({ version: 1, sessionId, pid: process.pid, agentDir }));
+			if (tuiMode !== "unregistered") setTimeout(() => fs.writeFileSync(registration, ""), 400);
+		};
+		if (tuiMode === "late") setTimeout(publish, 800);
+		else publish();
+		const leave = () => {
+			fs.rmSync(registration, { force: true });
+			process.exit(0);
+		};
+		process.on("SIGHUP", leave);
+		process.on("SIGTERM", leave);
 	}
 	setInterval(() => {}, 60_000);
 	await new Promise(() => {});
@@ -209,11 +223,17 @@ async function handle(msg: any) {
 				return write({ jsonrpc: "2.0", id, error: { code: -32603, message: "Internal error: load failed" } });
 			if (params.sessionId === "broker-lost")
 				return write({ jsonrpc: "2.0", id, error: { code: -32603, message: "Internal error: SDK request outcome is uncertain after the frame was sent." } });
-			// Like gjc's broker, a session a live TUI hosts attaches before its first answer saved it.
-			if (!sessions.has(params.sessionId) && fs.existsSync(path.join(params.cwd, ".gjc", "state", "sdk", `${params.sessionId}.tui`)))
-				sessions.set(params.sessionId, []);
-			const history = sessions.get(params.sessionId);
-			if (!history) return write({ jsonrpc: "2.0", id, error: { code: -32002, message: "not found" } });
+			// Like gjc's broker, a session a live TUI registered attaches before its first answer saved it; until it
+			// registered, or once it is gone, such a session is saved nowhere.
+			const registered = fs.existsSync(path.join(params.cwd, ".gjc", "state", "sdk", `${params.sessionId}.tui`));
+			const saved = sessions.get(params.sessionId);
+			const unsaved = !saved || (params.sessionId.startsWith("tui-") && saved.length === 0);
+			// What gjc answers (acpRequestFailure): -32603 with the adapter's code in data.
+			const missing = `Saved ACP session does not exist: ${params.sessionId}`;
+			if (unsaved && !registered)
+				return write({ jsonrpc: "2.0", id, error: { code: -32603, message: `Internal error: ${missing}`, data: { code: "not_found", details: missing } } });
+			const history = saved ?? [];
+			sessions.set(params.sessionId, history);
 			staleAttachments.delete(params.sessionId);
 			attached.add(params.sessionId);
 			permissionModes.delete(params.sessionId);

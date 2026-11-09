@@ -153,15 +153,17 @@ export class TmuxLauncher {
 	 * TmuxError when it does not.
 	 */
 	async open(cwd: string): Promise<{ sessionId: string; pane: string }> {
-		// An endpoint written before the window existed is another process's; the second covers coarse mtimes.
-		const since = Date.now() - 1000;
+		const dir = path.join(cwd, ".gjc", "state", "sdk");
+		// Endpoints already there are other processes'. One may name a pid that comes around again as the window's gjc;
+		// gjc writes each endpoint to a new file (temp file, then rename), so the window's has an inode not seen here.
+		const existing = this.#endpoints(dir);
 		// Window creation runs one at a time, so two phones starting sessions together do not both create the
 		// tmux session; waiting for gjc does not hold the next phone up.
 		const created = this.#creating.then(() => this.#create(cwd));
 		this.#creating = created.catch(() => {});
 		const { panePid, pane } = await created;
 		try {
-			const sessionId = await this.#waitReady(cwd, panePid, since);
+			const sessionId = await this.#waitReady(dir, panePid, existing);
 			// Untagged, the window would not be found again: its tool approvals would reach no phone.
 			const tagged = await this.#run(["set-option", "-w", "-t", pane, SESSION_TAG, sessionId]);
 			if (tagged.code !== 0) throw new TmuxError("tmux_failed", `tmux 창에 세션 표시를 못 달았습니다: ${tagged.stderr || `exit ${tagged.code}`}`);
@@ -224,18 +226,18 @@ export class TmuxLauncher {
 	}
 
 	/**
-	 * The id of the session gjc in the window started: the one whose SDK endpoint names that process. Endpoints written
-	 * before the window are skipped; others name a pid outside the window (or a gone one), and each is read once.
+	 * The id of the session gjc in the window started: the one whose SDK endpoint names that process. Endpoints in
+	 * `existing` are skipped; others name a pid outside the window (or a gone one), and each is read once.
 	 */
-	async #waitReady(cwd: string, panePid: number, since: number): Promise<string> {
+	async #waitReady(dir: string, panePid: number, existing: Map<string, bigint>): Promise<string> {
 		const { session } = this.#options;
-		const dir = path.join(cwd, ".gjc", "state", "sdk");
 		const timeoutMs = this.#options.readyTimeoutMs ?? DEFAULT_READY_TIMEOUT_MS;
 		const deadline = Date.now() + timeoutMs;
 		const foreign = new Set<string>();
 		while (Date.now() < deadline) {
 			if (!alive(panePid)) throw new TmuxError("tmux_window_exited", `tmux 세션 ${session}의 새 창에서 gjc가 바로 끝났습니다`);
-			for (const sessionId of this.#endpointIds(dir, since)) {
+			for (const [sessionId, inode] of this.#endpoints(dir)) {
+				if (existing.get(sessionId) === inode) continue;
 				const pid = this.#endpointPid(path.join(dir, `${sessionId}.json`));
 				if (pid === undefined) continue;
 				const key = `${sessionId}\t${pid}`;
@@ -248,23 +250,22 @@ export class TmuxLauncher {
 		throw new TmuxError("tmux_ready_timeout", `tmux 세션 ${session}의 새 창에서 gjc가 ${Math.round(timeoutMs / 1000)}초 안에 준비되지 않았습니다`);
 	}
 
-	/** Session ids with an SDK endpoint file (`<id>.json`) in `dir` written at `since` or later. */
-	#endpointIds(dir: string, since: number): string[] {
+	/** The SDK endpoint files (`<id>.json`) in `dir`: session id → inode. */
+	#endpoints(dir: string): Map<string, bigint> {
+		const endpoints = new Map<string, bigint>();
 		let names: string[];
 		try {
 			names = fs.readdirSync(dir);
 		} catch {
-			return [];
+			return endpoints;
 		}
-		return names.flatMap(name => {
+		for (const name of names) {
 			const id = name.endsWith(".json") ? name.slice(0, -".json".length) : "";
-			if (!SESSION_ID.test(id)) return [];
-			try {
-				return fs.statSync(path.join(dir, name)).mtimeMs >= since ? [id] : [];
-			} catch {
-				return [];
-			}
-		});
+			if (!SESSION_ID.test(id)) continue;
+			const stat = fs.statSync(path.join(dir, name), { bigint: true, throwIfNoEntry: false });
+			if (stat) endpoints.set(id, stat.ino);
+		}
+		return endpoints;
 	}
 
 	#endpointPid(file: string): number | undefined {

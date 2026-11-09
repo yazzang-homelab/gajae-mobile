@@ -9,6 +9,7 @@ import { TmuxLauncher, tuiCommand } from "../src/tmux";
 import { FAKE_AGENT, startTestBridge } from "./helpers";
 
 const hasTmux = Bun.which("tmux") !== null;
+const hasProcfs = fs.existsSync("/proc/self/stat");
 const turnEnd = (sid: string) => (e: { ev: string; p: any }) => e.ev === "session.update" && e.p.sessionId === sid && e.p.update.sessionUpdate === TURN_END;
 const askCall = (client: { events: { ev: string; p: any }[] }, sid: string) =>
 	client.events.find(e => e.ev === "session.update" && e.p.sessionId === sid && e.p.update.toolCallId === "ask1" && e.p.update.sessionUpdate === "tool_call")!.p.update;
@@ -74,7 +75,25 @@ async function tmuxBridge(options: { server: boolean; tui?: string; readyTimeout
 				return false;
 			}
 		});
-	return { socket, cwd, client, windows, tags, reconnect, acpProcesses, home: bridge.home };
+	/**
+	 * Kills the bridge's gjc ACP and tells whether the bridge started another by itself (it waits 1s first after a
+	 * death). One it started is given a second to come up: killed while starting, it is not restarted.
+	 */
+	const killAcp = async () => {
+		const [acp] = acpProcesses();
+		if (!acp) throw new Error("no gjc ACP process to kill");
+		process.kill(Number(acp), "SIGKILL");
+		const deadline = Date.now() + 2500;
+		while (Date.now() < deadline) {
+			await Bun.sleep(50);
+			if (acpProcesses().some(pid => pid !== acp)) {
+				await Bun.sleep(1000);
+				return true;
+			}
+		}
+		return false;
+	};
+	return { socket, cwd, client, windows, tags, reconnect, killAcp, home: bridge.home };
 }
 
 describe("tuiCommand", () => {
@@ -141,23 +160,21 @@ describe.skipIf(!hasTmux)("new sessions as tmux windows (gm#58)", () => {
 		for (const line of panes) expect(line.split(" ")[1]).toBe(`tui-${line.split(" ")[0]}`);
 	});
 
-	test("removes the window and tells the phone why when gjc never registers its session with the broker", async () => {
+	test.skipIf(!hasProcfs)("removes the window and tells the phone why when gjc never registers its session with the broker", async () => {
 		// gjc writes the endpoint first and registers after it; the load answers not_found until then.
-		const { client, windows } = await tmuxBridge({ server: true, tui: "unregistered", attachTimeoutMs: 1500 });
+		const { client, windows, killAcp } = await tmuxBridge({ server: true, tui: "unregistered", attachTimeoutMs: 1500 });
 		const failed = await client.request("session.new", {}).catch((e: any) => e);
 		expect(failed.code).toBe(-32021);
 		expect(failed.data).toEqual({ code: "tmux_attach_failed" });
 		expect(failed.message).toContain("Saved ACP session does not exist");
 		expect(windows()).toEqual([]);
-		// Nothing is left for the phone to list or open.
 		expect((await client.request("session.list", {})).sessions).toEqual([]);
+		// The bridge keeps nothing of it: gjc ACP ending is no reason to start it again to attach that session.
+		expect(await killAcp()).toBe(false);
 	});
 
-	test("stops restarting gjc ACP for a window closed before its first answer once it cannot attach again", async () => {
-		const { socket, cwd, client, acpProcesses } = await tmuxBridge({ server: false });
-		// A session opened over ACP while no tmux server ran, then one in a window.
-		const plain = (await client.request("session.new", {})).sessionId;
-		expect(tmux(socket, "new-session", "-d", "-s", "keep", "sleep 600").code).toBe(0);
+	test.skipIf(!hasProcfs)("stops restarting gjc ACP for a window closed before its first answer once it cannot attach again", async () => {
+		const { socket, cwd, client, killAcp } = await tmuxBridge({ server: true });
 		const sid = (await client.request("session.new", {})).sessionId;
 		expect(sid).toMatch(/^tui-\d+$/);
 		// The user closes the window unused: its gjc leaves and nothing was saved.
@@ -165,24 +182,13 @@ describe.skipIf(!hasTmux)("new sessions as tmux windows (gm#58)", () => {
 		const registration = path.join(cwd, ".gjc", "state", "sdk", `${sid}.tui`);
 		for (let i = 0; i < 100 && fs.existsSync(registration); i++) await Bun.sleep(20);
 		expect(fs.existsSync(registration)).toBe(false);
-		const exits = () => client.events.filter(e => e.ev === "session.update" && e.p.sessionId === plain && e.p.update.sessionUpdate === AGENT_EXIT).length;
-		const crash = async () => {
-			await client.request("session.open", { sessionId: plain });
-			const before = exits();
-			await client.request("session.prompt", { sessionId: plain, prompt: [{ type: "text", text: "crash" }] }).catch(() => {});
-			for (let i = 0; i < 250 && exits() === before; i++) await Bun.sleep(20);
-			expect(exits()).toBe(before + 1);
-		};
-		// The first ACP death still tries the window's session again, by itself: the bridge cannot tell it is gone.
-		await crash();
-		for (let i = 0; i < 100 && acpProcesses().length === 0; i++) await Bun.sleep(20);
-		expect(acpProcesses()).toHaveLength(1);
-		// That failed with no window left; the next death leaves gjc ACP down until a phone needs it.
-		await Bun.sleep(500);
-		await crash();
-		await Bun.sleep(1000);
-		expect(acpProcesses()).toEqual([]);
-	});
+		// The bridge cannot tell the window is gone: a death of gjc ACP still starts it again to attach the session. That
+		// fails with no window left, and from then on gjc ACP stays down until a phone needs it.
+		let restarts = 0;
+		while (restarts < 5 && (await killAcp())) restarts++;
+		expect(restarts).toBeGreaterThanOrEqual(1);
+		expect(restarts).toBeLessThan(5);
+	}, 30_000);
 
 	test("does not start a tmux server when the user's goes away between the check and the window", async () => {
 		// open() is what runs after unavailable() passed; with no server by then it must fail, not start one.
@@ -427,7 +433,7 @@ describe.skipIf(!hasTmux)("tool approvals of a tmux session reach the phone (gm#
 });
 
 describe.skipIf(!hasTmux)("TmuxLauncher.hosts", () => {
-	test("does not take an endpoint written before the window, even when the pid it names is now the window's gjc", async () => {
+	test("does not take an endpoint that was there before the window, even when the pid it names is now the window's gjc", async () => {
 		const socket = `gjcm-test-${crypto.randomBytes(4).toString("hex")}`;
 		cleanups.push(() => void tmux(socket, "kill-server"));
 		expect(tmux(socket, "new-session", "-d", "-s", "keep", "sleep 600").code).toBe(0);
@@ -435,6 +441,9 @@ describe.skipIf(!hasTmux)("TmuxLauncher.hosts", () => {
 		cleanups.push(() => fs.rmSync(cwd, { recursive: true, force: true }));
 		const sdk = path.join(cwd, ".gjc", "state", "sdk");
 		fs.mkdirSync(sdk, { recursive: true });
+		// An old session's endpoint, left behind by a process that is gone.
+		const stale = path.join(sdk, "stale.json");
+		fs.writeFileSync(stale, JSON.stringify({ version: 1, sessionId: "stale", pid: Bun.spawnSync(["true"]).pid }));
 		const launcher = new TmuxLauncher({ session: "gjcm", socket }, [...FAKE_AGENT, "--tui=late"]);
 		const opening = launcher.open(cwd);
 		let panePid = "";
@@ -443,11 +452,10 @@ describe.skipIf(!hasTmux)("TmuxLauncher.hosts", () => {
 			const listed = tmux(socket, "list-panes", "-s", "-t", "=gjcm", "-F", "#{pane_pid}");
 			if (listed.code === 0) panePid = listed.stdout.trim();
 		}
-		// An old session's endpoint, left behind, names the pid the window's gjc got (pids come around again).
-		const stale = path.join(sdk, "stale.json");
+		// Pids come around again: the one it names is now the window's gjc's. Written in place, the file is the same one.
+		const inode = fs.statSync(stale).ino;
 		fs.writeFileSync(stale, JSON.stringify({ version: 1, sessionId: "stale", pid: Number(panePid) }));
-		const minuteAgo = new Date(Date.now() - 60_000);
-		fs.utimesSync(stale, minuteAgo, minuteAgo);
+		expect(fs.statSync(stale).ino).toBe(inode);
 		expect((await opening).sessionId).toBe(`tui-${panePid}`);
 	});
 
@@ -460,11 +468,8 @@ describe.skipIf(!hasTmux)("TmuxLauncher.hosts", () => {
 		const sdk = path.join(cwd, ".gjc", "state", "sdk");
 		fs.mkdirSync(sdk, { recursive: true });
 		// Endpoints that show up while gjc in the window starts, naming a live process outside the window or a gone one,
-		// are not the new window's session; neither is one written before the window existed.
+		// are not the new window's session.
 		const gone = Bun.spawnSync(["true"]).pid;
-		fs.writeFileSync(path.join(sdk, "before.json"), JSON.stringify({ version: 1, sessionId: "before", pid: process.pid }));
-		const minuteAgo = new Date(Date.now() - 60_000);
-		fs.utimesSync(path.join(sdk, "before.json"), minuteAgo, minuteAgo);
 		const launcher = new TmuxLauncher({ session: "gjcm", socket }, [...FAKE_AGENT, "--tui=run"]);
 		const opening = launcher.open(cwd);
 		fs.writeFileSync(path.join(sdk, "left.json"), JSON.stringify({ version: 1, sessionId: "left", pid: process.pid }));

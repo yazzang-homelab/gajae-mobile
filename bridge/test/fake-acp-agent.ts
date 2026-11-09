@@ -5,17 +5,20 @@
 import fs from "node:fs";
 import path from "node:path";
 
-// Launched by the bridge's tmux path as the TUI (`<agent> --resume <id>`): like gjc, publish the session's SDK
-// endpoint under <cwd>/.gjc/state/sdk with this process's pid (and the agent dir it got) and stay up. It refuses
-// a session ACP still holds (no session/close yet). `--tui=exit` quits at once, `--tui=silent` never publishes.
-const resumeAt = process.argv.indexOf("--resume");
-if (resumeAt >= 0) {
-	const mode = process.argv.find(arg => arg.startsWith("--tui="))?.slice("--tui=".length);
-	const dir = path.join(process.cwd(), ".gjc", "state", "sdk");
-	const sessionId = process.argv[resumeAt + 1];
-	if (mode === "exit" || !fs.existsSync(path.join(dir, `${sessionId}.closed`))) process.exit(1);
-	if (mode !== "silent") {
+// Launched by the bridge's tmux path as the TUI (the tmux tests' agent command, which carries `--tui=<mode>`, without
+// `--mode=acp`): like gjc, start a new session and publish its SDK endpoint under <cwd>/.gjc/state/sdk with this
+// process's pid (and the agent dir it got), then stay up. `<id>.tui` marks the session as hosted by a TUI for the ACP
+// process below: like gjc's broker, it attaches a live host on session/load before any transcript exists.
+// `--tui=run` does that, `--tui=exit` quits at once, `--tui=silent` never publishes.
+const tuiMode = process.argv.find(arg => arg.startsWith("--tui="))?.slice("--tui=".length);
+if (tuiMode && !process.argv.includes("--mode=acp") && !process.argv.includes("sdk")) {
+	if (tuiMode === "exit") process.exit(1);
+	if (tuiMode !== "silent") {
+		const dir = path.join(process.cwd(), ".gjc", "state", "sdk");
+		const sessionId = `tui-${process.pid}`;
 		const agentDir = process.env.GJC_CODING_AGENT_DIR;
+		fs.mkdirSync(dir, { recursive: true });
+		fs.writeFileSync(path.join(dir, `${sessionId}.tui`), "");
 		fs.writeFileSync(path.join(dir, `${sessionId}.json`), JSON.stringify({ version: 1, sessionId, pid: process.pid, agentDir }));
 	}
 	setInterval(() => {}, 60_000);
@@ -190,8 +193,8 @@ async function handle(msg: any) {
 			attached.add(sessionId);
 			permissionModes.delete(sessionId);
 			persist();
-			// Like gjc's ACP session host, publish the SDK endpoint (it stays behind after session/close). Only the
-			// tmux tests, whose cwd is a scratch dir, need it.
+			// Like gjc's ACP session host, publish the SDK endpoint (it stays behind after session/close): the tmux tests,
+			// whose cwd is a scratch dir, check that a new window is never taken for it.
 			const sdkDir = path.join(params.cwd, ".gjc", "state", "sdk");
 			if (process.env.GJCM_TEST_TMUX) {
 				fs.mkdirSync(sdkDir, { recursive: true });
@@ -206,6 +209,9 @@ async function handle(msg: any) {
 				return write({ jsonrpc: "2.0", id, error: { code: -32603, message: "Internal error: load failed" } });
 			if (params.sessionId === "broker-lost")
 				return write({ jsonrpc: "2.0", id, error: { code: -32603, message: "Internal error: SDK request outcome is uncertain after the frame was sent." } });
+			// Like gjc's broker, a session a live TUI hosts attaches before its first answer saved it.
+			if (!sessions.has(params.sessionId) && fs.existsSync(path.join(params.cwd, ".gjc", "state", "sdk", `${params.sessionId}.tui`)))
+				sessions.set(params.sessionId, []);
 			const history = sessions.get(params.sessionId);
 			if (!history) return write({ jsonrpc: "2.0", id, error: { code: -32002, message: "not found" } });
 			staleAttachments.delete(params.sessionId);
@@ -236,8 +242,6 @@ async function handle(msg: any) {
 				steers.set(params.sessionId, (steers.get(params.sessionId) ?? []).filter(s => s.id !== waiting.steerId));
 				waiting.settle("closed");
 			}
-			const cwd = sessionCwds.get(params.sessionId);
-			if (cwd && process.env.GJCM_TEST_TMUX) fs.writeFileSync(path.join(cwd, ".gjc", "state", "sdk", `${params.sessionId}.closed`), "");
 			return reply({});
 		}
 		case "session/delete": {
@@ -338,10 +342,10 @@ async function handle(msg: any) {
 				update(sid, { sessionUpdate: "tool_call", ...toolCall });
 				const mode = permissionModes.get(sid) ?? "prompt";
 				const channel = mode === "prompt" ? channelOn(sid) : undefined;
-				// Measured on gjc 0.19.3: a TUI host (the session ACP closed for the tmux window) does not ask over ACP; without
-				// its approval channel it runs the tool unasked.
+				// Measured on gjc 0.19.3: a TUI host (the tmux window's gjc) does not ask over ACP; without its approval
+				// channel it runs the tool unasked.
 				const sdkDir = path.join(sessionCwds.get(sid) ?? process.cwd(), ".gjc", "state", "sdk");
-				const tuiHost = fs.existsSync(path.join(sdkDir, `${sid}.closed`));
+				const tuiHost = fs.existsSync(path.join(sdkDir, `${sid}.tui`));
 				const res = channel
 					? { outcome: { outcome: "selected", optionId: (await channelApproval(sid, channel, toolCall)) ?? "reject_once" } }
 					: tuiHost && mode === "prompt"

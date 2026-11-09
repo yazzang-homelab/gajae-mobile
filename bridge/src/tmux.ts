@@ -1,8 +1,10 @@
 /**
  * Opens a phone-started session as a window of one dedicated tmux session (gm#58), so the terminal shows the
- * same TUI the phone drives. The window runs `gjc --resume <id>`: gjc writes the transcript only after the first
- * answer for a TUI-started session, and ACP `session/load` resolves a session through that transcript, so the
- * bridge creates the session over ACP (which writes it at once), lets go of it, and hands it to the TUI.
+ * same TUI the phone drives. The window runs plain `gjc`, which starts a new session itself; the bridge learns its
+ * id from the SDK endpoint that process publishes and attaches with ACP `session/load`, which reaches a live host
+ * through the broker before any transcript exists (gjc registers the session with the broker before it writes the
+ * endpoint; measured on 0.19.3 and 0.20.0). One gjc start instead of creating the session over ACP first and resuming
+ * it in the window: bridge `session.new` measured 2026-11-09 in /root/tmp, pve3 22–27s → 14–15s, lab 8.3s → 5.3–7.4s.
  *
  * The bridge never starts a tmux server: a server started from the bridge's systemd unit would live in the
  * bridge's cgroup and die with every bridge restart, taking the phone's sessions with it. Every tmux call carries
@@ -16,7 +18,7 @@ export interface TmuxOptions {
 	session: string;
 	/** `tmux -L` socket name; the user's default server when absent. */
 	socket?: string;
-	/** How long gjc in the window may take to publish its SDK endpoint (measured 5.6–6.6s on pve3). */
+	/** How long gjc in the window may take to publish its SDK endpoint (measured 2026-11-09 in /root/tmp: lab 3.6–3.8s, pve3 10–11s, pve1 7.7–8.3s). */
 	readyTimeoutMs?: number;
 }
 
@@ -126,18 +128,21 @@ export class TmuxLauncher {
 	}
 
 	/**
-	 * Starts `gjc --resume <sessionId>` in a new window of the dedicated session and waits until that process
-	 * publishes the session's SDK endpoint. Removes the window and throws a TmuxError when it does not.
+	 * Starts gjc in a new window of the dedicated session, waits until that process publishes the SDK endpoint of the
+	 * session it started, and returns that session's id. Removes the window and throws a TmuxError when it does not.
 	 */
-	async open(sessionId: string, cwd: string): Promise<void> {
-		if (!SESSION_ID.test(sessionId)) throw new TmuxError("tmux_failed", `tmux 창에 열 수 없는 세션 id입니다: ${sessionId}`);
+	async open(cwd: string): Promise<string> {
 		// Window creation runs one at a time, so two phones starting sessions together do not both create the
 		// tmux session; waiting for gjc does not hold the next phone up.
-		const created = this.#creating.then(() => this.#create(sessionId, cwd));
+		const created = this.#creating.then(() => this.#create(cwd));
 		this.#creating = created.catch(() => {});
 		const { panePid, pane } = await created;
 		try {
-			await this.#waitReady(sessionId, cwd, panePid);
+			const sessionId = await this.#waitReady(cwd, panePid);
+			// Untagged, the window would not be found again: its tool approvals would reach no phone.
+			const tagged = await this.#run(["set-option", "-w", "-t", pane, SESSION_TAG, sessionId]);
+			if (tagged.code !== 0) throw new TmuxError("tmux_failed", `tmux 창에 세션 표시를 못 달았습니다: ${tagged.stderr || `exit ${tagged.code}`}`);
+			return sessionId;
 		} catch (error) {
 			await this.#run(["kill-pane", "-t", pane]);
 			throw error;
@@ -173,49 +178,59 @@ export class TmuxLauncher {
 		});
 	}
 
-	async #create(sessionId: string, cwd: string): Promise<{ panePid: number; pane: string }> {
+	async #create(cwd: string): Promise<{ panePid: number; pane: string }> {
 		const { session } = this.#options;
 		const env = Object.entries(this.#env).flatMap(([key, value]) => ["-e", `${key}=${value}`]);
 		// tmux expands formats in -c; a literal `#` in the path is written `##`.
 		const start = ["-c", cwd.replaceAll("#", "##"), ...env, "-P", "-F", "#{pane_pid} #{pane_id}"];
-		const command = [...this.#tui, "--resume", sessionId];
 		const exists = (await this.#run(["has-session", "-t", `=${session}`])).code === 0;
 		const created = exists
-			? await this.#run(["new-window", "-d", "-t", `=${session}:`, ...start, ...command])
-			: await this.#run(["new-session", "-d", "-s", session, ...start, ...command]);
+			? await this.#run(["new-window", "-d", "-t", `=${session}:`, ...start, ...this.#tui])
+			: await this.#run(["new-session", "-d", "-s", session, ...start, ...this.#tui]);
 		const verb = exists ? "new-window" : "new-session";
 		if (created.code !== 0) throw new TmuxError("tmux_failed", `tmux ${verb} 실패: ${created.stderr || `exit ${created.code}`}`);
 		const [pidText, pane] = created.stdout.split(" ");
 		const panePid = Number(pidText);
 		if (!Number.isInteger(panePid) || !pane) throw new TmuxError("tmux_failed", `tmux ${verb}가 창 정보를 주지 않았습니다: ${created.stdout}`);
-		// Untagged, the window would not be found again: its tool approvals would reach no phone.
-		const tagged = await this.#run(["set-option", "-w", "-t", pane, SESSION_TAG, sessionId]);
-		if (tagged.code !== 0) {
-			// A command that cannot start (a wrong --gjc) takes its window with it before the tag lands.
-			if (!alive(panePid)) throw new TmuxError("tmux_window_exited", `tmux 세션 ${session}의 새 창에서 gjc가 바로 끝났습니다`);
-			await this.#run(["kill-pane", "-t", pane]);
-			throw new TmuxError("tmux_failed", `tmux 창에 세션 표시를 못 달았습니다: ${tagged.stderr || `exit ${tagged.code}`}`);
-		}
 		return { panePid, pane };
 	}
 
-	async #waitReady(sessionId: string, cwd: string, panePid: number): Promise<void> {
+	/**
+	 * The id of the session gjc in the window started: the one whose SDK endpoint names that process. Endpoints other
+	 * processes left behind name a pid outside the window; each is read once.
+	 */
+	async #waitReady(cwd: string, panePid: number): Promise<string> {
 		const { session } = this.#options;
-		const endpoint = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+		const dir = path.join(cwd, ".gjc", "state", "sdk");
 		const timeoutMs = this.#options.readyTimeoutMs ?? DEFAULT_READY_TIMEOUT_MS;
 		const deadline = Date.now() + timeoutMs;
-		// The endpoint the ACP host left behind names a process outside the window; check each pid once.
-		const foreign = new Set<number>();
+		const foreign = new Set<string>();
 		while (Date.now() < deadline) {
 			if (!alive(panePid)) throw new TmuxError("tmux_window_exited", `tmux 세션 ${session}의 새 창에서 gjc가 바로 끝났습니다`);
-			const pid = this.#endpointPid(endpoint);
-			if (pid !== undefined && !foreign.has(pid)) {
-				if (descendsFrom(pid, panePid)) return;
-				foreign.add(pid);
+			for (const sessionId of this.#endpointIds(dir)) {
+				const pid = this.#endpointPid(path.join(dir, `${sessionId}.json`));
+				if (pid === undefined) continue;
+				const key = `${sessionId}\t${pid}`;
+				if (foreign.has(key)) continue;
+				if (descendsFrom(pid, panePid)) return sessionId;
+				foreign.add(key);
 			}
 			await Bun.sleep(POLL_MS);
 		}
 		throw new TmuxError("tmux_ready_timeout", `tmux 세션 ${session}의 새 창에서 gjc가 ${Math.round(timeoutMs / 1000)}초 안에 준비되지 않았습니다`);
+	}
+
+	/** Session ids with an SDK endpoint file (`<id>.json`) in `dir`. */
+	#endpointIds(dir: string): string[] {
+		try {
+			return fs
+				.readdirSync(dir)
+				.filter(name => name.endsWith(".json"))
+				.map(name => name.slice(0, -".json".length))
+				.filter(id => SESSION_ID.test(id));
+		} catch {
+			return [];
+		}
 	}
 
 	#endpointPid(file: string): number | undefined {

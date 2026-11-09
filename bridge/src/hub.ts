@@ -1088,22 +1088,20 @@ export class SessionHub {
 		if (!isDirectory(cwd)) throw new AcpError(-32602, `호스트에 작업 디렉터리가 없습니다: ${cwd}`);
 		const tmuxSkipped = this.#tmux && (await this.#tmux.unavailable());
 		if (tmuxSkipped) this.#options.log?.(`tmux skipped (opening over ACP): ${tmuxSkipped.slice(0, 200)}`);
-		const result = await acp.request("session/new", { cwd, mcpServers: [] });
 		if (this.#tmux && !tmuxSkipped) {
-			// ACP lets go of the session it just wrote, and gjc in the window resumes it; the phone then attaches
-			// to that TUI host like to any terminal session. A failure leaves the (empty) session saved.
+			// gjc in the window starts the session; the phone then attaches to that TUI host like to any terminal
+			// session. Nothing is saved until its first answer, so a window closed unused leaves no transcript behind.
+			let sessionId: string;
 			try {
-				await acp.request("session/close", { sessionId: result.sessionId });
-				await this.#tmux.open(result.sessionId, cwd);
+				sessionId = await this.#tmux.open(cwd);
 			} catch (error) {
-				const message = error instanceof Error ? error.message : String(error);
-				throw new AcpError(-32021, `새 세션을 tmux 창으로 열지 못했습니다(${result.sessionId}): ${message}`, {
-					code: error instanceof TmuxError ? error.code : "tmux_handoff_failed",
-				});
+				if (!(error instanceof TmuxError)) throw error;
+				throw new AcpError(-32021, `새 세션을 tmux 창으로 열지 못했습니다: ${error.message}`, { code: error.code });
 			}
-			this.#stateFor(result.sessionId, cwd).inTmux = true;
-			return this.openSession(clientId, { sessionId: result.sessionId, cwd });
+			this.#stateFor(sessionId, cwd).inTmux = true;
+			return this.openSession(clientId, { sessionId, cwd });
 		}
+		const result = await acp.request("session/new", { cwd, mcpServers: [] });
 		const state = this.#stateFor(result.sessionId, cwd);
 		state.loaded = true;
 		state.configOptions = supportedConfigOptions(result.configOptions ?? state.configOptions);

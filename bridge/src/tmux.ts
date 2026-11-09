@@ -262,8 +262,11 @@ export class TmuxLauncher {
 		for (const name of names) {
 			const id = name.endsWith(".json") ? name.slice(0, -".json".length) : "";
 			if (!SESSION_ID.test(id)) continue;
-			const stat = fs.statSync(path.join(dir, name), { bigint: true, throwIfNoEntry: false });
-			if (stat) endpoints.set(id, stat.ino);
+			try {
+				endpoints.set(id, fs.statSync(path.join(dir, name), { bigint: true }).ino);
+			} catch {
+				// Gone since the listing, or unreadable: nothing to take.
+			}
 		}
 		return endpoints;
 	}

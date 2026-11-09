@@ -77,7 +77,8 @@ async function tmuxBridge(options: { server: boolean; tui?: string; readyTimeout
 		});
 	/**
 	 * Kills the bridge's gjc ACP and tells whether the bridge started another by itself (it waits 1s first after a
-	 * death). One it started is given a second to come up: killed while starting, it is not restarted.
+	 * death). One it started is waited for until it is up (`host.info` waits for gjc ACP): killed while starting, it is
+	 * not restarted.
 	 */
 	const killAcp = async () => {
 		const [acp] = acpProcesses();
@@ -87,7 +88,7 @@ async function tmuxBridge(options: { server: boolean; tui?: string; readyTimeout
 		while (Date.now() < deadline) {
 			await Bun.sleep(50);
 			if (acpProcesses().some(pid => pid !== acp)) {
-				await Bun.sleep(1000);
+				await client.request("host.info", {});
 				return true;
 			}
 		}

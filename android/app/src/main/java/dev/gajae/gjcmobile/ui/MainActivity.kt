@@ -37,7 +37,7 @@ class MainActivity : ComponentActivity() {
     }
 
     /**
-     * `gjcm://pair?o=…` deep links open the pairing screen with the link pre-submitted; `gjcm://session?…` comes
+     * `gjcm://pair?o=…` deep links open the pairing screen, which asks the user to confirm the link before pairing; `gjcm://session?…` comes
      * from a widget row (an explicit intent, so it is not in the manifest's browsable filter).
      */
     private fun handle(intent: Intent?) {

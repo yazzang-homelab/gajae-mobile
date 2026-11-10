@@ -11,6 +11,13 @@ struct PairingView: View {
     @State private var working = false
     @State private var error: String?
     @State private var cameraDenied = false
+    @State private var pending: PendingPairing?
+
+    private struct PendingPairing {
+        let text: String
+        let offer: PairingOffer
+        let keyChanged: Bool
+    }
 
     var body: some View {
         NavigationStack {
@@ -21,7 +28,7 @@ struct PairingView: View {
                             Text("카메라 권한이 없습니다.\n설정에서 허용하거나 아래에 페어링 링크를 붙여 넣으세요.")
                                 .multilineTextAlignment(.center).foregroundStyle(Palette.muted).padding()
                         } else {
-                            QRScannerView { code in submit(code) }
+                            QRScannerView { code in if pending == nil { request(code, fromLink: false) } }
                         }
                         if working { ProgressView().controlSize(.large).tint(Palette.cream) }
                     }
@@ -39,7 +46,7 @@ struct PairingView: View {
                             .textInputAutocapitalization(.never)
                             .autocorrectionDisabled()
                             .padding(10).card()
-                        Button("연결") { submit(manual) }
+                        Button("연결") { request(manual, fromLink: false) }
                             .buttonStyle(.borderedProminent)
                             .disabled(manual.isEmpty || working)
                     }
@@ -67,10 +74,22 @@ struct PairingView: View {
             .navigationTitle("호스트 페어링")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar { ToolbarItem(placement: .cancellationAction) { Button("닫기") { dismiss() } } }
+            .alert(
+                pending?.keyChanged == true ? "호스트 교체" : "이 호스트에 연결할까요?",
+                isPresented: Binding(get: { pending != nil }, set: { if !$0 { pending = nil } }),
+                presenting: pending
+            ) { request in
+                Button("취소", role: .cancel) {}
+                Button(request.keyChanged ? "교체" : "연결", role: request.keyChanged ? .destructive : nil) {
+                    submit(request.text, replaceChangedKey: request.keyChanged)
+                }
+            } message: { request in
+                Text(confirmationMessage(for: request))
+            }
             .task {
-                if let pending = model.pairingURL {
-                    model.pairingURL = nil
-                    submit(pending)
+                if let link = model.pairingLink {
+                    model.pairingLink = nil
+                    request(link.text, fromLink: link.fromLink)
                 }
                 cameraDenied = !(await AVCaptureDevice.requestAccess(for: .video))
             }
@@ -82,27 +101,64 @@ struct PairingView: View {
         error = nil
         Task {
             do {
-                submit(try await DemoHost.pairingLink())
+                request(try await DemoHost.pairingLink(), fromLink: false)
             } catch {
                 self.error = DemoHost.failure
             }
         }
     }
 
-    private func submit(_ text: String) {
+    private func parseErrorMessage(_ parse: PairingOffer.ParseError) -> String {
+        switch parse {
+        case .expired: "QR 코드가 만료됐습니다. 호스트에서 다시 `gjcm-bridge pair`를 실행하세요."
+        case .unsupportedVersion: "이 앱보다 새 버전의 브리지입니다. 앱을 업데이트하세요."
+        default: "가재코드 페어링 QR이 아닙니다."
+        }
+    }
+
+    private func confirmationMessage(for request: PendingPairing) -> String {
+        let name = request.offer.name.isEmpty ? request.offer.hostId : request.offer.name
+        let target = ([name] + request.offer.endpoints).joined(separator: "\n")
+        guard request.keyChanged else { return target }
+        return "이미 등록된 호스트의 키가 바뀌었습니다\n믿을 수 있는 호스트가 아니라면 교체하지 마세요. 교체하면 이후 지시문과 첨부 파일이 이 호스트로 갑니다.\n\n" + target
+    }
+
+    /// A link that arrived from outside the app is always confirmed first; an offer the user scanned or pasted
+    /// here goes straight through unless it would replace a known host's key. A new request replaces a pending
+    /// one, so a confirmation that failed to appear never blocks pasting (the scanner just ignores codes while one
+    /// is pending, so a second QR cannot swap the target under a shown alert).
+    private func request(_ text: String, fromLink: Bool) {
+        guard !working else { return }
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let offer: PairingOffer
+        do {
+            offer = try PairingOffer.parse(trimmed)
+        } catch let parse as PairingOffer.ParseError {
+            error = parseErrorMessage(parse)
+            return
+        } catch {
+            self.error = error.localizedDescription
+            return
+        }
+        let confirmation = offer.confirmation(among: model.hosts, fromLink: fromLink)
+        if confirmation != .none {
+            error = nil
+            pending = PendingPairing(text: trimmed, offer: offer, keyChanged: confirmation == .replaceKey)
+        } else {
+            submit(trimmed)
+        }
+    }
+
+    private func submit(_ text: String, replaceChangedKey: Bool = false) {
         guard !working else { return }
         working = true
         error = nil
         Task {
             defer { working = false }
             do {
-                onPaired(try await model.pair(with: text.trimmingCharacters(in: .whitespacesAndNewlines)))
+                onPaired(try await model.pair(with: text.trimmingCharacters(in: .whitespacesAndNewlines), replaceChangedKey: replaceChangedKey))
             } catch let parse as PairingOffer.ParseError {
-                error = switch parse {
-                case .expired: "QR 코드가 만료됐습니다. 호스트에서 다시 `gjcm-bridge pair`를 실행하세요."
-                case .unsupportedVersion: "이 앱보다 새 버전의 브리지입니다. 앱을 업데이트하세요."
-                default: "가재코드 페어링 QR이 아닙니다."
-                }
+                error = parseErrorMessage(parse)
             } catch {
                 self.error = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
             }

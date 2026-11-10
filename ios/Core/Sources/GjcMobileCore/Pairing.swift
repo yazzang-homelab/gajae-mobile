@@ -42,6 +42,40 @@ public struct PairingOffer: Codable, Equatable, Sendable {
     }
 }
 
+/// How a pairing offer relates to the hosts already paired, judged by hostId and hostKey.
+public enum PairingDisposition: Equatable, Sendable {
+    case newHost
+    case sameKey
+    case keyChanged
+}
+
+/// What the user must approve before an offer is submitted.
+public enum PairingConfirmation: Equatable, Sendable {
+    case none
+    case connect
+    case replaceKey
+}
+
+extension PairingOffer {
+    /// An offer for a hostId we already hold under a different hostKey is a replacement the user must approve.
+    public func disposition(among hosts: [PairedHost]) -> PairingDisposition {
+        guard let existing = hosts.first(where: { $0.hostId == hostId }) else { return .newHost }
+        return existing.hostKey == hostKey ? .sameKey : .keyChanged
+    }
+
+    /// A link that arrived from outside the app is always confirmed; an offer the user scanned or pasted in the app
+    /// goes straight through unless it would replace a known host's key.
+    public func confirmation(among hosts: [PairedHost], fromLink: Bool) -> PairingConfirmation {
+        if disposition(among: hosts) == .keyChanged { return .replaceKey }
+        return fromLink ? .connect : .none
+    }
+
+    /// Replacing a known host's key is refused unless the user explicitly approved the replacement.
+    public func isAllowed(among hosts: [PairedHost], keyChangeApproved: Bool) -> Bool {
+        keyChangeApproved || disposition(among: hosts) != .keyChanged
+    }
+}
+
 /// A host this phone has paired with. Persisted in the Keychain by the app.
 public struct PairedHost: Codable, Hashable, Identifiable, Sendable {
     public var id: String { hostId }

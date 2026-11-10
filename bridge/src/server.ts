@@ -84,7 +84,17 @@ export function startBridgeServer(options: BridgeServerOptions): Server<Conn> {
 		const conn = ws.data;
 		if (conn.phase !== "open" || !conn.cipher) return;
 		// `gjcm-bridge revoke` runs in another process and rewrites devices.json; check it before anything goes out.
-		if (!state.findDevice(conn.deviceKey!)) {
+		let paired: boolean;
+		try {
+			paired = state.findDevice(conn.deviceKey!) !== undefined;
+		} catch (error) {
+			// An unreadable devices.json must not travel up into the hub's delivery loop: only this connection ends.
+			log(`device check failed, closing the connection: ${error instanceof Error ? error.message : String(error)}`);
+			conn.phase = "closed";
+			ws.close(1011, "internal_error");
+			return;
+		}
+		if (!paired) {
 			conn.phase = "closed";
 			ws.close(4403, "device_revoked");
 			return;

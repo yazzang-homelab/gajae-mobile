@@ -3,12 +3,20 @@ import GjcMobileCore
 import Observation
 import UIKit
 
+enum PairingRefused: LocalizedError {
+    case keyChanged
+
+    var errorDescription: String? { "이미 등록된 호스트의 키가 바뀌어 연결하지 않았습니다." }
+}
+
 @MainActor
 @Observable
 final class AppModel {
     private(set) var hosts: [PairedHost]
     private(set) var connections: [String: HostConnection] = [:]
     var pairingURL: String?
+    /// A link from outside the app (deep link, system camera) is confirmed before pairing; the demo button's is not.
+    var pairingNeedsConfirmation = true
     /// Host to bring to the front, set by a widget link and consumed by `RootView`.
     var requestedHostId: String?
     private let store = SecureStore()
@@ -38,8 +46,10 @@ final class AppModel {
     }
 
     /// First connection from a QR offer: proves the pairing secret, then remembers the host.
-    func pair(with offerText: String) async throws -> PairedHost {
+    func pair(with offerText: String, replaceChangedKey: Bool = false) async throws -> PairedHost {
         let offer = try PairingOffer.parse(offerText)
+        // A known hostId under a different key is replaced only when the user explicitly approved it.
+        if offer.disposition(among: hosts) == .keyChanged, !replaceChangedKey { throw PairingRefused.keyChanged }
         guard let hostKey = Data(base64URL: offer.hostKey), let secret = Data(base64URL: offer.secret) else {
             throw PairingOffer.ParseError.malformed
         }

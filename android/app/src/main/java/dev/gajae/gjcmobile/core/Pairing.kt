@@ -68,6 +68,15 @@ data class PairingOffer(
     }
 }
 
+/** How a pairing offer relates to the hosts already paired, judged by hostId and hostKey. */
+enum class PairingDisposition { NEW_HOST, SAME_KEY, KEY_CHANGED }
+
+/** An offer for a hostId we already hold under a different hostKey is a replacement the user must approve. */
+fun pairingDisposition(offer: PairingOffer, hosts: List<PairedHost>): PairingDisposition {
+    val existing = hosts.firstOrNull { it.hostId == offer.hostId } ?: return PairingDisposition.NEW_HOST
+    return if (existing.hostKey == offer.hostKey) PairingDisposition.SAME_KEY else PairingDisposition.KEY_CHANGED
+}
+
 fun parseInstant(text: String): Instant? =
     runCatching { Instant.parse(text) }.getOrNull() ?: runCatching { OffsetDateTime.parse(text).toInstant() }.getOrNull()
 

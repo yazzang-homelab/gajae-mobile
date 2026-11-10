@@ -70,6 +70,29 @@ class PairingOfferTest {
         assertEquals(withDefault, PairedHost.fromJson(parseJson(withDefault.toJson().encode())))
     }
 
+    private fun dispositionFor(existingKey: String?, otherHost: Boolean = false): PairingDisposition {
+        val offer = PairingOffer.parse(link(), now)
+        val hosts = buildList {
+            if (otherHost) add(PairedHost("h2", "other", "zzz", emptyList()))
+            if (existingKey != null) add(PairedHost("h1", "mac", existingKey, emptyList()))
+        }
+        return pairingDisposition(offer, hosts)
+    }
+
+    @Test
+    fun unknownHostIdIsANewHost() {
+        assertEquals(PairingDisposition.NEW_HOST, dispositionFor(null))
+        assertEquals(PairingDisposition.NEW_HOST, dispositionFor(null, otherHost = true))
+    }
+
+    @Test
+    fun sameHostIdAndKeyIsARepairing() =
+        assertEquals(PairingDisposition.SAME_KEY, dispositionFor(B64Url.encode(ByteArray(32) { 1 })))
+
+    @Test
+    fun sameHostIdWithDifferentKeyIsAKeyChange() =
+        assertEquals(PairingDisposition.KEY_CHANGED, dispositionFor(B64Url.encode(ByteArray(32) { 2 })))
+
     @Test
     fun newChatCwdPrefersThisChatThenSavedDefaultThenBridge() {
         val host = PairedHost("h", "n", "k", emptyList())

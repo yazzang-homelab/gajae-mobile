@@ -42,6 +42,21 @@ public struct PairingOffer: Codable, Equatable, Sendable {
     }
 }
 
+/// How a pairing offer relates to the hosts already paired, judged by hostId and hostKey.
+public enum PairingDisposition: Equatable, Sendable {
+    case newHost
+    case sameKey
+    case keyChanged
+}
+
+extension PairingOffer {
+    /// An offer for a hostId we already hold under a different hostKey is a replacement the user must approve.
+    public func disposition(among hosts: [PairedHost]) -> PairingDisposition {
+        guard let existing = hosts.first(where: { $0.hostId == hostId }) else { return .newHost }
+        return existing.hostKey == hostKey ? .sameKey : .keyChanged
+    }
+}
+
 /// A host this phone has paired with. Persisted in the Keychain by the app.
 public struct PairedHost: Codable, Hashable, Identifiable, Sendable {
     public var id: String { hostId }

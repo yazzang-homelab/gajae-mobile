@@ -35,6 +35,7 @@ struct GjcMobileApp: App {
     /// camera) is a pairing link.
     private func handle(_ url: URL) {
         guard url.host == "session" else {
+            model.pairingNeedsConfirmation = true
             model.pairingURL = url.absoluteString
             return
         }

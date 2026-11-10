@@ -202,6 +202,23 @@ final class ModelTests: XCTestCase {
         XCTAssertEqual(moved.endpointsToTry.first, "ws://192.168.0.2:7787/ws")
     }
 
+    func testPairingDispositionDistinguishesNewSameAndChangedKey() throws {
+        let key = Data(repeating: 1, count: 32).base64URL
+        let offer: JSONValue = [
+            "v": 1, "hostId": "h1", "name": "pve", "hostKey": .string(key),
+            "endpoints": ["ws://100.64.0.1:7787/ws"], "pairingId": "p1",
+            "secret": .string(Data(repeating: 2, count: 32).base64URL), "exp": "2999-01-01T00:00:00.000Z",
+        ]
+        let parsed = try PairingOffer.parse("gjcm://pair?o=" + (try JSONEncoder().encode(offer)).base64URL)
+        let other = PairedHost(hostId: "h2", name: "other", hostKey: "zzz", endpoints: [])
+        XCTAssertEqual(parsed.disposition(among: []), .newHost)
+        XCTAssertEqual(parsed.disposition(among: [other]), .newHost)
+        let same = PairedHost(hostId: "h1", name: "pve", hostKey: key, endpoints: [])
+        XCTAssertEqual(parsed.disposition(among: [other, same]), .sameKey)
+        let changed = PairedHost(hostId: "h1", name: "pve", hostKey: Data(repeating: 9, count: 32).base64URL, endpoints: [])
+        XCTAssertEqual(parsed.disposition(among: [other, changed]), .keyChanged)
+    }
+
     /// Hosts saved by 1.0.1 (the Keychain list in `JSONEncoder`'s shape, without `preferredCwd`) must still load,
     /// keys intact; a failed decode would make the app forget every paired host.
     func testHostsSavedBeforePreferredCwdStillDecode() throws {

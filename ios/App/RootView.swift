@@ -151,7 +151,10 @@ struct RootView: View {
                     Button {
                         Task {
                             // The pairing sheet opens on pairingURL and pairs with it right away.
-                            if let link = try? await DemoHost.pairingLink() { model.pairingURL = link } else { demoError = DemoHost.failure }
+                            if let link = try? await DemoHost.pairingLink() {
+                                model.pairingNeedsConfirmation = false
+                                model.pairingURL = link
+                            } else { demoError = DemoHost.failure }
                         }
                     } label: {
                         Label("컴퓨터 없이 데모로 체험", systemImage: "play.circle").frame(maxWidth: 220).padding(.vertical, 6)

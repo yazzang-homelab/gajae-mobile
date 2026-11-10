@@ -27,4 +27,14 @@ class SessionListFailureTest {
         assertEquals(SessionListFailure.Transport, SessionListFailure.classify(BridgeException.ProtocolViolation("x")))
         assertEquals(SessionListFailure.Transport, SessionListFailure.classify(IOException("reset")))
     }
+
+    @Test
+    fun aCancelledSearchGivesTheQueryBack() {
+        assertEquals("a", SessionListFailure.queryAfterCancelledSearch(current = "ab", attempted = "ab", previous = "a"))
+    }
+
+    @Test
+    fun aCancelledSearchKeepsAQueryThatReplacedItMeanwhile() {
+        assertEquals("abc", SessionListFailure.queryAfterCancelledSearch(current = "abc", attempted = "ab", previous = "a"))
+    }
 }

@@ -9,7 +9,7 @@ public enum SessionListFailure: Equatable, Sendable {
     case disconnected
     /// The bridge answered the request with an error: the connection is fine, only the list failed.
     case remote
-    /// Any other transport or protocol failure: the connection is no longer usable.
+    /// Any other failure (transport, protocol, undecodable reply): the host status becomes failed; nothing is closed or redialed here.
     case transport
 
     public static func classify(_ error: Error) -> SessionListFailure {

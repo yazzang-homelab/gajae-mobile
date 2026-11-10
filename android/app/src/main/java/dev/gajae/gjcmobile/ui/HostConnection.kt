@@ -16,6 +16,7 @@ import dev.gajae.gjcmobile.core.ReconnectBackoff
 import dev.gajae.gjcmobile.core.SessionListFailure
 import dev.gajae.gjcmobile.core.SessionSummary
 import dev.gajae.gjcmobile.widget.WidgetStore
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.currentCoroutineContext
@@ -85,6 +86,7 @@ class HostConnection(
         eventJob?.cancel()
         client?.close()
         client = null
+        listError = null
         status = Status.Idle
     }
 
@@ -118,7 +120,7 @@ class HostConnection(
                 status = Status.Failed(e.userMessage())
                 return // unpaired: retrying cannot help
             } catch (e: Exception) {
-                if (e is kotlinx.coroutines.CancellationException) throw e
+                if (e is CancellationException) throw e
                 currentCoroutineContext().ensureActive()
                 status = Status.Failed(e.userMessage())
                 delay(backoff.failedDial())
@@ -128,9 +130,12 @@ class HostConnection(
 
     private fun attach(client: BridgeClient, endpoint: String) {
         // The previous client's socket and event queue outlive a plain overwrite; the bridge would keep both links.
+        // Stop its collector first so the Disconnected event that close() emits is never handled as a drop.
+        eventJob?.cancel()
         this.client?.takeIf { it !== client }?.close()
         this.client = client
         status = Status.Connected
+        listError = null
         listKnown = false
         waitingKnown = false
         arrivedSinceAttach.clear()
@@ -139,7 +144,6 @@ class HostConnection(
             host = host.copy(lastEndpoint = endpoint)
             onHostChange(host)
         }
-        eventJob?.cancel()
         eventJob = scope.launch { client.events.collect(::handle) }
         scope.launch {
             info = runCatching { client.hostInfo() }.getOrNull()
@@ -185,6 +189,7 @@ class HostConnection(
                 client = null
                 listKnown = false
                 waitingKnown = false
+                listError = null
                 status = Status.Failed(event.reason)
                 // A drop right after attaching waits before the next dial (see ReconnectBackoff).
                 ensureConnected(backoff.dropped(SystemClock.elapsedRealtime()))
@@ -240,8 +245,15 @@ class HostConnection(
     suspend fun search(query: String) {
         val trimmed = query.trim()
         if (trimmed == searchQuery) return
+        val previous = searchQuery
         searchQuery = trimmed
-        refreshSessions()
+        try {
+            refreshSessions()
+        } catch (e: CancellationException) {
+            // The list still shows the previous query's results: typing the same text again must search again.
+            searchQuery = SessionListFailure.queryAfterCancelledSearch(searchQuery, trimmed, previous)
+            throw e
+        }
     }
 
     suspend fun loadMoreSessions() {

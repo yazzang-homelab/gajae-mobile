@@ -90,6 +90,7 @@ final class HostConnection {
         eventTask?.cancel()
         if let client { Task { await client.close() } }
         client = nil
+        listError = nil
         status = .idle
     }
 
@@ -134,9 +135,12 @@ final class HostConnection {
 
     private func attach(_ client: BridgeClient, endpoint: String) {
         // The previous client's socket and reader outlive a plain overwrite; the bridge would keep both links.
+        // Stop its event reader first so the disconnected event that close() emits is never handled as a drop.
+        eventTask?.cancel()
         if let previous = self.client, previous !== client { Task { await previous.close() } }
         self.client = client
         status = .connected
+        listError = nil
         listKnown = false
         waitingKnown = false
         arrivedSinceAttach = []
@@ -145,7 +149,6 @@ final class HostConnection {
             host.lastEndpoint = endpoint
             onHostChange(host)
         }
-        eventTask?.cancel()
         eventTask = Task { [weak self] in
             for await event in client.events {
                 guard let self, !Task.isCancelled else { return }
@@ -197,6 +200,7 @@ final class HostConnection {
             client = nil
             listKnown = false
             waitingKnown = false
+            listError = nil
             status = .failed(reason)
             // A drop right after attaching waits before the next dial (see ReconnectBackoff).
             ensureConnected(after: backoff.dropped(at: Self.clockSeconds))

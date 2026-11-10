@@ -16,11 +16,15 @@ enum class SessionListFailure {
     /** The bridge answered the request with an error: the connection is fine, only the list failed. */
     Remote,
 
-    /** Any other transport or protocol failure: the connection is no longer usable. */
+    /** Any other failure (transport, protocol, undecodable reply): the host status becomes Failed; nothing is closed or redialed here. */
     Transport,
     ;
 
     companion object {
+        /** The query to keep after a search was cancelled: the previous one, unless something else already replaced [attempted]. */
+        fun queryAfterCancelledSearch(current: String, attempted: String, previous: String): String =
+            if (current == attempted) previous else current
+
         fun classify(error: Throwable): SessionListFailure = when (error) {
             is CancellationException -> Cancelled
             is BridgeException.Disconnected -> Disconnected

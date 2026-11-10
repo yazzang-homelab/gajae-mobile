@@ -8,7 +8,7 @@ import Security
 enum Keychain {
     private static let service = "dev.gajae.gjcmobile"
 
-    static func read(_ account: String) -> Data? {
+    static func read(_ account: String) -> StorageRead {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
@@ -17,8 +17,10 @@ enum Keychain {
             kSecMatchLimit as String: kSecMatchLimitOne,
         ]
         var result: AnyObject?
-        guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess else { return nil }
-        return result as? Data
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+        if status == errSecItemNotFound { return .notFound }
+        guard status == errSecSuccess, let data = result as? Data else { return .unavailable }
+        return .data(data)
     }
 
     @discardableResult
@@ -37,26 +39,41 @@ enum Keychain {
     }
 }
 
+private struct KeychainAccount: HostsBlobStorage {
+    let account: String
+    func read() -> StorageRead { Keychain.read(account) }
+    func write(_ data: Data) -> Bool { Keychain.write(data, account: account) }
+}
+
 struct SecureStore {
     private let deviceAccount = "device-key"
-    private let hostsAccount = "paired-hosts"
+    private let vault = PairedHostsVault(storage: KeychainAccount(account: "paired-hosts"))
 
+    /// A key that could not be read (not "no such item") is not replaced: this run uses a throwaway key and
+    /// the stored one stays for the next read.
     func deviceIdentity() -> DeviceIdentity {
-        if let raw = Keychain.read(deviceAccount), let identity = try? DeviceIdentity(rawPrivateKey: raw) {
-            return identity
+        switch Keychain.read(deviceAccount) {
+        case .data(let raw):
+            if let identity = try? DeviceIdentity(rawPrivateKey: raw) { return identity }
+        case .unavailable:
+            return DeviceIdentity()
+        case .notFound:
+            break
         }
         let identity = DeviceIdentity()
         Keychain.write(identity.rawPrivateKey, account: deviceAccount)
         return identity
     }
 
-    func hosts() -> [PairedHost] {
-        guard let data = Keychain.read(hostsAccount) else { return [] }
-        return (try? JSONDecoder().decode([PairedHost].self, from: data)) ?? []
-    }
+    /// False while the hosts could not be read; the empty list from `hosts()` then means "unknown".
+    var hostsAvailable: Bool { vault.isAvailable }
 
-    func save(hosts: [PairedHost]) {
-        if let data = try? JSONEncoder().encode(hosts) { Keychain.write(data, account: hostsAccount) }
+    func hosts() -> [PairedHost] { vault.load() }
+
+    /// The list now stored (it can hold hosts the caller could not load), or nil when nothing was written.
+    @discardableResult
+    func save(hosts: [PairedHost], forgetting hostId: String? = nil) -> [PairedHost]? {
+        vault.save(hosts: hosts, forgetting: hostId)
     }
 }
 

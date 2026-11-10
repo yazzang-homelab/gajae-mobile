@@ -21,6 +21,7 @@ enum WidgetRefresher {
     static func refresh() async {
         let store = SecureStore()
         let hosts = store.hosts()
+        guard store.hostsAvailable else { return }
         WidgetStore.sync(hosts)
         guard !hosts.isEmpty else { return }
         let device = store.deviceIdentity()

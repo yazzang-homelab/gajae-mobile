@@ -125,7 +125,8 @@ export class AcpProcess {
 		try {
 			this.#dispatch(line);
 		} catch (error) {
-			console.error(`gjc ACP line dropped: ${error instanceof Error ? error.message : String(error)}`);
+			// The stack says whether gjc's line or the bridge's own handler was at fault; the line itself is never logged.
+			console.error("gjc ACP line dropped:", error);
 		}
 	}
 

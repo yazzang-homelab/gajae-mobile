@@ -239,6 +239,12 @@ async function handle(msg: any) {
 			permissionModes.delete(params.sessionId);
 			sessionCwds.set(params.sessionId, params.cwd);
 			for (const text of history) update(params.sessionId, { sessionUpdate: "user_message_chunk", content: { type: "text", text } });
+			// FAKE_LOAD_SETTLES_PROMPT: the prompt the lost attachment left unsettled ends while the load is still answering.
+			if (process.env.FAKE_LOAD_SETTLES_PROMPT && cancellable.has(params.sessionId)) {
+				cancellable.get(params.sessionId)!();
+				cancellable.delete(params.sessionId);
+				await new Promise(resolve => setTimeout(resolve, 300));
+			}
 			return reply({ configOptions });
 		}
 		case "session/fork": {

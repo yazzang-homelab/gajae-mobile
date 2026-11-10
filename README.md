@@ -22,7 +22,7 @@ gajae-mobile is a native iOS and Android companion for [Gajae Code (`gjc`)](http
 
 - **Pair by QR code.** `gjcm-bridge pair` prints a one-time code (valid 10 minutes); scan it or paste the link.
 - **Chat with the agent.** Streamed answers, reasoning, plans, tool calls and their output, photo and file attachments.
-- **Approve from your phone.** When the agent wants to run a command it asks; you get a notification while the app is open and connected, and answer with *Allow once* or *Reject*. When the app is closed there is no notification; the widget shows waiting or "needs check" instead.
+- **Approve from your phone.** When the agent wants to run a command it asks; you get a notification while the app is open and connected, and answer with *Allow once* or *Reject*. When the app is closed there is no notification. If you keep the home screen widget, it shows the waiting request after its next background refresh, which can take more than 15 minutes.
 - **Steer and interrupt.** Send an instruction into a running turn, queue the next one, or stop it.
 - **Sessions, models, modes.** Resume saved sessions grouped by directory, search them, switch model, reasoning effort and permission mode.
 - **Home and lock-screen widget.** Shows how many sessions are waiting for you and which ones are working, and opens the waiting session in one tap. It never shows question or command text, and after 15 minutes without fresh state it says "check needed" instead of a reassuring zero.

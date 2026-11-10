@@ -289,11 +289,36 @@ describe("sessions over the bridge", () => {
 		// The other phone got no replay as live updates, so its chat shows the message once.
 		expect(b.events.slice(seenByB).some(e => e.ev === "session.update" && e.p.sessionId === sid)).toBe(false);
 		expect(texts(b)).toEqual(["기억해"]);
-		// Its next open is a full snapshot, once, even though it last saw the end of the old buffer.
-		const next = await b.request("session.open", { sessionId: sid, afterSeq: reopened.seq });
+		// Live news after the reload still reaches it, with a seq past the replay.
+		await a.request("session.prompt", { sessionId: sid, prompt: [{ type: "text", text: "다시" }] });
+		await b.waitFor(e => turnEnd(sid)(e) && e.p.seq > reopened.seq);
+		const live = b.events.filter(e => e.ev === "session.update" && e.p.sessionId === sid && e.p.update.sessionUpdate === "user_message_chunk").at(-1)!;
+		expect(live.p.update.content.text).toBe("다시");
+		expect(live.p.seq).toBeGreaterThan(reopened.seq);
+		expect(texts(b)).toEqual(["기억해", "다시"]);
+		// Its next open, with the last seq it really saw, is a full snapshot once, because live updates hid the gap.
+		const lastSeen = b.events.filter(e => e.ev === "session.update" && e.p.sessionId === sid).at(-1)!.p.seq;
+		const next = await b.request("session.open", { sessionId: sid, afterSeq: lastSeen });
 		expect(next.reset).toBe(true);
 		expect(next.updates.map((u: any) => u.update.content?.text)).toContain("기억해");
 		expect((await b.request("session.open", { sessionId: sid, afterSeq: next.seq })).reset).toBe(false);
+	});
+
+	test("a turn that ends while another phone's reopen reloads the session still ends on the phone that showed the chat", async () => {
+		const bridge = await useBridge({ FAKE_LOAD_SETTLES_PROMPT: "1" });
+		const { client: a } = await bridge.pairedClient("phone-a");
+		const { client: b } = await bridge.pairedClient("phone-b");
+		const sid = (await a.request("session.new", {})).sessionId;
+		await b.request("session.open", { sessionId: sid });
+		await a.request("session.prompt", { sessionId: sid, prompt: [{ type: "text", text: "slow" }] });
+		await b.waitFor(e => e.ev === "session.update" && e.p.sessionId === sid && e.p.update._meta?.gjcPhase === "working");
+		// The attachment goes stale with the prompt still unsettled; the reopen reloads, and the prompt ends inside that load.
+		expect((await a.request("sdk.query", { sessionId: sid, op: "usage.get" }).catch((e: any) => e)).code).toBe(-32002);
+		await a.request("session.open", { sessionId: sid });
+		const ended = await b.waitFor(turnEnd(sid), 5000);
+		expect(ended.p.update.stopReason).toBe("cancelled");
+		// The replay of the load itself stayed away from it.
+		expect(b.events.filter(e => e.ev === "session.update" && e.p.update.sessionUpdate === "user_message_chunk")).toHaveLength(1);
 	});
 
 	test("config changes go through session/set_config_option", async () => {

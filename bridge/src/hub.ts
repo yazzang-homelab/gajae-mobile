@@ -191,7 +191,7 @@ interface SessionState {
 	historySeq: number;
 	/** The permission mode last announced to the phones (`shownPermissionMode`). */
 	shownMode?: PermissionMode;
-	/** A reload whose replay is kept from phones already showing the chat (`#reattach`, or a phone's reopen after an ACP restart). */
+	/** While a reload replays: gjc's updates are kept from phones already showing the chat (every reload is quiet). */
 	quietReplay?: boolean;
 	/**
 	 * Phones (`HubClient.device`) that showed the chat during a quiet replay: they lack what the terminal did while gjc ACP
@@ -455,7 +455,7 @@ export class SessionHub {
 			const cwd = known?.cwd ?? (windowCwd || this.#saved.find(sessionId)?.cwd);
 			if (!cwd) continue;
 			const state = this.#stateFor(sessionId, cwd);
-			await this.#load(state, true).catch(async error => {
+			await this.#load(state).catch(async error => {
 				this.#options.log?.(`reattach ${sessionId} failed: ${error instanceof Error ? error.message : String(error)}`);
 				// A window closed before its gjc's first answer leaves nothing to load: no longer the bridge's window session.
 				if (this.#tmux && !(await this.#tmux.hosts(sessionId, cwd))) state.inTmux = false;
@@ -513,7 +513,7 @@ export class SessionHub {
 		if (method !== "session/update" || typeof params?.sessionId !== "string") return;
 		const state = this.#stateFor(params.sessionId);
 		if (this.#holdEcho(state, params.update)) return;
-		this.#append(state, state.inTmux ? terminalAsk(params.update) : params.update);
+		this.#append(state, state.inTmux ? terminalAsk(params.update) : params.update, state.quietReplay);
 		this.#lookForHandOver(state, params.update);
 		if (state.channel && !state.replaying) this.#watchChannel(state, params.update);
 	}
@@ -774,7 +774,8 @@ export class SessionHub {
 		return state;
 	}
 
-	#append(state: SessionState, update: Record<string, unknown>): void {
+	/** `quiet`: gjc's replay while the session reloads; it stays in the buffer but is not sent live (see `quietReplay`). */
+	#append(state: SessionState, update: Record<string, unknown>, quiet = false): void {
 		if (update.sessionUpdate === "config_option_update" && Array.isArray(update.configOptions)) {
 			update = { ...update, configOptions: supportedConfigOptions(update.configOptions) };
 			state.configOptions = update.configOptions as unknown[];
@@ -790,8 +791,9 @@ export class SessionHub {
 			const dropped = state.buffer.shift()!;
 			state.bufferBytes -= jsonBytes(dropped.update);
 		}
-		// A phone showing the chat already has the history a reload of the bridge's own replays.
-		if (state.quietReplay) return;
+		// A phone showing the chat already has the history a quiet reload replays. What the bridge appends itself during
+		// the reload (a turn end, a held message, a host ask row) is news and goes out.
+		if (quiet) return;
 		for (const { client, sessions } of this.#clients.values()) {
 			if (sessions.has(state.sessionId)) client.deliver("session.update", { sessionId: state.sessionId, ...entry });
 		}
@@ -1149,14 +1151,14 @@ export class SessionHub {
 		await state.releasing?.catch(() => {});
 		if (!state.loaded) {
 			// The opener gets the replay as its snapshot; other phones showing the chat must not get it appended again.
-			await this.#load(state, true);
+			await this.#load(state);
 			return this.#subscribe(clientId, state, 0, true);
 		}
 		return this.#subscribe(clientId, state, params.afterSeq ?? 0);
 	}
 
 	/** Loads the session into the ACP process (`session/load`); one load at a time per session. */
-	#load(state: SessionState, quiet = false): Promise<void> {
+	#load(state: SessionState): Promise<void> {
 		if (state.loaded) return Promise.resolve();
 		state.loading ??= (async () => {
 			const acp = await this.agent();
@@ -1176,7 +1178,7 @@ export class SessionHub {
 			for (const id of [...(state.channel?.requests.keys() ?? [])]) this.#dropChannelRequest(state, id);
 			state.channel = undefined;
 			state.replaying = true;
-			state.quietReplay = quiet;
+			state.quietReplay = true;
 			let result: any;
 			try {
 				result = await acp.request("session/load", { sessionId: state.sessionId, cwd: state.cwd, mcpServers: [] });
@@ -1187,7 +1189,7 @@ export class SessionHub {
 				state.replaying = false;
 				state.quietReplay = false;
 				state.historySeq = state.seq;
-				if (quiet) for (const { client, sessions } of this.#clients.values()) if (sessions.has(state.sessionId)) state.resync.add(client.device ?? client.id);
+				for (const { client, sessions } of this.#clients.values()) if (sessions.has(state.sessionId)) state.resync.add(client.device ?? client.id);
 			}
 			state.configOptions = supportedConfigOptions(result?.configOptions ?? state.configOptions);
 			// Judged on every load: a window the bridge opened (also before a restart) hosts it, or no longer does.
@@ -1457,7 +1459,7 @@ export class SessionHub {
 			}
 			// The turn is over either way; a failed load leaves the session closed, and the phone's next call (-32002)
 			// opens it again.
-			await this.#load(state, true).catch(error =>
+			await this.#load(state).catch(error =>
 				this.#options.log?.(`loading ${state.sessionId} again after releasing its turn failed: ${error instanceof Error ? error.message : String(error)}`),
 			);
 		})().finally(() => {

@@ -13,7 +13,7 @@ final class AppModel {
     var requestedHostId: String?
     private let store = SecureStore()
     private let cache = SessionCache()
-    let device: DeviceIdentity
+    private(set) var device: DeviceIdentity
 
     init() {
         device = store.deviceIdentity()
@@ -110,13 +110,20 @@ final class AppModel {
         connection.ensureConnected()
     }
 
-    /// The Keychain could not be read at launch (locked after a reboot): read again and add the hosts it holds.
-    private func recoverUnreadableHosts() {
+    /// The Keychain could not be read at launch (locked after a reboot): read the device key and the hosts again.
+    /// Hosts are not connected before the real key is back, since a throwaway key is an unknown device to the host.
+    /// The hosts go through the same save as every other change, which re-reads, merges and writes.
+    private func recoverUnreadableStorage() {
+        if store.deviceIsTemporary {
+            guard let recovered = store.recoverDeviceIdentity() else { return }
+            device = recovered
+            for connection in connections.values { connection.disconnect() }
+            connections = [:]
+            for host in hosts { connections[host.hostId] = makeConnection(host) }
+        }
         guard !store.hostsAvailable else { return }
-        let stored = store.hosts()
-        guard store.hostsAvailable else { return }
-        adopt(stored)
-        WidgetStore.sync(hosts)
+        persistHosts()
+        if store.hostsAvailable { WidgetStore.sync(hosts) }
     }
 
     /// Leaving the screen: the connections are still up for a moment, so their view goes to the widget as fresh,
@@ -127,7 +134,8 @@ final class AppModel {
     }
 
     func appBecameActive() {
-        recoverUnreadableHosts()
+        recoverUnreadableStorage()
+        guard !store.deviceIsTemporary else { return }
         for connection in connections.values { connection.ensureConnected() }
     }
 }

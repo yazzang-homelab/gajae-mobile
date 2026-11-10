@@ -25,6 +25,7 @@ enum WidgetRefresher {
         WidgetStore.sync(hosts)
         guard !hosts.isEmpty else { return }
         let device = store.deviceIdentity()
+        guard !store.deviceIsTemporary else { return }
         let deviceName = await UIDevice.current.name
         await withTaskGroup(of: Void.self) { group in
             for host in hosts {

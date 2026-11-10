@@ -46,19 +46,66 @@ public final class PairedHostsVault {
 
     /// Stores `hosts`. While the storage was unreadable, re-reads first: still unreadable writes nothing and
     /// returns nil; otherwise the stored hosts that `hosts` lacks (and that were not forgotten meanwhile) are kept.
+    /// The unreadable state and the forgotten set are cleared only once the merged list is written.
     /// Returns the list that is now stored, or nil when nothing was written.
     @discardableResult
     public func save(hosts: [PairedHost], forgetting hostId: String? = nil) -> [PairedHost]? {
         var merged = hosts
         if unreadable {
             if let hostId { forgottenWhileUnreadable.insert(hostId) }
-            let stored = load()
-            guard !unreadable else { return nil }
+            guard let stored = readStored() else { return nil }
             let known = Set(hosts.map(\.hostId))
             merged = stored.filter { !known.contains($0.hostId) && !forgottenWhileUnreadable.contains($0.hostId) } + hosts
-            forgottenWhileUnreadable = []
         }
         guard let data = try? JSONEncoder().encode(merged), storage.write(data) else { return nil }
+        unreadable = false
+        forgottenWhileUnreadable = []
         return merged
+    }
+
+    /// The stored hosts, or nil when the storage cannot be read; leaves the unreadable state alone.
+    private func readStored() -> [PairedHost]? {
+        switch storage.read() {
+        case .unavailable: return nil
+        case .notFound: return []
+        case .data(let data): return (try? JSONDecoder().decode([PairedHost].self, from: data)) ?? []
+        }
+    }
+}
+
+/// The device key on top of the secure storage. A key that cannot be read (not "no such item") is neither
+/// replaced nor stored over: this run gets a throwaway key, `isTemporary` says so, and `recover()` reads again.
+/// Hosts must not be connected with a throwaway key; the bridge would reject it as an unknown device.
+public final class DeviceIdentityVault {
+    private let storage: HostsBlobStorage
+    public private(set) var isTemporary = false
+
+    public init(storage: HostsBlobStorage) {
+        self.storage = storage
+    }
+
+    public func identity() -> DeviceIdentity {
+        switch storage.read() {
+        case .data(let raw):
+            if let identity = try? DeviceIdentity(rawPrivateKey: raw) {
+                isTemporary = false
+                return identity
+            }
+        case .unavailable:
+            isTemporary = true
+            return DeviceIdentity()
+        case .notFound:
+            break
+        }
+        let identity = DeviceIdentity()
+        isTemporary = !storage.write(identity.rawPrivateKey)
+        return identity
+    }
+
+    /// The stored key once it can be read, or nil while this run still has a throwaway key.
+    public func recover() -> DeviceIdentity? {
+        guard isTemporary else { return nil }
+        let identity = identity()
+        return isTemporary ? nil : identity
     }
 }

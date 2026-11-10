@@ -46,24 +46,16 @@ private struct KeychainAccount: HostsBlobStorage {
 }
 
 struct SecureStore {
-    private let deviceAccount = "device-key"
+    private let deviceVault = DeviceIdentityVault(storage: KeychainAccount(account: "device-key"))
     private let vault = PairedHostsVault(storage: KeychainAccount(account: "paired-hosts"))
 
-    /// A key that could not be read (not "no such item") is not replaced: this run uses a throwaway key and
-    /// the stored one stays for the next read.
-    func deviceIdentity() -> DeviceIdentity {
-        switch Keychain.read(deviceAccount) {
-        case .data(let raw):
-            if let identity = try? DeviceIdentity(rawPrivateKey: raw) { return identity }
-        case .unavailable:
-            return DeviceIdentity()
-        case .notFound:
-            break
-        }
-        let identity = DeviceIdentity()
-        Keychain.write(identity.rawPrivateKey, account: deviceAccount)
-        return identity
-    }
+    func deviceIdentity() -> DeviceIdentity { deviceVault.identity() }
+
+    /// True while this run uses a throwaway key because the stored one could not be read.
+    var deviceIsTemporary: Bool { deviceVault.isTemporary }
+
+    /// The stored key once it can be read, or nil while it still cannot.
+    func recoverDeviceIdentity() -> DeviceIdentity? { deviceVault.recover() }
 
     /// False while the hosts could not be read; the empty list from `hosts()` then means "unknown".
     var hostsAvailable: Bool { vault.isAvailable }

@@ -3,17 +3,23 @@ import XCTest
 
 private final class FakeStorage: HostsBlobStorage {
     var stored: Data?
-    var failing = false
+    var readFailing = false
+    var writeFailing = false
+    /// Both reads and writes fail, as with a locked Keychain.
+    var failing: Bool {
+        get { readFailing && writeFailing }
+        set { readFailing = newValue; writeFailing = newValue }
+    }
     var writes = 0
 
     func read() -> StorageRead {
-        if failing { return .unavailable }
+        if readFailing { return .unavailable }
         guard let stored else { return .notFound }
         return .data(stored)
     }
 
     func write(_ data: Data) -> Bool {
-        guard !failing else { return false }
+        guard !writeFailing else { return false }
         stored = data
         writes += 1
         return true
@@ -119,5 +125,102 @@ final class PairedHostsVaultTests: XCTestCase {
         storage.failing = false
         XCTAssertEqual(vault.load().map(\.hostId), ["a"])
         XCTAssertTrue(vault.isAvailable)
+    }
+
+    func testReadFailingButWritableStorageIsNotOverwritten() throws {
+        // The original defect: reads fail, writes would succeed. Only the re-read guard stops the overwrite.
+        let storage = FakeStorage()
+        PairedHostsVault(storage: storage).save(hosts: [host("a"), host("b")])
+        let before = storage.stored
+        let writesBefore = storage.writes
+
+        storage.readFailing = true
+        let vault = PairedHostsVault(storage: storage)
+        _ = vault.load()
+        XCTAssertNil(vault.save(hosts: [host("c")]))
+        XCTAssertEqual(storage.stored, before)
+        XCTAssertEqual(storage.writes, writesBefore)
+        XCTAssertFalse(vault.isAvailable)
+    }
+
+    func testAFailedWriteAfterASuccessfulReReadKeepsTheStorageUnavailableAndTheForgetting() throws {
+        let storage = FakeStorage()
+        PairedHostsVault(storage: storage).save(hosts: [host("a"), host("b")])
+
+        storage.readFailing = true
+        let vault = PairedHostsVault(storage: storage)
+        _ = vault.load()
+        storage.readFailing = false
+        storage.writeFailing = true
+
+        XCTAssertNil(vault.save(hosts: [host("c")], forgetting: "a"))
+        XCTAssertFalse(vault.isAvailable)
+
+        storage.writeFailing = false
+        let saved = try XCTUnwrap(vault.save(hosts: [host("c")]))
+        XCTAssertEqual(Set(saved.map(\.hostId)), ["b", "c"])
+        XCTAssertTrue(vault.isAvailable)
+    }
+
+    func testSavingTheInMemoryListRecoversHostsAndKeepsPairingsMadeWhileUnreadable() throws {
+        // What the app does when it becomes active again: the same save, with the list it holds.
+        let storage = FakeStorage()
+        PairedHostsVault(storage: storage).save(hosts: [host("a"), host("b")])
+
+        storage.readFailing = true
+        let vault = PairedHostsVault(storage: storage)
+        _ = vault.load()
+        storage.readFailing = false
+
+        let saved = try XCTUnwrap(vault.save(hosts: [host("c")]))
+        XCTAssertEqual(Set(saved.map(\.hostId)), ["a", "b", "c"])
+        XCTAssertEqual(Set(try storedIds(storage)), ["a", "b", "c"])
+    }
+}
+
+final class DeviceIdentityVaultTests: XCTestCase {
+    func testMissingKeyIsCreatedAndStored() throws {
+        let storage = FakeStorage()
+        let vault = DeviceIdentityVault(storage: storage)
+        let identity = vault.identity()
+        XCTAssertFalse(vault.isTemporary)
+        XCTAssertEqual(storage.stored, identity.rawPrivateKey)
+    }
+
+    func testUnreadableKeyIsNotReplacedAndIsTemporary() throws {
+        let storage = FakeStorage()
+        let original = DeviceIdentity()
+        storage.stored = original.rawPrivateKey
+        storage.readFailing = true
+        let vault = DeviceIdentityVault(storage: storage)
+        _ = vault.identity()
+        XCTAssertTrue(vault.isTemporary)
+        XCTAssertEqual(storage.stored, original.rawPrivateKey)
+        XCTAssertEqual(storage.writes, 0)
+    }
+
+    func testRecoverReturnsNilWhileStillUnreadableAndTheStoredKeyOnceReadable() throws {
+        let storage = FakeStorage()
+        let original = DeviceIdentity()
+        storage.stored = original.rawPrivateKey
+        storage.readFailing = true
+        let vault = DeviceIdentityVault(storage: storage)
+        _ = vault.identity()
+        XCTAssertNil(vault.recover())
+        XCTAssertTrue(vault.isTemporary)
+
+        storage.readFailing = false
+        let recovered = try XCTUnwrap(vault.recover())
+        XCTAssertEqual(recovered.rawPrivateKey, original.rawPrivateKey)
+        XCTAssertFalse(vault.isTemporary)
+        XCTAssertNil(vault.recover())
+    }
+
+    func testAKeyThatCannotBeStoredStaysTemporary() throws {
+        let storage = FakeStorage()
+        storage.writeFailing = true
+        let vault = DeviceIdentityVault(storage: storage)
+        _ = vault.identity()
+        XCTAssertTrue(vault.isTemporary)
     }
 }

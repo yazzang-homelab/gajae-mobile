@@ -203,7 +203,14 @@ export function startBridgeServer(options: BridgeServerOptions): Server<Conn> {
 			clientNonce,
 			serverNonce,
 		};
-		const keys = serverKeys(host.keyPair, serverEph, transcript);
+		let keys: ReturnType<typeof serverKeys>;
+		try {
+			keys = serverKeys(host.keyPair, serverEph, transcript);
+		} catch {
+			// A device key is public, so anyone can send an ephemeral key that the key agreement rejects (all zero bytes).
+			log(`rejected hello device=${deviceKeyText.slice(0, 8)}: key agreement failed`);
+			return fail(ws, "bad_hello", "malformed keys");
+		}
 		ws.data.cipher = new FrameCipher(keys.s2c, keys.c2s);
 		ws.data.deviceKey = deviceKeyText;
 		ws.data.deviceName = state.findDevice(deviceKeyText)?.name;
@@ -217,6 +224,21 @@ export function startBridgeServer(options: BridgeServerOptions): Server<Conn> {
 				nonce: b64urlEncode(serverNonce),
 			}),
 		);
+	};
+
+	const handleMessage = (ws: ServerWebSocket<Conn>, raw: string | Buffer) => {
+		const conn = ws.data;
+		if (conn.phase === "hello") {
+			if (typeof raw !== "string") return fail(ws, "bad_hello", "hello must be a text frame");
+			return onHello(ws, raw);
+		}
+		if (conn.phase === "closed") return;
+		if (typeof raw === "string") {
+			conn.phase = "closed";
+			ws.close(4400, "binary_frames_required");
+			return;
+		}
+		void onFrame(ws, Buffer.from(raw));
 	};
 
 	const onFrame = async (ws: ServerWebSocket<Conn>, frame: Buffer) => {
@@ -290,18 +312,14 @@ export function startBridgeServer(options: BridgeServerOptions): Server<Conn> {
 				}, HANDSHAKE_TIMEOUT_MS);
 			},
 			message(ws, raw) {
-				const conn = ws.data;
-				if (conn.phase === "hello") {
-					if (typeof raw !== "string") return fail(ws, "bad_hello", "hello must be a text frame");
-					return onHello(ws, raw);
+				try {
+					handleMessage(ws, raw);
+				} catch (error) {
+					// One bad frame must not take the whole bridge down with every other phone's connection.
+					log(`message handler failed: ${error instanceof Error ? error.message : String(error)}`);
+					ws.data.phase = "closed";
+					ws.close(1011, "internal_error");
 				}
-				if (conn.phase === "closed") return;
-				if (typeof raw === "string") {
-					conn.phase = "closed";
-					ws.close(4400, "binary_frames_required");
-					return;
-				}
-				void onFrame(ws, Buffer.from(raw));
 			},
 			close(ws, code, reason) {
 				// Who closed tells a drop the app chose (it closes with 1000, e.g. on a frame over its limit) from a lost network

@@ -84,6 +84,40 @@ describe("pairing and authentication", () => {
 		expect((await client.closed).reason).toBe("decrypt_failed");
 	});
 
+	test("a hello with an all-zero ephemeral key is refused and the bridge keeps serving", async () => {
+		const bridge = await useBridge();
+		const { identity } = await bridge.pairedClient("known phone");
+		const zeroEphHello = (deviceKey: Uint8Array) =>
+			new Promise<{ reply: any; code: number }>((resolve, reject) => {
+				const ws = new WebSocket(bridge.endpoint);
+				let reply: any;
+				ws.onopen = () =>
+					ws.send(
+						JSON.stringify({
+							t: "hello",
+							v: 1,
+							deviceKey: Buffer.from(deviceKey).toString("base64url"),
+							eph: Buffer.alloc(32).toString("base64url"),
+							nonce: crypto.randomBytes(16).toString("base64url"),
+						}),
+					);
+				ws.onmessage = e => {
+					reply = JSON.parse(String(e.data));
+				};
+				ws.onclose = e => resolve({ reply, code: e.code });
+				ws.onerror = () => reject(new Error("websocket error"));
+			});
+		const known = await zeroEphHello(identity.device.publicKey);
+		expect(known.reply).toMatchObject({ t: "error", code: "bad_hello" });
+		expect(known.code).toBe(4401);
+		const unknown = await zeroEphHello(generateKeyPair().publicKey);
+		expect(unknown.reply).toMatchObject({ t: "error", code: "unknown_device" });
+		// The same bridge process still completes a normal handshake.
+		const again = await BridgeClient.connect(bridge.endpoint, identity);
+		await expect(again.request("ping")).resolves.toHaveProperty("pong");
+		again.close();
+	});
+
 	test("revoked devices are disconnected on their next frame", async () => {
 		const bridge = await useBridge();
 		const { client, identity } = await bridge.pairedClient("old phone");

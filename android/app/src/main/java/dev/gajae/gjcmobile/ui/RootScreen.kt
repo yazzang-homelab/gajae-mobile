@@ -186,6 +186,9 @@ private fun Sidebar(model: AppModel, connection: HostConnection, onClose: () -> 
         }
         item {
             if (connection.loadingMore) CircularProgressIndicator(Modifier.padding(12.dp))
+            connection.listError?.let {
+                Text(it, style = MaterialTheme.typography.labelSmall, color = Palette.gajaeRed, modifier = Modifier.padding(vertical = 8.dp))
+            }
             if (connection.nextCursor == null && connection.sessions.isNotEmpty()) {
                 Text("세션 ${connection.sessions.size}개 · 호스트 ~/.gjc/agent/sessions", style = MaterialTheme.typography.labelSmall, color = Palette.muted, modifier = Modifier.padding(vertical = 8.dp))
             }

@@ -238,7 +238,12 @@ export function startBridgeServer(options: BridgeServerOptions): Server<Conn> {
 			ws.close(4400, "binary_frames_required");
 			return;
 		}
-		void onFrame(ws, Buffer.from(raw));
+		// `onFrame` is async, so the `message` handler's catch does not see what it throws.
+		onFrame(ws, Buffer.from(raw)).catch(error => {
+			log(`frame handler failed: ${error instanceof Error ? error.message : String(error)}`);
+			ws.data.phase = "closed";
+			ws.close(1011, "internal_error");
+		});
 	};
 
 	const onFrame = async (ws: ServerWebSocket<Conn>, frame: Buffer) => {

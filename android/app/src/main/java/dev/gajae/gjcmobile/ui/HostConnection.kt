@@ -13,6 +13,7 @@ import dev.gajae.gjcmobile.core.HostInfo
 import dev.gajae.gjcmobile.core.PairedHost
 import dev.gajae.gjcmobile.core.PermissionRequest
 import dev.gajae.gjcmobile.core.ReconnectBackoff
+import dev.gajae.gjcmobile.core.SessionListFailure
 import dev.gajae.gjcmobile.core.SessionSummary
 import dev.gajae.gjcmobile.widget.WidgetStore
 import kotlinx.coroutines.CoroutineScope
@@ -52,6 +53,8 @@ class HostConnection(
     var permissions by mutableStateOf<List<PermissionRequest>>(emptyList()); private set
     var nextCursor by mutableStateOf<String?>(null); private set
     var loadingMore by mutableStateOf(false); private set
+    /** Why the last session-list request failed while the connection stayed up (an error reply from the bridge). */
+    var listError by mutableStateOf<String?>(null); private set
     var searchQuery by mutableStateOf(""); private set
     /** The host home's chat (null shows the new-chat composer) and that composer's directory. */
     var activeChat by mutableStateOf<ChatModel?>(null)
@@ -124,6 +127,8 @@ class HostConnection(
     }
 
     private fun attach(client: BridgeClient, endpoint: String) {
+        // The previous client's socket and event queue outlive a plain overwrite; the bridge would keep both links.
+        this.client?.takeIf { it !== client }?.close()
         this.client = client
         status = Status.Connected
         listKnown = false
@@ -206,14 +211,23 @@ class HostConnection(
             alerts.sessions(list.sessions).forEach(::notify)
             sessions = list.sessions
             nextCursor = list.nextCursor
+            listError = null
             if (searchQuery.isEmpty()) {
                 listKnown = true
                 recordWidget()
             }
-        } catch (e: BridgeException.Disconnected) {
-            // the event stream reports the drop and reconnects
         } catch (e: Exception) {
-            status = Status.Failed(e.userMessage())
+            handleListFailure(e)
+        }
+    }
+
+    /** Cancellation is rethrown, a drop is left to the event stream, an error reply only marks the list. */
+    private fun handleListFailure(e: Exception) {
+        when (SessionListFailure.classify(e)) {
+            SessionListFailure.Cancelled -> throw e
+            SessionListFailure.Disconnected -> Unit // the event stream reports the drop and reconnects
+            SessionListFailure.Remote -> listError = e.userMessage()
+            SessionListFailure.Transport -> status = Status.Failed(e.userMessage())
         }
     }
 
@@ -241,8 +255,9 @@ class HostConnection(
             alerts.sessions(page.sessions).forEach(::notify)
             sessions = sessions + page.sessions.filter { it.sessionId !in known }
             nextCursor = page.nextCursor
+            listError = null
         } catch (e: Exception) {
-            status = Status.Failed(e.userMessage())
+            handleListFailure(e)
         } finally {
             loadingMore = false
         }

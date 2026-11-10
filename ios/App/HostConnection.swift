@@ -22,6 +22,8 @@ final class HostConnection {
     private(set) var chats: [String: ChatModel] = [:]
     private(set) var nextCursor: String?
     private(set) var loadingMore = false
+    /// Why the last session-list request failed while the connection stayed up (an error reply from the bridge).
+    private(set) var listError: String?
     private(set) var searchQuery = ""
     private(set) var route: HomeRoute?
     /// The host home's chat (nil shows the new-chat composer) and that composer's directory. Kept per host so
@@ -131,6 +133,8 @@ final class HostConnection {
     }
 
     private func attach(_ client: BridgeClient, endpoint: String) {
+        // The previous client's socket and reader outlive a plain overwrite; the bridge would keep both links.
+        if let previous = self.client, previous !== client { Task { await previous.close() } }
         self.client = client
         status = .connected
         listKnown = false
@@ -219,13 +223,24 @@ final class HostConnection {
             alerts.sessions(list.sessions).forEach { notify($0) }
             sessions = list.sessions
             nextCursor = list.nextCursor
+            listError = nil
             if searchQuery.isEmpty {
                 cache.save(sessions, hostId: host.hostId)
                 listKnown = true
                 recordWidget()
             }
         } catch {
-            status = .failed((error as? LocalizedError)?.errorDescription ?? error.localizedDescription)
+            handleListFailure(error)
+        }
+    }
+
+    /// A cancelled request changes nothing, a drop is left to the event stream, an error reply only marks the list.
+    private func handleListFailure(_ error: Error) {
+        let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+        switch SessionListFailure.classify(error) {
+        case .cancelled, .disconnected: break
+        case .remote: listError = message
+        case .transport: status = .failed(message)
         }
     }
 
@@ -254,8 +269,9 @@ final class HostConnection {
             alerts.sessions(page.sessions).forEach { notify($0) }
             sessions += page.sessions.filter { !known.contains($0.sessionId) }
             nextCursor = page.nextCursor
+            listError = nil
         } catch {
-            status = .failed((error as? LocalizedError)?.errorDescription ?? error.localizedDescription)
+            handleListFailure(error)
         }
     }
 

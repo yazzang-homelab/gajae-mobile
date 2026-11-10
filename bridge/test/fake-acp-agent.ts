@@ -338,6 +338,12 @@ async function handle(msg: any) {
 			saveTranscript(sid, sessionCwds.get(sid) ?? "/tmp");
 			for (const block of params.prompt) update(sid, { sessionUpdate: "user_message_chunk", content: block });
 			if (texts.join(" ") === "crash") process.exit(3);
+			// "malformed" stands for a gjc that writes lines outside the protocol before its real reply.
+			if (texts.join(" ") === "malformed") {
+				process.stdout.write("null\n");
+				process.stdout.write("42\n");
+				write({ jsonrpc: "2.0", method: "session/update", params: { sessionId: sid } });
+			}
 			// "huge" stands for a single update bigger than any frame (a tool's output, say): 33 MiB of text.
 			if (texts.join(" ") === "huge") {
 				update(sid, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "x".repeat(33 * 1024 * 1024) } });

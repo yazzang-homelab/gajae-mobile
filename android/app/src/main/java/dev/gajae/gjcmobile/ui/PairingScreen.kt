@@ -40,6 +40,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -51,9 +52,9 @@ import androidx.compose.ui.unit.dp
 import com.journeyapps.barcodescanner.ScanContract
 import com.journeyapps.barcodescanner.ScanOptions
 import dev.gajae.gjcmobile.R
-import dev.gajae.gjcmobile.core.PairingDisposition
+import dev.gajae.gjcmobile.core.PairingConfirmation
 import dev.gajae.gjcmobile.core.PairingOffer
-import dev.gajae.gjcmobile.core.pairingDisposition
+import dev.gajae.gjcmobile.core.pairingConfirmation
 import kotlinx.coroutines.launch
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -62,7 +63,8 @@ fun PairingScreen(model: AppModel, onClose: (() -> Unit)?) {
     var manual by remember { mutableStateOf("") }
     var working by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
-    var pending by remember { mutableStateOf<Pair<String, PairingOffer>?>(null) }
+    // A link waiting for the user's confirmation; saved so rotating the screen does not lose it.
+    var pending by rememberSaveable { mutableStateOf<String?>(null) }
     val scope = rememberCoroutineScope()
 
     fun parseErrorMessage(e: PairingOffer.ParseException) = when (e.error) {
@@ -101,9 +103,9 @@ fun PairingScreen(model: AppModel, onClose: (() -> Unit)?) {
             error = parseErrorMessage(e)
             return
         }
-        if (fromLink || pairingDisposition(offer, model.hosts) == PairingDisposition.KEY_CHANGED) {
+        if (pairingConfirmation(offer, model.hosts, fromLink) != PairingConfirmation.NONE) {
             error = null
-            pending = text.trim() to offer
+            pending = text.trim()
         } else {
             submit(text)
         }
@@ -120,8 +122,14 @@ fun PairingScreen(model: AppModel, onClose: (() -> Unit)?) {
         }
     }
 
-    pending?.let { (text, offer) ->
-        val keyChanged = pairingDisposition(offer, model.hosts) == PairingDisposition.KEY_CHANGED
+    // The pending link is kept as text across rotation and parsed again; one that no longer parses is dropped.
+    val pendingOffer = pending?.let { text -> runCatching { PairingOffer.parse(text) }.getOrNull() }
+    if (pending != null && pendingOffer == null) pending = null
+    val pendingText = pending
+    if (pendingText != null && pendingOffer != null) {
+        val text = pendingText
+        val offer = pendingOffer
+        val keyChanged = pairingConfirmation(offer, model.hosts, fromLink = true) == PairingConfirmation.REPLACE_KEY
         AlertDialog(
             onDismissRequest = { pending = null },
             title = { Text(if (keyChanged) "호스트 교체" else "이 호스트에 연결할까요?") },

@@ -77,6 +77,23 @@ fun pairingDisposition(offer: PairingOffer, hosts: List<PairedHost>): PairingDis
     return if (existing.hostKey == offer.hostKey) PairingDisposition.SAME_KEY else PairingDisposition.KEY_CHANGED
 }
 
+/** What the user must approve before an offer is submitted. */
+enum class PairingConfirmation { NONE, CONNECT, REPLACE_KEY }
+
+/**
+ * A link that arrived from outside the app is always confirmed; an offer the user scanned or pasted in the app
+ * goes straight through unless it would replace a known host's key.
+ */
+fun pairingConfirmation(offer: PairingOffer, hosts: List<PairedHost>, fromLink: Boolean): PairingConfirmation = when {
+    pairingDisposition(offer, hosts) == PairingDisposition.KEY_CHANGED -> PairingConfirmation.REPLACE_KEY
+    fromLink -> PairingConfirmation.CONNECT
+    else -> PairingConfirmation.NONE
+}
+
+/** Replacing a known host's key is refused unless the user explicitly approved the replacement. */
+fun pairingAllowed(offer: PairingOffer, hosts: List<PairedHost>, keyChangeApproved: Boolean): Boolean =
+    keyChangeApproved || pairingDisposition(offer, hosts) != PairingDisposition.KEY_CHANGED
+
 fun parseInstant(text: String): Instant? =
     runCatching { Instant.parse(text) }.getOrNull() ?: runCatching { OffsetDateTime.parse(text).toInstant() }.getOrNull()
 

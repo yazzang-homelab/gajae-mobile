@@ -35,8 +35,7 @@ struct GjcMobileApp: App {
     /// camera) is a pairing link.
     private func handle(_ url: URL) {
         guard url.host == "session" else {
-            model.pairingNeedsConfirmation = true
-            model.pairingURL = url.absoluteString
+            model.pairingLink = PairingLink(text: url.absoluteString, fromLink: true)
             return
         }
         let query = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? []

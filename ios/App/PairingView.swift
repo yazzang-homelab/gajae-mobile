@@ -28,7 +28,7 @@ struct PairingView: View {
                             Text("카메라 권한이 없습니다.\n설정에서 허용하거나 아래에 페어링 링크를 붙여 넣으세요.")
                                 .multilineTextAlignment(.center).foregroundStyle(Palette.muted).padding()
                         } else {
-                            QRScannerView { code in request(code, confirm: false) }
+                            QRScannerView { code in if pending == nil { request(code, fromLink: false) } }
                         }
                         if working { ProgressView().controlSize(.large).tint(Palette.cream) }
                     }
@@ -46,7 +46,7 @@ struct PairingView: View {
                             .textInputAutocapitalization(.never)
                             .autocorrectionDisabled()
                             .padding(10).card()
-                        Button("연결") { request(manual, confirm: false) }
+                        Button("연결") { request(manual, fromLink: false) }
                             .buttonStyle(.borderedProminent)
                             .disabled(manual.isEmpty || working)
                     }
@@ -87,11 +87,9 @@ struct PairingView: View {
                 Text(confirmationMessage(for: request))
             }
             .task {
-                if let pending = model.pairingURL {
-                    model.pairingURL = nil
-                    let confirm = model.pairingNeedsConfirmation
-                    model.pairingNeedsConfirmation = true
-                    request(pending, confirm: confirm)
+                if let link = model.pairingLink {
+                    model.pairingLink = nil
+                    request(link.text, fromLink: link.fromLink)
                 }
                 cameraDenied = !(await AVCaptureDevice.requestAccess(for: .video))
             }
@@ -103,7 +101,7 @@ struct PairingView: View {
         error = nil
         Task {
             do {
-                request(try await DemoHost.pairingLink(), confirm: false)
+                request(try await DemoHost.pairingLink(), fromLink: false)
             } catch {
                 self.error = DemoHost.failure
             }
@@ -126,9 +124,11 @@ struct PairingView: View {
     }
 
     /// A link that arrived from outside the app is always confirmed first; an offer the user scanned or pasted
-    /// here goes straight through unless it would replace a known host's key.
-    private func request(_ text: String, confirm: Bool) {
-        guard !working, confirm || pending == nil else { return }
+    /// here goes straight through unless it would replace a known host's key. A new request replaces a pending
+    /// one, so a confirmation that failed to appear never blocks pasting (the scanner just ignores codes while one
+    /// is pending, so a second QR cannot swap the target under a shown alert).
+    private func request(_ text: String, fromLink: Bool) {
+        guard !working else { return }
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         let offer: PairingOffer
         do {
@@ -140,10 +140,10 @@ struct PairingView: View {
             self.error = error.localizedDescription
             return
         }
-        let keyChanged = offer.disposition(among: model.hosts) == .keyChanged
-        if confirm || keyChanged {
+        let confirmation = offer.confirmation(among: model.hosts, fromLink: fromLink)
+        if confirmation != .none {
             error = nil
-            pending = PendingPairing(text: trimmed, offer: offer, keyChanged: keyChanged)
+            pending = PendingPairing(text: trimmed, offer: offer, keyChanged: confirmation == .replaceKey)
         } else {
             submit(trimmed)
         }

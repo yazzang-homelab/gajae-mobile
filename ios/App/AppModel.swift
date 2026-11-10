@@ -3,6 +3,11 @@ import GjcMobileCore
 import Observation
 import UIKit
 
+struct PairingLink: Equatable {
+    let text: String
+    let fromLink: Bool
+}
+
 enum PairingRefused: LocalizedError {
     case keyChanged
 
@@ -14,9 +19,9 @@ enum PairingRefused: LocalizedError {
 final class AppModel {
     private(set) var hosts: [PairedHost]
     private(set) var connections: [String: HostConnection] = [:]
-    var pairingURL: String?
-    /// A link from outside the app (deep link, system camera) is confirmed before pairing; the demo button's is not.
-    var pairingNeedsConfirmation = true
+    /// A pairing link for the pairing sheet. `fromLink` (deep link, system camera) means the user is asked to confirm
+    /// it first; the demo button's link is not.
+    var pairingLink: PairingLink?
     /// Host to bring to the front, set by a widget link and consumed by `RootView`.
     var requestedHostId: String?
     private let store = SecureStore()
@@ -49,7 +54,7 @@ final class AppModel {
     func pair(with offerText: String, replaceChangedKey: Bool = false) async throws -> PairedHost {
         let offer = try PairingOffer.parse(offerText)
         // A known hostId under a different key is replaced only when the user explicitly approved it.
-        if offer.disposition(among: hosts) == .keyChanged, !replaceChangedKey { throw PairingRefused.keyChanged }
+        if !offer.isAllowed(among: hosts, keyChangeApproved: replaceChangedKey) { throw PairingRefused.keyChanged }
         guard let hostKey = Data(base64URL: offer.hostKey), let secret = Data(base64URL: offer.secret) else {
             throw PairingOffer.ParseError.malformed
         }

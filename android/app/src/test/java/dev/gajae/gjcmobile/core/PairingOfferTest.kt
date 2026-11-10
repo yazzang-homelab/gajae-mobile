@@ -93,6 +93,30 @@ class PairingOfferTest {
     fun sameHostIdWithDifferentKeyIsAKeyChange() =
         assertEquals(PairingDisposition.KEY_CHANGED, dispositionFor(B64Url.encode(ByteArray(32) { 2 })))
 
+    private val k1 = B64Url.encode(ByteArray(32) { 1 })
+    private val k2 = B64Url.encode(ByteArray(32) { 2 })
+    private fun hostWith(key: String) = listOf(PairedHost("h1", "mac", key, emptyList()))
+
+    @Test
+    fun linksAreAlwaysConfirmedAndInAppScansOnlyWhenTheKeyChanges() {
+        val offer = PairingOffer.parse(link(), now)
+        assertEquals(PairingConfirmation.CONNECT, pairingConfirmation(offer, emptyList(), fromLink = true))
+        assertEquals(PairingConfirmation.CONNECT, pairingConfirmation(offer, hostWith(k1), fromLink = true))
+        assertEquals(PairingConfirmation.NONE, pairingConfirmation(offer, emptyList(), fromLink = false))
+        assertEquals(PairingConfirmation.NONE, pairingConfirmation(offer, hostWith(k1), fromLink = false))
+        assertEquals(PairingConfirmation.REPLACE_KEY, pairingConfirmation(offer, hostWith(k2), fromLink = true))
+        assertEquals(PairingConfirmation.REPLACE_KEY, pairingConfirmation(offer, hostWith(k2), fromLink = false))
+    }
+
+    @Test
+    fun keyChangeIsRefusedWithoutExplicitApproval() {
+        val offer = PairingOffer.parse(link(), now)
+        assertEquals(false, pairingAllowed(offer, hostWith(k2), keyChangeApproved = false))
+        assertEquals(true, pairingAllowed(offer, hostWith(k2), keyChangeApproved = true))
+        assertEquals(true, pairingAllowed(offer, hostWith(k1), keyChangeApproved = false))
+        assertEquals(true, pairingAllowed(offer, emptyList(), keyChangeApproved = false))
+    }
+
     @Test
     fun newChatCwdPrefersThisChatThenSavedDefaultThenBridge() {
         val host = PairedHost("h", "n", "k", emptyList())

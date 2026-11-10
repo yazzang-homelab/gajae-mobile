@@ -16,9 +16,8 @@ import dev.gajae.gjcmobile.core.BridgeException
 import dev.gajae.gjcmobile.core.DeviceIdentity
 import dev.gajae.gjcmobile.core.OkHttpFrameTransport
 import dev.gajae.gjcmobile.core.PairedHost
-import dev.gajae.gjcmobile.core.PairingDisposition
 import dev.gajae.gjcmobile.core.PairingOffer
-import dev.gajae.gjcmobile.core.pairingDisposition
+import dev.gajae.gjcmobile.core.pairingAllowed
 import dev.gajae.gjcmobile.core.SessionSummary
 import dev.gajae.gjcmobile.core.get
 import dev.gajae.gjcmobile.core.parseJson
@@ -70,7 +69,7 @@ class AppModel(application: Application) : AndroidViewModel(application) {
     suspend fun pair(offerText: String, replaceChangedKey: Boolean = false): PairedHost {
         val offer = PairingOffer.parse(offerText)
         // A known hostId under a different key is replaced only when the user explicitly approved it.
-        if (pairingDisposition(offer, hosts) == PairingDisposition.KEY_CHANGED && !replaceChangedKey) {
+        if (!pairingAllowed(offer, hosts, replaceChangedKey)) {
             throw IllegalStateException(KEY_CHANGED_REFUSED)
         }
         val hostKey = B64Url.decode(offer.hostKey)!!

@@ -155,6 +155,39 @@ describe("pairing and authentication", () => {
 	});
 });
 
+describe("revocation of an attached device", () => {
+	test("a revoked device that sends nothing is closed and stops receiving; another device still does", async () => {
+		const bridge = await useBridge();
+		const { client: lost } = await bridge.pairedClient("lost phone");
+		const { client: kept } = await bridge.pairedClient("kept phone");
+		await lost.request("ping");
+		await kept.request("ping");
+		bridge.state.revokeDevice("lost phone");
+		const sid = (await kept.request("session.new", {})).sessionId;
+		await kept.request("session.prompt", { sessionId: sid, prompt: [{ type: "text", text: "tool" }] });
+		await kept.waitFor(e => e.ev === "permission.request");
+		expect((await lost.closed).reason).toBe("device_revoked");
+		expect(lost.events.some(e => e.ev === "permission.request")).toBe(false);
+		expect(bridge.state.devices().map(d => d.name)).toEqual(["kept phone"]);
+	});
+
+	test("an unreadable device list closes the connection it was checked for and the bridge keeps serving", async () => {
+		const bridge = await useBridge();
+		const { client } = await bridge.pairedClient("phone");
+		const sid = (await client.request("session.new", {})).sessionId;
+		const devicesFile = path.join(bridge.state.home, "devices.json");
+		const saved = fs.readFileSync(devicesFile, "utf8");
+		// A running turn makes the bridge send on its own (the status tick), with no frame from the phone in between.
+		void client.request("session.prompt", { sessionId: sid, prompt: [{ type: "text", text: "slow" }] }).catch(() => {});
+		await client.waitFor(e => e.ev === "session.update" && JSON.stringify(e.p).includes("one"));
+		fs.writeFileSync(devicesFile, "{");
+		expect((await client.closed).reason).toBe("internal_error");
+		fs.writeFileSync(devicesFile, saved);
+		const { client: next } = await bridge.pairedClient("next phone");
+		expect(await next.request("ping")).toBeDefined();
+	});
+});
+
 describe("gjc ACP process failures", () => {
 	test("a gjc that dies before answering initialize reports its exit code and stderr", async () => {
 		const dying = [

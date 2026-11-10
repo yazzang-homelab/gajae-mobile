@@ -28,7 +28,7 @@ App Store Connect와 Play Console에 그대로 붙여 넣는 값입니다. 앱 U
 ```
 가재코드 모바일은 내 컴퓨터에서 돌아가는 코딩 에이전트 가재코드(gjc)를 휴대폰에서 다루는 앱입니다.
 
-• 휴대폰에서 승인: 에이전트가 명령을 실행하려 하면 알림이 오고, 허용하거나 거부합니다.
+• 휴대폰에서 승인: 에이전트가 명령을 실행하려 하면 앱이 열려 있고 연결된 동안 알림이 오고, 허용하거나 거부합니다. 앱이 닫혀 있으면 알림은 오지 않습니다. 홈 화면에 위젯을 두었다면 다음 백그라운드 갱신 뒤에 대기 중인 요청이 표시되며, 갱신까지 15분 넘게 걸릴 수 있습니다.
 • 끼어들기와 중단: 진행 중인 턴에 지시를 넣거나, 다음 지시를 예약하거나, 멈춥니다.
 • 홈·잠금화면 위젯: 내 답을 기다리는 세션과 작업 중인 세션을 보여주고, 누르면 그 세션이 바로 열립니다. 질문이나 명령 내용은 위젯에 표시하지 않습니다.
 • 세션·모델·모드: 저장된 세션을 이어가고 검색하며, 모델·추론 강도·권한 모드를 바꿉니다.
@@ -51,7 +51,7 @@ App Store Connect와 Play Console에 그대로 붙여 넣는 값입니다. 앱 U
 ```
 Gajae Code mobile is a companion app for Gajae Code (gjc), the coding agent that runs on your own computer.
 
-• Approve from your phone: when the agent wants to run a command you get a notification and allow or reject it.
+• Approve from your phone: when the agent wants to run a command you get a notification while the app is open and connected, and allow or reject it. When the app is closed there is no notification. If you keep the home screen widget, it shows the waiting request after its next background refresh, which can take more than 15 minutes.
 • Steer and interrupt: send an instruction into a running turn, queue the next one, or stop it.
 • Home and lock-screen widget: see which sessions are waiting for you or working, and open the waiting one in one tap. Question and command text never appear on the widget.
 • Sessions, models, modes: resume and search saved sessions, switch model, reasoning effort and permission mode.
@@ -75,7 +75,7 @@ Source code: https://github.com/yazzang-homelab/gajae-mobile (AGPL-3.0)
 ```
 Gajae Code mobile 是 Gajae Code（gjc）的伴侣应用。Gajae Code 是运行在你自己电脑上的编程智能体。
 
-• 在手机上批准：智能体要执行命令时会通知你，你可以允许或拒绝。
+• 在手机上批准：应用处于打开并已连接状态时，智能体要执行命令会通知你，你可以允许或拒绝。应用关闭时不会有通知。如果在主屏幕放置了小组件，它会在下一次后台刷新后显示等待中的请求，刷新可能需要超过 15 分钟。
 • 介入与中断：向正在运行的回合插入指令、排队下一条指令，或直接停止。
 • 主屏幕与锁屏小组件：查看哪些会话在等你、哪些正在运行，轻点即可打开等待中的会话。小组件不会显示问题或命令内容。
 • 会话、模型、模式：继续并搜索已保存的会话，切换模型、推理强度和权限模式。

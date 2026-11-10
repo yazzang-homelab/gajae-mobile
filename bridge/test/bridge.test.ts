@@ -154,6 +154,17 @@ describe("sessions over the bridge", () => {
 		expect(client.events.some(e => e.ev === "permission.resolved")).toBe(true);
 	});
 
+	test("malformed ACP lines are dropped and the turn after them still completes", async () => {
+		const bridge = await useBridge();
+		const { client } = await bridge.pairedClient();
+		const sid = (await client.request("session.new", {})).sessionId;
+		await client.request("session.prompt", { sessionId: sid, prompt: [{ type: "text", text: "malformed" }] });
+		const end = await client.waitFor(turnEnd(sid));
+		expect(end.p.update.stopReason).toBe("end_turn");
+		expect((await client.request("ping")).pong).toBeNumber();
+		expect(client.events.some(e => e.ev === "session.update" && e.p.update.sessionUpdate === "agent_message_chunk")).toBe(true);
+	});
+
 	test("reconnecting with afterSeq gets only the missed updates; pending permission is re-offered", async () => {
 		const bridge = await useBridge();
 		const { client, identity } = await bridge.pairedClient();

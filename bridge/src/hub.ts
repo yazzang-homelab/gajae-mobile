@@ -238,6 +238,9 @@ function shownPermissionMode(state: SessionState): PermissionMode {
 	return state.inTmux && !state.channel && state.permissionMode === "prompt" ? "allow" : state.permissionMode;
 }
 
+/** Wait between `session/load` attempts while gjc in a new tmux window registers its session (see `#attachWindow`). */
+const ATTACH_RETRY_MS = 250;
+
 /** Reads per trigger at most, and the wait between them while a pending tool call is not listed yet. */
 const CHANNEL_READS = 4;
 const CHANNEL_RETRY_MS = 1000;
@@ -451,9 +454,12 @@ export class SessionHub {
 			if (known?.loaded || this.#stopped) continue;
 			const cwd = known?.cwd ?? (windowCwd || this.#saved.find(sessionId)?.cwd);
 			if (!cwd) continue;
-			await this.#load(this.#stateFor(sessionId, cwd), true).catch(error =>
-				this.#options.log?.(`reattach ${sessionId} failed: ${error instanceof Error ? error.message : String(error)}`),
-			);
+			const state = this.#stateFor(sessionId, cwd);
+			await this.#load(state, true).catch(async error => {
+				this.#options.log?.(`reattach ${sessionId} failed: ${error instanceof Error ? error.message : String(error)}`);
+				// A window closed before its gjc's first answer leaves nothing to load: no longer the bridge's window session.
+				if (this.#tmux && !(await this.#tmux.hosts(sessionId, cwd))) state.inTmux = false;
+			});
 		}
 	}
 
@@ -1088,26 +1094,53 @@ export class SessionHub {
 		if (!isDirectory(cwd)) throw new AcpError(-32602, `호스트에 작업 디렉터리가 없습니다: ${cwd}`);
 		const tmuxSkipped = this.#tmux && (await this.#tmux.unavailable());
 		if (tmuxSkipped) this.#options.log?.(`tmux skipped (opening over ACP): ${tmuxSkipped.slice(0, 200)}`);
-		const result = await acp.request("session/new", { cwd, mcpServers: [] });
 		if (this.#tmux && !tmuxSkipped) {
-			// ACP lets go of the session it just wrote, and gjc in the window resumes it; the phone then attaches
-			// to that TUI host like to any terminal session. A failure leaves the (empty) session saved.
+			// gjc in the window starts the session; the phone then attaches to that TUI host like to any terminal
+			// session. Nothing is saved until its first answer, so a window closed unused leaves no transcript behind.
+			let window: { sessionId: string; pane: string };
 			try {
-				await acp.request("session/close", { sessionId: result.sessionId });
-				await this.#tmux.open(result.sessionId, cwd);
+				window = await this.#tmux.open(cwd);
 			} catch (error) {
-				const message = error instanceof Error ? error.message : String(error);
-				throw new AcpError(-32021, `새 세션을 tmux 창으로 열지 못했습니다(${result.sessionId}): ${message}`, {
-					code: error instanceof TmuxError ? error.code : "tmux_handoff_failed",
-				});
+				if (!(error instanceof TmuxError)) throw error;
+				throw new AcpError(-32021, `새 세션을 tmux 창으로 열지 못했습니다: ${error.message}`, { code: error.code });
 			}
-			this.#stateFor(result.sessionId, cwd).inTmux = true;
-			return this.openSession(clientId, { sessionId: result.sessionId, cwd });
+			return this.#attachWindow(clientId, this.#tmux, window, cwd);
 		}
+		const result = await acp.request("session/new", { cwd, mcpServers: [] });
 		const state = this.#stateFor(result.sessionId, cwd);
 		state.loaded = true;
 		state.configOptions = supportedConfigOptions(result.configOptions ?? state.configOptions);
 		return this.#subscribe(clientId, state, 0);
+	}
+
+	/**
+	 * Attaches the phone to the session gjc in a new tmux window started. gjc writes its SDK endpoint before it registers
+	 * the session with the broker, and `session/load` answers `not_found` until it has (gjc 0.19.3/0.20.0
+	 * `session-runtime.ts`), so the load is tried again while the window lives, up to `attachTimeoutMs`. A window the
+	 * phone could not attach to is removed: nobody would find it again before its first answer saved the session.
+	 */
+	async #attachWindow(clientId: string, tmux: TmuxLauncher, window: { sessionId: string; pane: string }, cwd: string): Promise<OpenSnapshot> {
+		const { sessionId, pane } = window;
+		const state = this.#stateFor(sessionId, cwd);
+		state.inTmux = true;
+		const deadline = Date.now() + tmux.attachTimeoutMs;
+		for (;;) {
+			try {
+				return await this.openSession(clientId, { sessionId, cwd });
+			} catch (error) {
+				const unregistered = error instanceof AcpError && (error.data as { code?: unknown } | undefined)?.code === "not_found";
+				const retry = unregistered && Date.now() < deadline && (await tmux.hosts(sessionId, cwd));
+				if (retry) {
+					await Bun.sleep(ATTACH_RETRY_MS);
+					continue;
+				}
+				await tmux.close(pane);
+				if (this.#sessions.get(sessionId) === state) this.#sessions.delete(sessionId);
+				if (!unregistered) throw error;
+				const message = error instanceof Error ? error.message : String(error);
+				throw new AcpError(-32021, `새 세션 창의 gjc에 붙지 못했습니다: ${message}`, { code: "tmux_attach_failed" });
+			}
+		}
 	}
 
 	async openSession(clientId: string, params: { sessionId: string; cwd?: string; afterSeq?: number }): Promise<OpenSnapshot> {

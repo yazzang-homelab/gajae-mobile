@@ -267,6 +267,35 @@ describe("sessions over the bridge", () => {
 		expect(reopened.updates.map((u: any) => u.update.content?.text)).toEqual(["기억해", "crash"]);
 	});
 
+	test("a reopen after an ACP restart does not replay the history onto another phone showing the chat", async () => {
+		const bridge = await useBridge();
+		const { client: a } = await bridge.pairedClient("phone-a");
+		const { client: b } = await bridge.pairedClient("phone-b");
+		const sid = (await a.request("session.new", {})).sessionId;
+		await b.request("session.open", { sessionId: sid });
+		await a.request("session.prompt", { sessionId: sid, prompt: [{ type: "text", text: "기억해" }] });
+		await b.waitFor(turnEnd(sid));
+		const texts = (c: typeof a) => c.events.filter(e => e.ev === "session.update" && e.p.sessionId === sid && e.p.update.sessionUpdate === "user_message_chunk").map(e => e.p.update.content?.text);
+		expect(texts(b)).toEqual(["기억해"]);
+		const seenByB = b.events.length;
+		bridge.hangup();
+		await Bun.sleep(200);
+		expect((await a.request("session.setConfig", { sessionId: sid, configId: "model", value: "fake/model-b" }).catch((e: any) => e)).code).toBe(-32002);
+		const reopened = await a.request("session.open", { sessionId: sid });
+		// Control: the phone that reopened gets the replay as its snapshot.
+		expect(reopened.reset).toBe(true);
+		expect(reopened.updates.map((u: any) => u.update.content?.text)).toContain("기억해");
+		await Bun.sleep(200);
+		// The other phone got no replay as live updates, so its chat shows the message once.
+		expect(b.events.slice(seenByB).some(e => e.ev === "session.update" && e.p.sessionId === sid)).toBe(false);
+		expect(texts(b)).toEqual(["기억해"]);
+		// Its next open is a full snapshot, once, even though it last saw the end of the old buffer.
+		const next = await b.request("session.open", { sessionId: sid, afterSeq: reopened.seq });
+		expect(next.reset).toBe(true);
+		expect(next.updates.map((u: any) => u.update.content?.text)).toContain("기억해");
+		expect((await b.request("session.open", { sessionId: sid, afterSeq: next.seq })).reset).toBe(false);
+	});
+
 	test("config changes go through session/set_config_option", async () => {
 		const bridge = await useBridge();
 		const { client } = await bridge.pairedClient();

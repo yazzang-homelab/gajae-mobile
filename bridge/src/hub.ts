@@ -191,7 +191,7 @@ interface SessionState {
 	historySeq: number;
 	/** The permission mode last announced to the phones (`shownPermissionMode`). */
 	shownMode?: PermissionMode;
-	/** A reload the bridge started on its own (`#reattach`): its replay is kept from phones already showing the chat. */
+	/** A reload whose replay is kept from phones already showing the chat (`#reattach`, or a phone's reopen after an ACP restart). */
 	quietReplay?: boolean;
 	/**
 	 * Phones (`HubClient.device`) that showed the chat during a quiet replay: they lack what the terminal did while gjc ACP
@@ -1148,7 +1148,8 @@ export class SessionHub {
 		// A turn being released (`#releaseTurn`) reloads the session itself.
 		await state.releasing?.catch(() => {});
 		if (!state.loaded) {
-			await this.#load(state);
+			// The opener gets the replay as its snapshot; other phones showing the chat must not get it appended again.
+			await this.#load(state, true);
 			return this.#subscribe(clientId, state, 0, true);
 		}
 		return this.#subscribe(clientId, state, params.afterSeq ?? 0);

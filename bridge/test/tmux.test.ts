@@ -32,13 +32,29 @@ function tmux(socket: string, ...args: string[]) {
 }
 
 /** A bridge whose new sessions go to tmux session `gjcm` on a private tmux socket. */
-async function tmuxBridge(options: { server: boolean; tui?: string; readyTimeoutMs?: number; attachTimeoutMs?: number; env?: Record<string, string> }) {
-	const socket = `gjcm-test-${crypto.randomBytes(4).toString("hex")}`;
-	cleanups.push(() => void tmux(socket, "kill-server"));
+async function tmuxBridge(options: {
+	server: boolean;
+	tui?: string;
+	readyTimeoutMs?: number;
+	attachTimeoutMs?: number;
+	env?: Record<string, string>;
+	/** The tmux server, working directory and gjc state of a bridge that ran before (its process is gone). */
+	after?: { socket: string; cwd: string; home: string };
+}) {
+	const socket = options.after?.socket ?? `gjcm-test-${crypto.randomBytes(4).toString("hex")}`;
+	if (!options.after) cleanups.push(() => void tmux(socket, "kill-server"));
 	// The user's own tmux server, which the bridge only joins.
 	if (options.server) expect(tmux(socket, "new-session", "-d", "-s", "keep", "sleep 600").code).toBe(0);
-	const cwd = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "gjcm-tmux-cwd-")));
-	cleanups.push(() => fs.rmSync(cwd, { recursive: true, force: true }));
+	const cwd = options.after?.cwd ?? fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "gjcm-tmux-cwd-")));
+	if (!options.after) cleanups.push(() => fs.rmSync(cwd, { recursive: true, force: true }));
+	// gjc's sessions outlive the bridge: the next one finds what the one before left.
+	const gjcState: Record<string, string> = options.after
+		? {
+				FAKE_ACP_STATE: path.join(options.after.home, "fake-acp-sessions.json"),
+				GJCM_FAKE_AGENT_DIR: path.join(options.after.home, "agent"),
+				GJC_CODING_AGENT_DIR: path.join(options.after.home, "agent"),
+			}
+		: {};
 	const command = [...FAKE_AGENT, "--mode=acp", `--tui=${options.tui ?? "run"}`];
 	const tmuxOptions = {
 		session: "gjcm",
@@ -46,7 +62,7 @@ async function tmuxBridge(options: { server: boolean; tui?: string; readyTimeout
 		...(options.readyTimeoutMs ? { readyTimeoutMs: options.readyTimeoutMs } : {}),
 		...(options.attachTimeoutMs ? { attachTimeoutMs: options.attachTimeoutMs } : {}),
 	};
-	const bridge = await startTestBridge(command, cwd, { GJCM_TEST_TMUX: JSON.stringify(tmuxOptions), ...options.env });
+	const bridge = await startTestBridge(command, cwd, { GJCM_TEST_TMUX: JSON.stringify(tmuxOptions), ...gjcState, ...options.env });
 	cleanups.push(() => bridge.stop());
 	const { client, identity } = await bridge.pairedClient();
 	const windows = () => {
@@ -94,7 +110,14 @@ async function tmuxBridge(options: { server: boolean; tui?: string; readyTimeout
 		}
 		return false;
 	};
-	return { socket, cwd, client, windows, tags, reconnect, killAcp, home: bridge.home };
+	/** The bridge process dies (its gjc ACP with it); the tmux window, its TUI and gjc's state stay. */
+	const killBridge = async () => {
+		const acps = acpProcesses();
+		process.kill(bridge.pid, "SIGKILL");
+		for (const acp of acps) process.kill(Number(acp), "SIGKILL");
+		await until(() => ![bridge.pid, ...acps].some(pid => fs.existsSync(`/proc/${pid}`)), 5000);
+	};
+	return { socket, cwd, client, windows, tags, reconnect, killAcp, killBridge, home: bridge.home };
 }
 
 describe("tuiCommand", () => {
@@ -325,7 +348,49 @@ describe.skipIf(!hasTmux)("tool approvals of a tmux session reach the phone (gm#
 		expect(client.events.filter(permissionFor(sid))).toEqual([]);
 	}, 40_000);
 
-	test("brings a terminal turn's approval too, and drops the card of one that expired unanswered", async () => {
+	test("a bridge started while the host works asks the phone, and no longer once the host is idle", async () => {
+		// It cannot tell a turn typed at the terminal from a phone turn the bridge before it was asking for.
+		const first = await tmuxBridge({ server: true });
+		const sid = (await first.client.request("session.new", {})).sessionId;
+		const sdk = path.join(first.cwd, ".gjc", "state", "sdk");
+		await phonePrompt(first.client, sid);
+		await first.client.request("sdk.control", { sessionId: sid, op: "turn.steer", input: { text: "terminal tool" } });
+		await first.client.waitFor(permissionFor(sid), 10_000);
+		await first.killBridge();
+		const { client } = await tmuxBridge({ server: false, after: first });
+		// gjc ACP starts with the first request, and the bridge then attaches to its windows by itself.
+		await client.request("host.info", {});
+		let listed: any[] = [];
+		const deadline = Date.now() + 20_000;
+		while (listed.length === 0 && Date.now() < deadline) {
+			await Bun.sleep(200);
+			listed = (await client.request("permission.list", {})).requests;
+		}
+		expect(listed.map((r: any) => r.toolCall.toolCallId)).toEqual(["tt1"]);
+		expect(fs.existsSync(path.join(sdk, `${sid}.answer.json`))).toBe(false);
+		// The TUI's turn ends (its tool expired); the bridge sees the host idle on a later look.
+		fs.rmSync(path.join(sdk, `${sid}.requests.json`));
+		await Bun.sleep(4500);
+		fs.writeFileSync(path.join(sdk, `${sid}.typed`), "");
+		await client.request("session.open", { sessionId: sid });
+		expect((await client.waitFor(toolEnd(sid, "ty1"), 15_000)).p.update.status).toBe("completed");
+		expect(client.events.filter(e => permissionFor(sid)(e) && e.p.toolCall.toolCallId === "ty1")).toEqual([]);
+	}, 60_000);
+
+	test("asks the phone after all when it cannot allow a terminal turn's tool itself", async () => {
+		const { client, cwd } = await tmuxBridge({ server: true });
+		const sid = (await client.request("session.new", {})).sessionId;
+		const sdk = path.join(cwd, ".gjc", "state", "sdk");
+		// The bridge's own answer fails short of gjc: the request still waits.
+		fs.writeFileSync(path.join(sdk, `${sid}.respond-fail`), "");
+		fs.writeFileSync(path.join(sdk, `${sid}.typed`), "");
+		const card = await client.waitFor(permissionFor(sid), 10_000);
+		expect(card.p.toolCall.toolCallId).toBe("ty1");
+		await client.request("permission.respond", { requestId: card.p.requestId, optionId: "allow_once" });
+		expect((await client.waitFor(toolEnd(sid, "ty1"), 10_000)).p.update.status).toBe("completed");
+	}, 30_000);
+
+	test("asks the phone for the turn its prompt waits behind too, and drops the card of one that expired unanswered", async () => {
 		const { client } = await tmuxBridge({ server: true });
 		const sid = (await client.request("session.new", {})).sessionId;
 		await client.request("sdk.control", { sessionId: sid, op: "turn.steer", input: { text: "terminal turn" } });
@@ -432,7 +497,7 @@ describe.skipIf(!hasTmux)("tool approvals of a tmux session reach the phone (gm#
 		expect(JSON.parse(fs.readFileSync(answer, "utf8"))).toMatchObject({ sessionId: sid, optionId: "allow_once" });
 	}, 40_000);
 
-	test("switching to allow while a terminal approval waits allows it instead of letting gjc cancel it", async () => {
+	test("switching to allow while an approval waits allows it instead of letting gjc cancel it", async () => {
 		const { client } = await tmuxBridge({ server: true });
 		const sid = (await client.request("session.new", {})).sessionId;
 		await phonePrompt(client, sid);

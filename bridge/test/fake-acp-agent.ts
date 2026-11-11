@@ -165,7 +165,8 @@ function channelOn(sid: string): string | undefined {
 	return dir && fs.existsSync(path.join(dir, `${sid}.channel`)) ? dir : undefined;
 }
 async function channelApproval(sid: string, dir: string, toolCall: Record<string, unknown>): Promise<string | undefined> {
-	const id = `req-${nextChannelRequest++}`;
+	// Unique across gjc ACP processes, as gjc's own ids are.
+	const id = `req-${process.pid}-${nextChannelRequest++}`;
 	const requests = path.join(dir, `${sid}.requests.json`);
 	const answer = path.join(dir, `${sid}.answer.json`);
 	// gjc lists the request a moment after the pending tool call arrives over ACP (measured ~1.4s).

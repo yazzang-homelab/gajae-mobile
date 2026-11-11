@@ -151,10 +151,13 @@ interface SessionState {
 	/** gjc's own phase flag (session_info_update _meta.running): also true for turns started elsewhere. */
 	hostRunning: boolean;
 	/**
-	 * A phone turn was running when the gjc ACP process died. The TUI in the tmux window goes on with it, so its tool
-	 * approvals still go to the phone (see `#allowTerminalRequest`) until the host is found idle or the phone sends a prompt.
+	 * The TUI in the tmux window may be going on with a phone turn this process holds no prompt for: the gjc ACP
+	 * process died under it, its prompt failed, or the bridge started while the host was busy. Its tool approvals
+	 * still go to the phone (see `#allowTerminalRequest`) until the host is found idle (`#watchCutTurn`) or the phone
+	 * sends a prompt.
 	 */
 	phoneTurnCut?: boolean;
+	cutTurnCheck?: ReturnType<typeof setTimeout>;
 	throughput: Throughput;
 	/** In-flight `session.stats` read feeding [throughput]. */
 	usageSample?: Promise<void>;
@@ -249,6 +252,8 @@ const ATTACH_RETRY_MS = 250;
 /** Reads per trigger at most, and the wait between them while a pending tool call is not listed yet. */
 const CHANNEL_READS = 4;
 const CHANNEL_RETRY_MS = 1000;
+/** Wait between looks at whether the host a phone turn was cut from has gone idle (see `#watchCutTurn`). */
+const CUT_TURN_CHECK_MS = 3000;
 
 /** `permission.requests.list` result (`{sessionId, enabled, requests:[{id, sessionId, expiresAt, options, toolCall}]}`). */
 function channelRequests(result: unknown): { enabled: boolean; requests: ChannelRequest[] } {
@@ -443,6 +448,7 @@ export class SessionHub {
 	stop(): void {
 		this.#stopped = true;
 		if (this.#statusTimer) clearInterval(this.#statusTimer);
+		for (const state of this.#sessions.values()) clearTimeout(state.cutTurnCheck);
 		this.#acp?.kill();
 	}
 
@@ -461,6 +467,8 @@ export class SessionHub {
 			const cwd = known?.cwd ?? (windowCwd || this.#saved.find(sessionId)?.cwd);
 			if (!cwd) continue;
 			const state = this.#stateFor(sessionId, cwd);
+			// A window from before this bridge started: what its host works on may be a phone turn of the bridge before.
+			if (!known) state.phoneTurnCut = true;
 			await this.#load(state).catch(async error => {
 				this.#options.log?.(`reattach ${sessionId} failed: ${error instanceof Error ? error.message : String(error)}`);
 				// A window closed before its gjc's first answer leaves nothing to load: no longer the bridge's window session.
@@ -638,8 +646,9 @@ export class SessionHub {
 	 * neither who started a run nor reliably when one starts, so the phone's own prompt is the line: its turn asks the
 	 * phone, as does a turn its queued prompt waits behind. False when the request is to be shown as a card.
 	 */
-	async #allowTerminalRequest(state: SessionState, request: ChannelRequest): Promise<boolean> {
-		if (state.running || state.phoneTurnCut) return false;
+	async #allowTerminalRequest(state: SessionState, channel: ApprovalChannel, request: ChannelRequest): Promise<boolean> {
+		// A mode other than prompt answers by itself, also what waited when the phone switched to it.
+		if (state.running || state.phoneTurnCut || state.permissionMode !== "prompt") return false;
 		const optionId = request.options.find(o => o.kind === "allow_once")?.optionId;
 		if (!optionId) return false;
 		try {
@@ -648,8 +657,24 @@ export class SessionHub {
 			this.#options.log?.(`permission.respond (terminal turn) failed for ${state.sessionId}: ${error instanceof Error ? error.message : String(error)}`);
 			return false;
 		}
-		state.channel?.settled.add(request.id);
+		channel.settled.add(request.id);
 		return true;
+	}
+
+	/**
+	 * Looks every `CUT_TURN_CHECK_MS` whether the host a phone turn was cut from has nothing left to do: gjc reports
+	 * the end of a run it started for no ACP prompt unreliably (measured 2026-11-11 on pve3, gjc 0.20.0: no idle
+	 * report after such a turn), and until then a turn typed at the terminal would wait for the phone again.
+	 */
+	#watchCutTurn(state: SessionState): void {
+		if (!state.phoneTurnCut || state.cutTurnCheck || this.#stopped) return;
+		state.cutTurnCheck = setTimeout(async () => {
+			state.cutTurnCheck = undefined;
+			// Not loaded: the next load looks, and watches on.
+			if (this.#stopped || !state.phoneTurnCut || !state.loaded) return;
+			if (!state.running && (await this.#hostState(state))?.idle) state.phoneTurnCut = false;
+			else this.#watchCutTurn(state);
+		}, CUT_TURN_CHECK_MS);
 	}
 
 	/** Lists the channel's requests into phone permission cards; one read at a time, another queued behind it. */
@@ -686,7 +711,7 @@ export class SessionHub {
 				for (const request of listed) {
 					channel.waitingTools.delete(request.toolCallId);
 					if (channel.requests.has(request.id)) continue;
-					const allowed = await this.#allowTerminalRequest(state, request);
+					const allowed = await this.#allowTerminalRequest(state, channel, request);
 					if (state.channel !== channel) return;
 					if (!allowed) this.#showChannelRequest(state, request);
 				}
@@ -1230,6 +1255,7 @@ export class SessionHub {
 			// The cut phone turn is over once the host has nothing left to do.
 			if (state.phoneTurnCut && (await this.#hostState(state, acp))?.idle) state.phoneTurnCut = false;
 			state.loaded = true;
+			this.#watchCutTurn(state);
 			this.#announceShownMode(state);
 			// Requests already waiting (from before a restart) are not announced by any later tool call.
 			this.#readChannel(state);
@@ -1381,7 +1407,14 @@ export class SessionHub {
 				if (message.includes(STALE_ATTACHMENT)) state.loaded = false;
 				// A stop, not a failure; `undelivered` tells the phone that sent it to put the message back in its composer.
 				if (message.includes(PREFLIGHT_CANCELLED)) this.#endTurn(state, { sessionUpdate: TURN_END, stopReason: "cancelled", undelivered: true });
-				else this.#endTurn(state, { sessionUpdate: TURN_END, stopReason: "error", error: message });
+				else {
+					// The failure does not tell whether the TUI host took the prompt and runs it.
+					if (state.inTmux) {
+						state.phoneTurnCut = true;
+						this.#watchCutTurn(state);
+					}
+					this.#endTurn(state, { sessionUpdate: TURN_END, stopReason: "error", error: message });
+				}
 			},
 		);
 		state.turn = turn;

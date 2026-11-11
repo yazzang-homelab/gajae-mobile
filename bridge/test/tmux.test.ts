@@ -377,6 +377,28 @@ describe.skipIf(!hasTmux)("tool approvals of a tmux session reach the phone (gm#
 		expect(client.events.filter(e => permissionFor(sid)(e) && e.p.toolCall.toolCallId === "ty1")).toEqual([]);
 	}, 60_000);
 
+	test("a phone that opens the chat before a restarted bridge attached to its window is asked too", async () => {
+		// It cannot tell a turn typed at the terminal from a phone turn the bridge before it was asking for.
+		const first = await tmuxBridge({ server: true });
+		const sid = (await first.client.request("session.new", {})).sessionId;
+		const sdk = path.join(first.cwd, ".gjc", "state", "sdk");
+		await phonePrompt(first.client, sid);
+		await first.client.request("sdk.control", { sessionId: sid, op: "turn.steer", input: { text: "terminal tool" } });
+		await first.client.waitFor(permissionFor(sid), 10_000);
+		await first.killBridge();
+		const { client } = await tmuxBridge({ server: false, after: first });
+		// The phone was on the chat and opens it again at once: its open loads the session, not the bridge's own attaching.
+		await client.request("session.open", { sessionId: sid, cwd: first.cwd });
+		let listed: any[] = [];
+		const deadline = Date.now() + 20_000;
+		while (listed.length === 0 && Date.now() < deadline) {
+			await Bun.sleep(200);
+			listed = (await client.request("permission.list", {})).requests;
+		}
+		expect(listed.map((r: any) => r.toolCall.toolCallId)).toEqual(["tt1"]);
+		expect(fs.existsSync(path.join(sdk, `${sid}.answer.json`))).toBe(false);
+	}, 60_000);
+
 	test("asks the phone after all when it cannot allow a terminal turn's tool itself", async () => {
 		const { client, cwd } = await tmuxBridge({ server: true });
 		const sid = (await client.request("session.new", {})).sessionId;

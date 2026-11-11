@@ -152,11 +152,12 @@ interface SessionState {
 	hostRunning: boolean;
 	/**
 	 * The TUI in the tmux window may be going on with a phone turn this process holds no prompt for: the gjc ACP
-	 * process died under it, its prompt failed, or the bridge started while the host was busy. Its tool approvals
+	 * process died under it, its prompt failed, or this process first attached while the host was busy. Its tool approvals
 	 * still go to the phone (see `#allowTerminalRequest`) until the host is found idle (`#watchCutTurn`) or the phone
 	 * sends a prompt.
 	 */
 	phoneTurnCut?: boolean;
+	/** The next look of `#watchCutTurn`. */
 	cutTurnCheck?: ReturnType<typeof setTimeout>;
 	throughput: Throughput;
 	/** In-flight `session.stats` read feeding [throughput]. */
@@ -467,8 +468,6 @@ export class SessionHub {
 			const cwd = known?.cwd ?? (windowCwd || this.#saved.find(sessionId)?.cwd);
 			if (!cwd) continue;
 			const state = this.#stateFor(sessionId, cwd);
-			// A window from before this bridge started: what its host works on may be a phone turn of the bridge before.
-			if (!known) state.phoneTurnCut = true;
 			await this.#load(state).catch(async error => {
 				this.#options.log?.(`reattach ${sessionId} failed: ${error instanceof Error ? error.message : String(error)}`);
 				// A window closed before its gjc's first answer leaves nothing to load: no longer the bridge's window session.
@@ -812,6 +811,8 @@ export class SessionHub {
 				loaded: false,
 				running: false,
 				hostRunning: false,
+				// Until its first load finds the host idle: it may be a window from before this bridge started.
+				phoneTurnCut: true,
 				throughput: new Throughput(),
 				queued: [],
 				remoteAsks: new Map(),
@@ -1252,8 +1253,8 @@ export class SessionHub {
 			// Before the mode: enabling the channel sets the session to prompt.
 			if (state.inTmux) await this.#enableChannel(state);
 			if (state.permissionMode !== "prompt") await this.#applyPermissionMode(acp, state.sessionId, state.permissionMode);
-			// The cut phone turn is over once the host has nothing left to do.
-			if (state.phoneTurnCut && (await this.#hostState(state, acp))?.idle) state.phoneTurnCut = false;
+			// The cut phone turn is over once the host has nothing left to do; only a tmux session's channel asks.
+			if (state.phoneTurnCut && (!state.inTmux || (await this.#hostState(state, acp))?.idle)) state.phoneTurnCut = false;
 			state.loaded = true;
 			this.#watchCutTurn(state);
 			this.#announceShownMode(state);

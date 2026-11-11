@@ -150,6 +150,11 @@ interface SessionState {
 	interrupting?: boolean;
 	/** gjc's own phase flag (session_info_update _meta.running): also true for turns started elsewhere. */
 	hostRunning: boolean;
+	/**
+	 * A phone turn was running when the gjc ACP process died. The TUI in the tmux window goes on with it, so its tool
+	 * approvals still go to the phone (see `#allowTerminalRequest`) until the host is found idle or the phone sends a prompt.
+	 */
+	phoneTurnCut?: boolean;
 	throughput: Throughput;
 	/** In-flight `session.stats` read feeding [throughput]. */
 	usageSample?: Promise<void>;
@@ -425,6 +430,7 @@ export class SessionHub {
 			state.channel = undefined;
 			if (state.running) {
 				state.running = false;
+				state.phoneTurnCut = state.inTmux;
 				this.#append(state, { sessionUpdate: AGENT_EXIT, code, stderrTail: acp.stderrTail.slice(-2000) });
 			}
 		}
@@ -625,6 +631,27 @@ export class SessionHub {
 		}
 	}
 
+	/**
+	 * Allows a guarded tool of a turn the phone did not send, as gjc does in a terminal without the channel. The TUI
+	 * shows a waiting approval as a spinner only and cannot answer it, so a turn typed there stood still until a phone
+	 * answered, or until gjc rejected the tool after 60s (gm#114, measured 2026-11-11 on pve3, gjc 0.20.0). gjc tells
+	 * neither who started a run nor reliably when one starts, so the phone's own prompt is the line: its turn asks the
+	 * phone, as does a turn its queued prompt waits behind. False when the request is to be shown as a card.
+	 */
+	async #allowTerminalRequest(state: SessionState, request: ChannelRequest): Promise<boolean> {
+		if (state.running || state.phoneTurnCut) return false;
+		const optionId = request.options.find(o => o.kind === "allow_once")?.optionId;
+		if (!optionId) return false;
+		try {
+			await this.#sdkCli!.control(state.sessionId, state.cwd, "permission.respond", { sessionId: state.sessionId, id: request.id, optionId });
+		} catch (error) {
+			this.#options.log?.(`permission.respond (terminal turn) failed for ${state.sessionId}: ${error instanceof Error ? error.message : String(error)}`);
+			return false;
+		}
+		state.channel?.settled.add(request.id);
+		return true;
+	}
+
 	/** Lists the channel's requests into phone permission cards; one read at a time, another queued behind it. */
 	#readChannel(state: SessionState): void {
 		const channel = state.channel;
@@ -658,7 +685,10 @@ export class SessionHub {
 				for (const id of channel.requests.keys()) if (!ids.has(id)) this.#dropChannelRequest(state, id);
 				for (const request of listed) {
 					channel.waitingTools.delete(request.toolCallId);
-					if (!channel.requests.has(request.id)) this.#showChannelRequest(state, request);
+					if (channel.requests.has(request.id)) continue;
+					const allowed = await this.#allowTerminalRequest(state, request);
+					if (state.channel !== channel) return;
+					if (!allowed) this.#showChannelRequest(state, request);
 				}
 				// A gated call shows up in the channel a moment after it arrives here; one that never does was not gated.
 				if (!channel.again && channel.waitingTools.size === 0) return;
@@ -1197,6 +1227,8 @@ export class SessionHub {
 			// Before the mode: enabling the channel sets the session to prompt.
 			if (state.inTmux) await this.#enableChannel(state);
 			if (state.permissionMode !== "prompt") await this.#applyPermissionMode(acp, state.sessionId, state.permissionMode);
+			// The cut phone turn is over once the host has nothing left to do.
+			if (state.phoneTurnCut && (await this.#hostState(state, acp))?.idle) state.phoneTurnCut = false;
 			state.loaded = true;
 			this.#announceShownMode(state);
 			// Requests already waiting (from before a restart) are not announced by any later tool call.
@@ -1317,6 +1349,8 @@ export class SessionHub {
 		const promptBytes = Buffer.byteLength(JSON.stringify(params.prompt));
 		if (promptBytes > PROMPT_BYTES_LIMIT) throw promptTooLarge(params.prompt, promptBytes);
 		state.running = true;
+		// From here this prompt is what asks the phone; it ends behind whatever the cut turn left running.
+		state.phoneTurnCut = false;
 		const turnId = crypto.randomUUID();
 		state.turnId = turnId;
 		state.turnBehindHost = state.hostRunning;
@@ -1414,9 +1448,9 @@ export class SessionHub {
 	 * nothing left to do (`context.get` `isStreaming` false with empty queues, and no compaction or retry under way:
 	 * `isStreaming` does not cover those). `undefined` when it cannot say.
 	 */
-	async #hostState(state: SessionState): Promise<{ terminal: boolean; idle: boolean } | undefined> {
+	async #hostState(state: SessionState, attached?: AcpProcess): Promise<{ terminal: boolean; idle: boolean } | undefined> {
 		try {
-			const acp = await this.agent();
+			const acp = attached ?? (await this.agent());
 			const [capabilities, context] = await Promise.all([
 				this.#sdkRequest(acp, state, "query", "runtime.capabilities", {}),
 				this.#sdkRequest(acp, state, "query", "context.get", {}),

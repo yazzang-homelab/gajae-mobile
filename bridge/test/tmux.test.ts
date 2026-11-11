@@ -255,6 +255,10 @@ describe.skipIf(!hasTmux)("new sessions as tmux windows (gm#58)", () => {
 
 describe.skipIf(!hasTmux)("tool approvals of a tmux session reach the phone (gm#58)", () => {
 	const permissionFor = (sid: string) => (e: { ev: string; p: any }) => e.ev === "permission.request" && e.p.sessionId === sid;
+	// A phone prompt in flight: its turn's approvals are the phone's, also those of a turn it waits behind ("terminal
+	// tool" stands for that turn's bash call). The prompt stays unanswered until the test ends.
+	const phonePrompt = (client: { request(method: string, params: unknown): Promise<any> }, sid: string) =>
+		client.request("session.prompt", { sessionId: sid, prompt: [{ type: "text", text: "slow" }] });
 	const toolEnd = (sid: string, id: string) => (e: { ev: string; p: any }) =>
 		e.ev === "session.update" && e.p.sessionId === sid && e.p.update.toolCallId === id && ["completed", "failed"].includes(e.p.update.status);
 
@@ -289,10 +293,43 @@ describe.skipIf(!hasTmux)("tool approvals of a tmux session reach the phone (gm#
 		expect((await client.waitFor(toolEnd(sid, "t1"), 10_000)).p.update.status).toBe("failed");
 	});
 
+	test("a turn typed at the terminal runs its tool unasked, also with no phone on the chat (gm#114)", async () => {
+		// Measured 2026-11-11 on pve3 (gjc 0.20.0): the TUI showed a spinner only, and with no phone to answer, gjc
+		// rejected the bash call after 60s ("Permission request cancelled").
+		const { client, cwd } = await tmuxBridge({ server: true });
+		const sid = (await client.request("session.new", {})).sessionId;
+		const sdk = path.join(cwd, ".gjc", "state", "sdk");
+		await client.request("session.close", { sessionId: sid });
+		fs.writeFileSync(path.join(sdk, `${sid}.typed`), "");
+		await until(() => fs.existsSync(path.join(sdk, `${sid}.requests.json`)), 5000);
+		await until(() => !fs.existsSync(path.join(sdk, `${sid}.requests.json`)), 10_000);
+		const { updates, permissions } = await client.request("session.open", { sessionId: sid });
+		expect(updates.find((u: any) => u.update.toolCallId === "ty1" && u.update.sessionUpdate === "tool_call_update").update.status).toBe("completed");
+		expect(permissions).toEqual([]);
+		expect(client.events.filter(permissionFor(sid))).toEqual([]);
+	}, 30_000);
+
+	test("once the turn gjc ACP died under is over, a terminal turn runs unasked again", async () => {
+		const { client, cwd } = await tmuxBridge({ server: true });
+		const sid = (await client.request("session.new", {})).sessionId;
+		const sdk = path.join(cwd, ".gjc", "state", "sdk");
+		await phonePrompt(client, sid);
+		await client.request("sdk.control", { sessionId: sid, op: "turn.steer", input: { text: "crash" } }).catch(() => {});
+		await client.waitFor(e => e.ev === "session.update" && e.p.sessionId === sid && e.p.update.sessionUpdate === AGENT_EXIT, 5000);
+		// The bridge attaches again by itself and finds the host idle.
+		const channel = path.join(sdk, `${sid}.channel`);
+		fs.rmSync(channel);
+		await until(() => fs.existsSync(channel), 20_000);
+		fs.writeFileSync(path.join(sdk, `${sid}.typed`), "");
+		expect((await client.waitFor(toolEnd(sid, "ty1"), 15_000)).p.update.status).toBe("completed");
+		expect(client.events.filter(permissionFor(sid))).toEqual([]);
+	}, 40_000);
+
 	test("brings a terminal turn's approval too, and drops the card of one that expired unanswered", async () => {
 		const { client } = await tmuxBridge({ server: true });
 		const sid = (await client.request("session.new", {})).sessionId;
 		await client.request("sdk.control", { sessionId: sid, op: "turn.steer", input: { text: "terminal turn" } });
+		await phonePrompt(client, sid);
 		await client.request("sdk.control", { sessionId: sid, op: "turn.steer", input: { text: "terminal tool" } });
 		const card = await client.waitFor(permissionFor(sid), 10_000);
 		expect(card.p.toolCall.toolCallId).toBe("tt1");
@@ -307,6 +344,7 @@ describe.skipIf(!hasTmux)("tool approvals of a tmux session reach the phone (gm#
 		const { client, cwd } = await tmuxBridge({ server: true });
 		const sid = (await client.request("session.new", {})).sessionId;
 		const sdk = path.join(cwd, ".gjc", "state", "sdk");
+		await phonePrompt(client, sid);
 		await client.request("sdk.control", { sessionId: sid, op: "turn.steer", input: { text: "terminal tool" } });
 		const card = await client.waitFor(permissionFor(sid), 10_000);
 		// The call fails before gjc: the request still waits, so the phone gets it again and can answer it.
@@ -357,6 +395,7 @@ describe.skipIf(!hasTmux)("tool approvals of a tmux session reach the phone (gm#
 		const answer = path.join(cwd, ".gjc", "state", "sdk", `${sid}.answer.json`);
 		await client.request("session.prompt", { sessionId: sid, prompt: [{ type: "text", text: "hello" }] });
 		await client.waitFor(turnEnd(sid));
+		await phonePrompt(client, sid);
 		await client.request("sdk.control", { sessionId: sid, op: "turn.steer", input: { text: "terminal tool" } });
 		const before = await client.waitFor(permissionFor(sid), 10_000);
 		const updates = () => client.events.filter(e => e.ev === "session.update" && e.p.sessionId === sid);
@@ -364,7 +403,7 @@ describe.skipIf(!hasTmux)("tool approvals of a tmux session reach the phone (gm#
 		const hellosBefore = hellos();
 
 		// The ACP process dies (a crash; a recycle restarts it the same way) and no phone opens the chat again.
-		await client.request("session.prompt", { sessionId: sid, prompt: [{ type: "text", text: "crash" }] }).catch(() => {});
+		await client.request("sdk.control", { sessionId: sid, op: "turn.steer", input: { text: "crash" } }).catch(() => {});
 		await client.waitFor(e => e.ev === "permission.resolved" && e.p.requestId === before.p.requestId, 5000);
 		await client.waitFor(e => e.ev === "session.update" && e.p.sessionId === sid && e.p.update.sessionUpdate === AGENT_EXIT, 5000);
 		const again = await client.waitFor(e => permissionFor(sid)(e) && e.p.requestId !== before.p.requestId, 20_000);
@@ -396,6 +435,7 @@ describe.skipIf(!hasTmux)("tool approvals of a tmux session reach the phone (gm#
 	test("switching to allow while a terminal approval waits allows it instead of letting gjc cancel it", async () => {
 		const { client } = await tmuxBridge({ server: true });
 		const sid = (await client.request("session.new", {})).sessionId;
+		await phonePrompt(client, sid);
 		await client.request("sdk.control", { sessionId: sid, op: "turn.steer", input: { text: "terminal tool" } });
 		const card = await client.waitFor(permissionFor(sid), 10_000);
 		// gjc cancels the channel's waiting requests when the mode changes.
@@ -409,6 +449,7 @@ describe.skipIf(!hasTmux)("tool approvals of a tmux session reach the phone (gm#
 		const sid = (await client.request("session.new", {})).sessionId;
 		const channel = path.join(cwd, ".gjc", "state", "sdk", `${sid}.channel`);
 		fs.rmSync(channel);
+		await phonePrompt(client, sid);
 		await client.request("sdk.control", { sessionId: sid, op: "turn.steer", input: { text: "terminal tool" } });
 		await until(() => fs.existsSync(channel), 10_000);
 	}, 20_000);
@@ -417,6 +458,7 @@ describe.skipIf(!hasTmux)("tool approvals of a tmux session reach the phone (gm#
 		const { client, cwd } = await tmuxBridge({ server: true });
 		const sid = (await client.request("session.new", {})).sessionId;
 		const requests = path.join(cwd, ".gjc", "state", "sdk", `${sid}.requests.json`);
+		await phonePrompt(client, sid);
 		await client.request("sdk.control", { sessionId: sid, op: "turn.steer", input: { text: "terminal tool" } });
 		const card = await client.waitFor(permissionFor(sid), 10_000);
 		const listed = fs.readFileSync(requests, "utf8");

@@ -194,6 +194,29 @@ async function channelApproval(sid: string, dir: string, toolCall: Record<string
 	}
 }
 
+function channelWaiting(sid: string): boolean {
+	const cwd = sessionCwds.get(sid);
+	return cwd !== undefined && fs.existsSync(path.join(cwd, ".gjc", "state", "sdk", `${sid}.requests.json`));
+}
+// `<id>.typed` under the session's sdk directory stands for a turn typed in the TUI itself, which no ACP client asked
+// for: gjc reports the host working, the turn's bash call waits on the permission channel (runs unasked without
+// one), and the host goes idle when the call ends.
+setInterval(() => {
+	for (const [sid, cwd] of sessionCwds) {
+		const typed = path.join(cwd, ".gjc", "state", "sdk", `${sid}.typed`);
+		if (!fs.existsSync(typed)) continue;
+		fs.rmSync(typed);
+		const dir = channelOn(sid);
+		const toolCall = { toolCallId: "ty1", title: "make build", kind: "execute", status: "pending", rawInput: { command: "make build" } };
+		update(sid, { sessionUpdate: "session_info_update", _meta: { gjcPhase: "working", running: true } });
+		update(sid, { sessionUpdate: "tool_call", ...toolCall });
+		void (dir ? channelApproval(sid, dir, toolCall) : Promise.resolve("allow_once")).then(optionId => {
+			update(sid, { sessionUpdate: "tool_call_update", toolCallId: "ty1", status: optionId === "allow_once" ? "completed" : "failed" });
+			update(sid, { sessionUpdate: "session_info_update", _meta: { gjcPhase: "idle", running: false } });
+		});
+	}
+}, 50);
+
 async function handle(msg: any) {
 	const { id, method, params } = msg;
 	const reply = (result: unknown) => write({ jsonrpc: "2.0", id, result });
@@ -469,7 +492,8 @@ async function handle(msg: any) {
 				const queue = steers.get(params.sessionId) ?? [];
 				const item = {
 					usage: { tokens: 1200, contextWindow: 100000, percent: 1.2 },
-					isStreaming: terminalTurns.has(params.sessionId) || cancellable.has(params.sessionId),
+					// A tool waiting on the permission channel belongs to a run under way (also one a restarted ACP finds).
+					isStreaming: terminalTurns.has(params.sessionId) || cancellable.has(params.sessionId) || channelWaiting(params.sessionId),
 					steeringQueueDepth: queue.filter(s => s.mode === "steer").length,
 					followupQueueDepth: queue.filter(s => s.mode === "followUp").length,
 					systemPrompt: ["abc", "de"],
@@ -539,6 +563,8 @@ async function handle(msg: any) {
 						);
 					return reply({ accepted: true });
 				}
+				// "crash" stands for the ACP process dying while a prompt is in flight.
+				if (text === "crash") process.exit(3);
 				if (text === "expire") {
 					expiring.get(params.sessionId)?.();
 					return reply({ accepted: true });

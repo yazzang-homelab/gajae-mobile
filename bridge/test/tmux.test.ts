@@ -599,7 +599,7 @@ describe.skipIf(!hasTmux)("deleting a tmux session from the phone (gm#95)", () =
 		expect(refused.message).toContain("PC 터미널(gjc TUI)에서 열려 있는 세션입니다");
 		expect(fs.existsSync(transcript(home, sid))).toBe(true);
 		expect(await listed(client)).toContain(sid);
-		// The fresh attachment the bridge tried the delete on serves the next turn.
+		// The bridge's attachment to the window's session is as it was: the next turn runs on it.
 		const mark = client.events.length;
 		await client.request("session.open", { sessionId: sid });
 		await client.request("session.prompt", { sessionId: sid, prompt: [{ type: "text", text: "again" }] });
@@ -619,6 +619,11 @@ describe.skipIf(!hasTmux)("deleting a tmux session from the phone (gm#95)", () =
 		await client.request("session.open", { sessionId: sid });
 		await client.request("session.prompt", { sessionId: sid, prompt: [{ type: "text", text: "again" }] });
 		await until(() => client.events.slice(mark).some(turnEnd(sid)), 10_000);
+		// Deleted again from the chat opened again, gjc ACP hosting it now: closed here once more, not left as loaded.
+		const again = await client.request("session.delete", { sessionId: sid }).catch((e: any) => e);
+		expect(again.data?.code).toBe("cleanup_pending");
+		const closedAgain = await client.request("session.prompt", { sessionId: sid, prompt: [{ type: "text", text: "more" }] }).catch((e: any) => e);
+		expect(closedAgain.code).toBe(-32002);
 	}, 20_000);
 
 	test("a session a TUI of the user's own hosts is refused in Korean, and deleted once that TUI is gone", async () => {

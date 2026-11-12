@@ -1301,11 +1301,22 @@ export class SessionHub {
 		try {
 			await acp.request("session/delete", { sessionId: params.sessionId });
 		} catch (error) {
-			if (errorCode(error) !== "operation_prohibited") throw error;
+			if (errorCode(error) !== "operation_prohibited") {
+				// gjc ends its attachment before it deletes (0.20.0 `deleteSession`: `#teardownSession`, then the durable
+				// delete), so a delete that failed after that (`cleanup_pending`) leaves nothing loaded here: the phone's
+				// next call (-32002) opens the session again.
+				if (state && attachedBefore) state.loaded = false;
+				throw error;
+			}
 			if (!state || !attachedBefore) {
 				// Loaded just now: a TUI hosts it. The attachment made for the delete is let go, or gjc would refuse the
-				// session as the terminal's also after that TUI ended. Not while a load of the session's own is under way.
-				if (!state?.loading) await acp.request("session/close", { sessionId: params.sessionId }).catch(() => {});
+				// session as the terminal's also after that TUI ended. Not one a phone opened meanwhile (the load above
+				// takes as long as the history is), nor while such a load is under way.
+				const opened = this.#sessions.get(params.sessionId);
+				if (!opened?.loading && !opened?.loaded)
+					await acp.request("session/close", { sessionId: params.sessionId }).catch(closing => {
+						this.#options.log?.(`closing ${params.sessionId} after its refused delete failed: ${closing instanceof Error ? closing.message : String(closing)}`);
+					});
 				throw terminalSession();
 			}
 			// The bridge's window still hosts it: refused again for certain, so its attachment is left as it is.
@@ -1331,8 +1342,7 @@ export class SessionHub {
 					await (await this.agent()).request("session/delete", { sessionId: params.sessionId });
 				} catch (again) {
 					if (errorCode(again) === "operation_prohibited") throw terminalSession();
-					// gjc ends its attachment before it deletes (0.20.0 `deleteSession`: `#teardownSession`, then the durable
-					// delete), so a delete that failed after that (`cleanup_pending`) leaves nothing loaded here either.
+					// As above: gjc ended the attachment the load made.
 					state.loaded = false;
 					throw again;
 				}

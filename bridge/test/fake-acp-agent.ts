@@ -262,9 +262,12 @@ async function handle(msg: any) {
 			const history = saved ?? [];
 			sessions.set(params.sessionId, history);
 			staleAttachments.delete(params.sessionId);
+			// Like gjc (`#attachExisting`), a session already attached keeps the owner it was attached with.
+			if (!attached.has(params.sessionId)) {
+				if (registered) terminalHosted.add(params.sessionId);
+				else terminalHosted.delete(params.sessionId);
+			}
 			attached.add(params.sessionId);
-			if (registered) terminalHosted.add(params.sessionId);
-			else terminalHosted.delete(params.sessionId);
 			permissionModes.delete(params.sessionId);
 			sessionCwds.set(params.sessionId, params.cwd);
 			for (const text of history) update(params.sessionId, { sessionUpdate: "user_message_chunk", content: { type: "text", text } });
@@ -304,6 +307,13 @@ async function handle(msg: any) {
 			if (terminalHosted.has(params.sessionId)) {
 				const owned = `ACP session ${params.sessionId} is owned by its terminal host; delete it from that session instead.`;
 				return write({ jsonrpc: "2.0", id, error: { code: -32603, message: `Internal error: ${owned}`, data: { code: "operation_prohibited", details: owned } } });
+			}
+			// FAKE_DELETE_PENDING: like gjc 0.20.0 on Linux for a session with an artifacts directory, the delete ends the
+			// attachment and then fails with the transcript still there.
+			if (process.env.FAKE_DELETE_PENDING) {
+				attached.delete(params.sessionId);
+				const pending = "Saved session cleanup is pending in artifacts: Exact detached artifact removal rejected: cleanup_pending";
+				return write({ jsonrpc: "2.0", id, error: { code: -32603, message: `Internal error: ${pending}`, data: { code: "cleanup_pending", details: pending } } });
 			}
 			sessions.delete(params.sessionId);
 			persist();

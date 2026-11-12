@@ -1298,14 +1298,21 @@ export class SessionHub {
 			if (!cwd) throw new AcpError(-32002, `Unknown session ${params.sessionId}`);
 			await acp.request("session/load", { sessionId: params.sessionId, cwd, mcpServers: [] });
 		}
-		const request = () => acp.request("session/delete", { sessionId: params.sessionId });
 		try {
-			await request();
+			await acp.request("session/delete", { sessionId: params.sessionId });
 		} catch (error) {
 			if (errorCode(error) !== "operation_prohibited") throw error;
-			// Loaded just now: a TUI hosts it.
-			if (!state || !attachedBefore) throw terminalSession();
+			if (!state || !attachedBefore) {
+				// Loaded just now: a TUI hosts it. The attachment made for the delete is let go, or gjc would refuse the
+				// session as the terminal's also after that TUI ended. Not while a load of the session's own is under way.
+				if (!state?.loading) await acp.request("session/close", { sessionId: params.sessionId }).catch(() => {});
+				throw terminalSession();
+			}
+			// The bridge's window still hosts it: refused again for certain, so its attachment is left as it is.
+			if (state.inTmux && (await this.#tmux?.hosts(state.sessionId, state.cwd))) throw terminalSession();
 			await state.releasing?.catch(() => {});
+			// A prompt that came in meanwhile would be ended by the close below.
+			if (state.running) throw new AcpError(-32003, "Stop the running turn before deleting the session");
 			// Nothing else goes to the attachment being closed; a failure below leaves the session closed, and the
 			// phone's next call (-32002) opens it again.
 			state.loaded = false;
@@ -1318,10 +1325,18 @@ export class SessionHub {
 					return false;
 				},
 			);
-			if (saved)
-				await request().catch(again => {
-					throw errorCode(again) === "operation_prohibited" ? terminalSession() : again;
-				});
+			if (saved) {
+				try {
+					// The load may have started another gjc ACP process.
+					await (await this.agent()).request("session/delete", { sessionId: params.sessionId });
+				} catch (again) {
+					if (errorCode(again) === "operation_prohibited") throw terminalSession();
+					// gjc ends its attachment before it deletes (0.20.0 `deleteSession`: `#teardownSession`, then the durable
+					// delete), so a delete that failed after that (`cleanup_pending`) leaves nothing loaded here either.
+					state.loaded = false;
+					throw again;
+				}
+			}
 		}
 		this.#sessions.delete(params.sessionId);
 		for (const { sessions } of this.#clients.values()) sessions.delete(params.sessionId);

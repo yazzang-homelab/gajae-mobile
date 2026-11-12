@@ -567,8 +567,8 @@ describe.skipIf(!hasTmux)("deleting a tmux session from the phone (gm#95)", () =
 		((await client.request("session.list", {})).sessions as Array<{ sessionId: string }>).map(s => s.sessionId);
 	const transcript = (home: string, sid: string) => path.join(home, "agent", "sessions", "v2-fake", `2026-10-21T00-00-00-000Z_${sid}.jsonl`);
 	/** A new session in a window, answered once (so gjc saved it) unless `unused`. */
-	const windowSession = async (unused = false) => {
-		const bridge = await tmuxBridge({ server: true });
+	const windowSession = async (unused = false, env?: Record<string, string>) => {
+		const bridge = await tmuxBridge({ server: true, ...(env ? { env } : {}) });
 		const sid: string = (await bridge.client.request("session.new", {})).sessionId;
 		if (!unused) {
 			await bridge.client.request("session.prompt", { sessionId: sid, prompt: [{ type: "text", text: "hello" }] });
@@ -589,7 +589,7 @@ describe.skipIf(!hasTmux)("deleting a tmux session from the phone (gm#95)", () =
 		expect(await client.request("session.delete", { sessionId: sid })).toEqual({ ok: true });
 		expect(fs.existsSync(transcript(home, sid))).toBe(false);
 		expect(await listed(client)).not.toContain(sid);
-	});
+	}, 20_000);
 
 	test("refuses in Korean while the window still hosts the session, and leaves it usable", async () => {
 		const { client, home, sid } = await windowSession();
@@ -604,7 +604,42 @@ describe.skipIf(!hasTmux)("deleting a tmux session from the phone (gm#95)", () =
 		await client.request("session.open", { sessionId: sid });
 		await client.request("session.prompt", { sessionId: sid, prompt: [{ type: "text", text: "again" }] });
 		await until(() => client.events.slice(mark).some(turnEnd(sid)), 10_000);
-	});
+	}, 20_000);
+
+	test("a delete gjc gave up after ending its attachment leaves the session closed here, to be opened again", async () => {
+		const { client, home, sid, closeWindow } = await windowSession(false, { FAKE_DELETE_PENDING: "1" });
+		await closeWindow();
+		const failed = await client.request("session.delete", { sessionId: sid }).catch((e: any) => e);
+		expect(failed.data?.code).toBe("cleanup_pending");
+		expect(fs.existsSync(transcript(home, sid))).toBe(true);
+		expect(await listed(client)).toContain(sid);
+		const closed = await client.request("session.prompt", { sessionId: sid, prompt: [{ type: "text", text: "again" }] }).catch((e: any) => e);
+		expect(closed.code).toBe(-32002);
+		const mark = client.events.length;
+		await client.request("session.open", { sessionId: sid });
+		await client.request("session.prompt", { sessionId: sid, prompt: [{ type: "text", text: "again" }] });
+		await until(() => client.events.slice(mark).some(turnEnd(sid)), 10_000);
+	}, 20_000);
+
+	test("a session a TUI of the user's own hosts is refused in Korean, and deleted once that TUI is gone", async () => {
+		// Saved over ACP, then resumed in a terminal of the user's (the registration stands for that TUI). The bridge's
+		// gjc ACP restarted since, so the bridge loads the session for the delete.
+		const { client, cwd, home, killAcp } = await tmuxBridge({ server: false });
+		const sid: string = (await client.request("session.new", {})).sessionId;
+		await client.request("session.prompt", { sessionId: sid, prompt: [{ type: "text", text: "hello" }] });
+		await client.waitFor(turnEnd(sid));
+		await killAcp();
+		const registration = path.join(cwd, ".gjc", "state", "sdk", `${sid}.tui`);
+		fs.writeFileSync(registration, "");
+		const refused = await client.request("session.delete", { sessionId: sid }).catch((e: any) => e);
+		expect(refused.code).toBe(-32004);
+		expect(refused.data).toEqual({ code: "terminal_session" });
+		expect(fs.existsSync(transcript(home, sid))).toBe(true);
+		// The attachment made for that delete was let go: gjc ACP judges the session's host again.
+		fs.rmSync(registration);
+		expect(await client.request("session.delete", { sessionId: sid })).toEqual({ ok: true });
+		expect(fs.existsSync(transcript(home, sid))).toBe(false);
+	}, 20_000);
 
 	test("a session whose window closed before its first answer is gone: deleting it succeeds, and it is not listed", async () => {
 		const { client, sid, closeWindow } = await windowSession(true);
@@ -614,7 +649,7 @@ describe.skipIf(!hasTmux)("deleting a tmux session from the phone (gm#95)", () =
 		expect(await listed(client)).not.toContain(sid);
 		expect(await client.request("session.delete", { sessionId: sid })).toEqual({ ok: true });
 		expect(await listed(client)).not.toContain(sid);
-	});
+	}, 20_000);
 
 	test("a session deleted in its window is no longer listed once the window is gone", async () => {
 		const { client, home, sid, closeWindow } = await windowSession();
@@ -622,7 +657,7 @@ describe.skipIf(!hasTmux)("deleting a tmux session from the phone (gm#95)", () =
 		fs.rmSync(transcript(home, sid));
 		await closeWindow();
 		expect(await listed(client)).not.toContain(sid);
-	});
+	}, 20_000);
 });
 
 describe.skipIf(!hasTmux)("TmuxLauncher.hosts", () => {

@@ -562,6 +562,69 @@ describe.skipIf(!hasTmux)("tool approvals of a tmux session reach the phone (gm#
 	}, 20_000);
 });
 
+describe.skipIf(!hasTmux)("deleting a tmux session from the phone (gm#95)", () => {
+	const listed = async (client: { request(method: string, params: unknown): Promise<any> }) =>
+		((await client.request("session.list", {})).sessions as Array<{ sessionId: string }>).map(s => s.sessionId);
+	const transcript = (home: string, sid: string) => path.join(home, "agent", "sessions", "v2-fake", `2026-10-21T00-00-00-000Z_${sid}.jsonl`);
+	/** A new session in a window, answered once (so gjc saved it) unless `unused`. */
+	const windowSession = async (unused = false) => {
+		const bridge = await tmuxBridge({ server: true });
+		const sid: string = (await bridge.client.request("session.new", {})).sessionId;
+		if (!unused) {
+			await bridge.client.request("session.prompt", { sessionId: sid, prompt: [{ type: "text", text: "hello" }] });
+			await bridge.client.waitFor(turnEnd(sid));
+			expect(fs.existsSync(transcript(bridge.home, sid))).toBe(true);
+		}
+		/** The window goes (tmux sends its gjc SIGHUP), and with it the TUI's registration with the broker. */
+		const closeWindow = async () => {
+			expect(tmux(bridge.socket, "kill-window", "-t", "=gjcm:").code).toBe(0);
+			await until(() => !fs.existsSync(path.join(bridge.cwd, ".gjc", "state", "sdk", `${sid}.tui`)), 5000);
+		};
+		return { ...bridge, sid, closeWindow };
+	};
+
+	test("deletes a session whose window is closed, which gjc refuses on the attachment the window left", async () => {
+		const { client, home, sid, closeWindow } = await windowSession();
+		await closeWindow();
+		expect(await client.request("session.delete", { sessionId: sid })).toEqual({ ok: true });
+		expect(fs.existsSync(transcript(home, sid))).toBe(false);
+		expect(await listed(client)).not.toContain(sid);
+	});
+
+	test("refuses in Korean while the window still hosts the session, and leaves it usable", async () => {
+		const { client, home, sid } = await windowSession();
+		const refused = await client.request("session.delete", { sessionId: sid }).catch((e: any) => e);
+		expect(refused.code).toBe(-32004);
+		expect(refused.data).toEqual({ code: "terminal_session" });
+		expect(refused.message).toContain("PC 터미널(gjc TUI)에서 열려 있는 세션입니다");
+		expect(fs.existsSync(transcript(home, sid))).toBe(true);
+		expect(await listed(client)).toContain(sid);
+		// The fresh attachment the bridge tried the delete on serves the next turn.
+		const mark = client.events.length;
+		await client.request("session.open", { sessionId: sid });
+		await client.request("session.prompt", { sessionId: sid, prompt: [{ type: "text", text: "again" }] });
+		await until(() => client.events.slice(mark).some(turnEnd(sid)), 10_000);
+	});
+
+	test("a session whose window closed before its first answer is gone: deleting it succeeds, and it is not listed", async () => {
+		const { client, sid, closeWindow } = await windowSession(true);
+		// New and unanswered: listed while its window is there.
+		expect(await listed(client)).toContain(sid);
+		await closeWindow();
+		expect(await listed(client)).not.toContain(sid);
+		expect(await client.request("session.delete", { sessionId: sid })).toEqual({ ok: true });
+		expect(await listed(client)).not.toContain(sid);
+	});
+
+	test("a session deleted in its window is no longer listed once the window is gone", async () => {
+		const { client, home, sid, closeWindow } = await windowSession();
+		// `/session delete` in the TUI: gjc removes the transcript; the bridge still holds the session as loaded.
+		fs.rmSync(transcript(home, sid));
+		await closeWindow();
+		expect(await listed(client)).not.toContain(sid);
+	});
+});
+
 describe.skipIf(!hasTmux)("TmuxLauncher.hosts", () => {
 	test("does not take an endpoint that was there before the window, even when the pid it names is now the window's gjc", async () => {
 		const socket = `gjcm-test-${crypto.randomBytes(4).toString("hex")}`;

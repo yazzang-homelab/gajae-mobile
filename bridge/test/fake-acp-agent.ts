@@ -127,6 +127,9 @@ const queuedPrompts = new Map<
 	string,
 	{ steerId: string; blocks: any[]; taken?: boolean; orphan?: boolean; settle: (outcome: "consumed" | "removed" | "closed") => void }
 >();
+// Sessions this process is attached to as a terminal's: a live TUI hosted them when they were loaded. Like gjc 0.20.0,
+// the attachment stays until session/close, also after that TUI ended, and session/delete refuses such a session.
+const terminalHosted = new Set<string>();
 // Sessions whose next session/load fails once ("fail next load").
 const failNextLoad = new Set<string>();
 // gjc's SDK permission policy; every ACP attachment (session/new, session/load) resets it to prompt.
@@ -260,6 +263,8 @@ async function handle(msg: any) {
 			sessions.set(params.sessionId, history);
 			staleAttachments.delete(params.sessionId);
 			attached.add(params.sessionId);
+			if (registered) terminalHosted.add(params.sessionId);
+			else terminalHosted.delete(params.sessionId);
 			permissionModes.delete(params.sessionId);
 			sessionCwds.set(params.sessionId, params.cwd);
 			for (const text of history) update(params.sessionId, { sessionUpdate: "user_message_chunk", content: { type: "text", text } });
@@ -284,6 +289,7 @@ async function handle(msg: any) {
 		}
 		case "session/close": {
 			attached.delete(params.sessionId);
+			terminalHosted.delete(params.sessionId);
 			// Like gjc 0.19.3 (measured with a TUI host): closing the attachment settles a prompt still waiting on it as
 			// cancelled; the host's own turn is left alone.
 			const waiting = queuedPrompts.get(params.sessionId);
@@ -295,6 +301,10 @@ async function handle(msg: any) {
 			return reply({});
 		}
 		case "session/delete": {
+			if (terminalHosted.has(params.sessionId)) {
+				const owned = `ACP session ${params.sessionId} is owned by its terminal host; delete it from that session instead.`;
+				return write({ jsonrpc: "2.0", id, error: { code: -32603, message: `Internal error: ${owned}`, data: { code: "operation_prohibited", details: owned } } });
+			}
 			sessions.delete(params.sessionId);
 			persist();
 			if (agentDir) fs.rmSync(`${agentDir}/sessions/v2-fake/2026-10-21T00-00-00-000Z_${params.sessionId}.jsonl`, { force: true });

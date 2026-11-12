@@ -1120,7 +1120,7 @@ export class SessionHub {
 		};
 	}
 
-	listSessions(params: { cwd?: string; cursor?: string; query?: string }) {
+	async listSessions(params: { cwd?: string; cursor?: string; query?: string }) {
 		const page = this.#saved.list(params);
 		const listed = new Set(page.sessions.map(s => s.sessionId));
 		// Sessions this bridge created but that have not written a transcript yet (no prompt sent).
@@ -1135,8 +1135,13 @@ export class SessionHub {
 						(!needle || `${s.cwd}\n${s.sessionId}`.toLowerCase().includes(needle)),
 				);
 		const saved = candidates.length > 0 ? this.#saved.ids() : new Set<string>();
-		const fresh = candidates
-			.filter(s => !saved.has(s.sessionId))
+		const unsaved = candidates.filter(s => !saved.has(s.sessionId));
+		// A tmux window's session stays loaded here after the window deleted it (`/session delete`) or ended before its
+		// first answer, and is saved nowhere then: it is a new session only while its window hosts it (gm#95).
+		const tmux = this.#tmux;
+		const open = await Promise.all(unsaved.map(async s => !s.inTmux || !tmux || (await tmux.hosts(s.sessionId, s.cwd))));
+		const fresh = unsaved
+			.filter((_, i) => open[i])
 			.map(s => ({ sessionId: s.sessionId, cwd: s.cwd, updatedAt: new Date().toISOString() }));
 		const sessions = [...fresh, ...page.sessions].map(s => {
 			const state = this.#sessions.get(s.sessionId);
@@ -1186,7 +1191,7 @@ export class SessionHub {
 			try {
 				return await this.openSession(clientId, { sessionId, cwd });
 			} catch (error) {
-				const unregistered = error instanceof AcpError && (error.data as { code?: unknown } | undefined)?.code === "not_found";
+				const unregistered = errorCode(error) === "not_found";
 				const retry = unregistered && Date.now() < deadline && (await tmux.hosts(sessionId, cwd));
 				if (retry) {
 					await Bun.sleep(ATTACH_RETRY_MS);
@@ -1275,18 +1280,49 @@ export class SessionHub {
 		return this.openSession(clientId, { sessionId: forked.sessionId, cwd });
 	}
 
-	/** Deletes a session's transcript and artifacts through gjc. */
+	/**
+	 * Deletes a session's transcript and artifacts through gjc. gjc refuses a session this ACP process is attached to
+	 * as a terminal's (`operation_prohibited`), and keeps that attachment until `session/close`, also after the TUI
+	 * ended (gjc 0.20.0 `acp-agent.ts` `deleteSession`; gm#95: a tmux window's session could not be deleted after its
+	 * window closed). So a refused delete of a session loaded here is tried once more on a fresh attachment: gjc ACP
+	 * then hosts a session whose TUI is gone and deletes it, and refuses again while a TUI still hosts it.
+	 */
 	async deleteSession(params: { sessionId: string }): Promise<{ ok: true }> {
 		const state = this.#sessions.get(params.sessionId);
 		if (state?.running) throw new AcpError(-32003, "Stop the running turn before deleting the session");
 		const acp = await this.agent();
+		const attachedBefore = state?.loaded === true;
 		if (!state?.loaded) {
 			// gjc resolves delete authority from sessions it knows; a saved-only session is loaded first.
 			const cwd = state?.cwd ?? this.#saved.find(params.sessionId)?.cwd;
 			if (!cwd) throw new AcpError(-32002, `Unknown session ${params.sessionId}`);
 			await acp.request("session/load", { sessionId: params.sessionId, cwd, mcpServers: [] });
 		}
-		await acp.request("session/delete", { sessionId: params.sessionId });
+		const request = () => acp.request("session/delete", { sessionId: params.sessionId });
+		try {
+			await request();
+		} catch (error) {
+			if (errorCode(error) !== "operation_prohibited") throw error;
+			// Loaded just now: a TUI hosts it.
+			if (!state || !attachedBefore) throw terminalSession();
+			await state.releasing?.catch(() => {});
+			// Nothing else goes to the attachment being closed; a failure below leaves the session closed, and the
+			// phone's next call (-32002) opens it again.
+			state.loaded = false;
+			await acp.request("session/close", { sessionId: params.sessionId });
+			// A TUI that ended before its first answer saved nothing: there is no session left to load or delete.
+			const saved = await this.#load(state).then(
+				() => true,
+				reload => {
+					if (errorCode(reload) !== "not_found") throw reload;
+					return false;
+				},
+			);
+			if (saved)
+				await request().catch(again => {
+					throw errorCode(again) === "operation_prohibited" ? terminalSession() : again;
+				});
+		}
 		this.#sessions.delete(params.sessionId);
 		for (const { sessions } of this.#clients.values()) sessions.delete(params.sessionId);
 		return { ok: true };
@@ -2109,6 +2145,16 @@ function hostTurnStop(phoneTurn: boolean): AcpError {
 
 function noPendingSteer(): AcpError {
 	return new AcpError(-32005, "대기 중인 끼어들기 메시지가 없습니다. 이미 전달됐습니다.", { code: "no_pending_steer" });
+}
+
+/** The adapter's code gjc ACP puts in a failure's data (`not_found`, `operation_prohibited`, …). */
+function errorCode(error: unknown): unknown {
+	return error instanceof AcpError ? (error.data as { code?: unknown } | undefined)?.code : undefined;
+}
+
+/** A session a TUI hosts is deleted there (gjc refuses it over ACP). */
+function terminalSession(): AcpError {
+	return new AcpError(-32004, "PC 터미널(gjc TUI)에서 열려 있는 세션입니다. 그 창에서 /session delete로 지우거나, 창을 닫은 뒤 다시 지우세요.", { code: "terminal_session" });
 }
 
 function isActive(state: SessionState): boolean {

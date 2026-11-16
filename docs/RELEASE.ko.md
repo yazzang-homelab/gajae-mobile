@@ -86,7 +86,9 @@ git push origin HEAD:playstore              # 또는
 gh workflow run android.yml --ref <브랜치>
 ```
 
-산출물 `gjc-mobile-release`에 `app-release.aab`(Play 업로드용)와 `app-release.apk`(직접 설치용)가 들어 있습니다.
+산출물 `gjc-mobile-release`에 `app-release.aab`(Play 업로드용)와 `app-release.apk`(직접 설치용), `mapping.txt`가 들어 있습니다.
+
+릴리스 빌드는 R8로 축소·난독화합니다(`isMinifyEnabled`, `isShrinkResources`). 유지 규칙은 `android/app/proguard-rules.pro`에 둡니다. AAB에 매핑이 들어 있어 Play Console이 크래시 스택을 자동으로 풀고, APK로 받은 스택은 `mapping.txt`로 풉니다. 리플렉션을 쓰는 라이브러리를 추가하면 릴리스 빌드를 기기에서 실행해 확인합니다.
 
 ### 업로드 키
 

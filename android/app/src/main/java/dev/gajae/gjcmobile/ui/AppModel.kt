@@ -17,6 +17,7 @@ import dev.gajae.gjcmobile.core.DeviceIdentity
 import dev.gajae.gjcmobile.core.OkHttpFrameTransport
 import dev.gajae.gjcmobile.core.PairedHost
 import dev.gajae.gjcmobile.core.PairingOffer
+import dev.gajae.gjcmobile.core.pairingAllowed
 import dev.gajae.gjcmobile.core.SessionSummary
 import dev.gajae.gjcmobile.core.get
 import dev.gajae.gjcmobile.core.parseJson
@@ -65,8 +66,12 @@ class AppModel(application: Application) : AndroidViewModel(application) {
         HostConnection(host, device, deviceName, viewModelScope, notifier, widget) { updated -> update(updated) }
 
     /** First connection from a QR offer: proves the pairing secret, then remembers the host. */
-    suspend fun pair(offerText: String): PairedHost {
+    suspend fun pair(offerText: String, replaceChangedKey: Boolean = false): PairedHost {
         val offer = PairingOffer.parse(offerText)
+        // A known hostId under a different key is replaced only when the user explicitly approved it.
+        if (!pairingAllowed(offer, hosts, replaceChangedKey)) {
+            throw IllegalStateException(KEY_CHANGED_REFUSED)
+        }
         val hostKey = B64Url.decode(offer.hostKey)!!
         val secret = B64Url.decode(offer.secret)!!
         var lastError: Exception = BridgeException.NoReachableEndpoint()
@@ -135,5 +140,7 @@ class AppModel(application: Application) : AndroidViewModel(application) {
 }
 
 fun Throwable.userMessage(): String = message ?: toString()
+
+const val KEY_CHANGED_REFUSED = "이미 등록된 호스트의 키가 바뀌어 연결하지 않았습니다."
 
 const val DEMO_FAILURE = "데모 호스트에 연결하지 못했습니다. 잠시 후 다시 시도하세요."

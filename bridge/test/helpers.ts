@@ -61,5 +61,5 @@ export async function startTestBridge(command: string[] = FAKE_AGENT, cwd = os.t
 	};
 	/** What a gjc updater sends after switching the gjc build. */
 	const hangup = () => proc.kill("SIGHUP");
-	return { home, state, endpoint, offer, pairedClient, hangup, stop };
+	return { home, state, endpoint, offer, pairedClient, hangup, stop, pid: proc.pid };
 }

@@ -84,6 +84,66 @@ describe("pairing and authentication", () => {
 		expect((await client.closed).reason).toBe("decrypt_failed");
 	});
 
+	test("a hello with an all-zero ephemeral key is refused and the bridge keeps serving", async () => {
+		const bridge = await useBridge();
+		const { identity } = await bridge.pairedClient("known phone");
+		const zeroEphHello = (deviceKey: Uint8Array) =>
+			new Promise<{ reply: any; code: number }>((resolve, reject) => {
+				const ws = new WebSocket(bridge.endpoint);
+				let reply: any;
+				ws.onopen = () =>
+					ws.send(
+						JSON.stringify({
+							t: "hello",
+							v: 1,
+							deviceKey: Buffer.from(deviceKey).toString("base64url"),
+							eph: Buffer.alloc(32).toString("base64url"),
+							nonce: crypto.randomBytes(16).toString("base64url"),
+						}),
+					);
+				ws.onmessage = e => {
+					reply = JSON.parse(String(e.data));
+				};
+				ws.onclose = e => resolve({ reply, code: e.code });
+				ws.onerror = () => reject(new Error("websocket error"));
+			});
+		const known = await zeroEphHello(identity.device.publicKey);
+		expect(known.reply).toMatchObject({ t: "error", code: "bad_hello" });
+		expect(known.code).toBe(4401);
+		const unknown = await zeroEphHello(generateKeyPair().publicKey);
+		expect(unknown.reply).toMatchObject({ t: "error", code: "unknown_device" });
+		// The same bridge process still completes a normal handshake.
+		const again = await BridgeClient.connect(bridge.endpoint, identity);
+		await expect(again.request("ping")).resolves.toHaveProperty("pong");
+		again.close();
+	});
+
+	test("a hello that makes the handler throw closes that connection and the bridge keeps serving", async () => {
+		const bridge = await useBridge();
+		const { identity } = await bridge.pairedClient("known phone");
+		// `String(proof)` throws on an object whose toString is not a function; nothing before the handshake guards it.
+		const code = await new Promise<number>((resolve, reject) => {
+			const ws = new WebSocket(bridge.endpoint);
+			ws.onopen = () =>
+				ws.send(
+					JSON.stringify({
+						t: "hello",
+						v: 1,
+						deviceKey: Buffer.from(generateKeyPair().publicKey).toString("base64url"),
+						eph: Buffer.from(generateKeyPair().publicKey).toString("base64url"),
+						nonce: crypto.randomBytes(16).toString("base64url"),
+						pairing: { id: "x", proof: { toString: 1 } },
+					}),
+				);
+			ws.onclose = e => resolve(e.code);
+			ws.onerror = () => reject(new Error("websocket error"));
+		});
+		expect(code).toBe(1011);
+		const again = await BridgeClient.connect(bridge.endpoint, identity);
+		await expect(again.request("ping")).resolves.toHaveProperty("pong");
+		again.close();
+	});
+
 	test("revoked devices are disconnected on their next frame", async () => {
 		const bridge = await useBridge();
 		const { client, identity } = await bridge.pairedClient("old phone");
@@ -92,6 +152,39 @@ describe("pairing and authentication", () => {
 		await expect(client.request("ping")).rejects.toBeInstanceOf(BridgeClientError);
 		expect((await client.closed).reason).toBe("device_revoked");
 		await expect(BridgeClient.connect(bridge.endpoint, identity)).rejects.toMatchObject({ code: "unknown_device" });
+	});
+});
+
+describe("revocation of an attached device", () => {
+	test("a revoked device that sends nothing is closed and stops receiving; another device still does", async () => {
+		const bridge = await useBridge();
+		const { client: lost } = await bridge.pairedClient("lost phone");
+		const { client: kept } = await bridge.pairedClient("kept phone");
+		await lost.request("ping");
+		await kept.request("ping");
+		bridge.state.revokeDevice("lost phone");
+		const sid = (await kept.request("session.new", {})).sessionId;
+		await kept.request("session.prompt", { sessionId: sid, prompt: [{ type: "text", text: "tool" }] });
+		await kept.waitFor(e => e.ev === "permission.request");
+		expect((await lost.closed).reason).toBe("device_revoked");
+		expect(lost.events.some(e => e.ev === "permission.request")).toBe(false);
+		expect(bridge.state.devices().map(d => d.name)).toEqual(["kept phone"]);
+	});
+
+	test("an unreadable device list closes the connection it was checked for and the bridge keeps serving", async () => {
+		const bridge = await useBridge();
+		const { client } = await bridge.pairedClient("phone");
+		const sid = (await client.request("session.new", {})).sessionId;
+		const devicesFile = path.join(bridge.state.home, "devices.json");
+		const saved = fs.readFileSync(devicesFile, "utf8");
+		// A running turn makes the bridge send on its own (the status tick), with no frame from the phone in between.
+		void client.request("session.prompt", { sessionId: sid, prompt: [{ type: "text", text: "slow" }] }).catch(() => {});
+		await client.waitFor(e => e.ev === "session.update" && JSON.stringify(e.p).includes("one"));
+		fs.writeFileSync(devicesFile, "{");
+		expect((await client.closed).reason).toBe("internal_error");
+		fs.writeFileSync(devicesFile, saved);
+		const { client: next } = await bridge.pairedClient("next phone");
+		expect(await next.request("ping")).toBeDefined();
 	});
 });
 
@@ -152,6 +245,17 @@ describe("sessions over the bridge", () => {
 		const kinds = all.map((u: any) => u.update.sessionUpdate).filter((k: string) => k !== "session_info_update");
 		expect(kinds).toEqual(["user_message_chunk", "tool_call", "tool_call_update", "agent_message_chunk", "agent_message_chunk", TURN_END]);
 		expect(client.events.some(e => e.ev === "permission.resolved")).toBe(true);
+	});
+
+	test("malformed ACP lines are dropped and the turn after them still completes", async () => {
+		const bridge = await useBridge();
+		const { client } = await bridge.pairedClient();
+		const sid = (await client.request("session.new", {})).sessionId;
+		await client.request("session.prompt", { sessionId: sid, prompt: [{ type: "text", text: "malformed" }] });
+		const end = await client.waitFor(turnEnd(sid));
+		expect(end.p.update.stopReason).toBe("end_turn");
+		expect((await client.request("ping")).pong).toBeNumber();
+		expect(client.events.some(e => e.ev === "session.update" && e.p.update.sessionUpdate === "agent_message_chunk")).toBe(true);
 	});
 
 	test("reconnecting with afterSeq gets only the missed updates; pending permission is re-offered", async () => {
@@ -265,6 +369,60 @@ describe("sessions over the bridge", () => {
 		const reopened = await client.request("session.open", { sessionId: sid, afterSeq: 3 });
 		expect(reopened.reset).toBe(true);
 		expect(reopened.updates.map((u: any) => u.update.content?.text)).toEqual(["기억해", "crash"]);
+	});
+
+	test("a reopen after an ACP restart does not replay the history onto another phone showing the chat", async () => {
+		const bridge = await useBridge();
+		const { client: a } = await bridge.pairedClient("phone-a");
+		const { client: b } = await bridge.pairedClient("phone-b");
+		const sid = (await a.request("session.new", {})).sessionId;
+		await b.request("session.open", { sessionId: sid });
+		await a.request("session.prompt", { sessionId: sid, prompt: [{ type: "text", text: "기억해" }] });
+		await b.waitFor(turnEnd(sid));
+		const texts = (c: typeof a) => c.events.filter(e => e.ev === "session.update" && e.p.sessionId === sid && e.p.update.sessionUpdate === "user_message_chunk").map(e => e.p.update.content?.text);
+		expect(texts(b)).toEqual(["기억해"]);
+		const seenByB = b.events.length;
+		bridge.hangup();
+		await Bun.sleep(200);
+		expect((await a.request("session.setConfig", { sessionId: sid, configId: "model", value: "fake/model-b" }).catch((e: any) => e)).code).toBe(-32002);
+		const reopened = await a.request("session.open", { sessionId: sid });
+		// Control: the phone that reopened gets the replay as its snapshot.
+		expect(reopened.reset).toBe(true);
+		expect(reopened.updates.map((u: any) => u.update.content?.text)).toContain("기억해");
+		await Bun.sleep(200);
+		// The other phone got no replay as live updates, so its chat shows the message once.
+		expect(b.events.slice(seenByB).some(e => e.ev === "session.update" && e.p.sessionId === sid)).toBe(false);
+		expect(texts(b)).toEqual(["기억해"]);
+		// Live news after the reload still reaches it, with a seq past the replay.
+		await a.request("session.prompt", { sessionId: sid, prompt: [{ type: "text", text: "다시" }] });
+		await b.waitFor(e => turnEnd(sid)(e) && e.p.seq > reopened.seq);
+		const live = b.events.filter(e => e.ev === "session.update" && e.p.sessionId === sid && e.p.update.sessionUpdate === "user_message_chunk").at(-1)!;
+		expect(live.p.update.content.text).toBe("다시");
+		expect(live.p.seq).toBeGreaterThan(reopened.seq);
+		expect(texts(b)).toEqual(["기억해", "다시"]);
+		// Its next open, with the last seq it really saw, is a full snapshot once, because live updates hid the gap.
+		const lastSeen = b.events.filter(e => e.ev === "session.update" && e.p.sessionId === sid).at(-1)!.p.seq;
+		const next = await b.request("session.open", { sessionId: sid, afterSeq: lastSeen });
+		expect(next.reset).toBe(true);
+		expect(next.updates.map((u: any) => u.update.content?.text)).toContain("기억해");
+		expect((await b.request("session.open", { sessionId: sid, afterSeq: next.seq })).reset).toBe(false);
+	});
+
+	test("a turn that ends while another phone's reopen reloads the session still ends on the phone that showed the chat", async () => {
+		const bridge = await useBridge({ FAKE_LOAD_SETTLES_PROMPT: "1" });
+		const { client: a } = await bridge.pairedClient("phone-a");
+		const { client: b } = await bridge.pairedClient("phone-b");
+		const sid = (await a.request("session.new", {})).sessionId;
+		await b.request("session.open", { sessionId: sid });
+		await a.request("session.prompt", { sessionId: sid, prompt: [{ type: "text", text: "slow" }] });
+		await b.waitFor(e => e.ev === "session.update" && e.p.sessionId === sid && e.p.update._meta?.gjcPhase === "working");
+		// The attachment goes stale with the prompt still unsettled; the reopen reloads, and the prompt ends inside that load.
+		expect((await a.request("sdk.query", { sessionId: sid, op: "usage.get" }).catch((e: any) => e)).code).toBe(-32002);
+		await a.request("session.open", { sessionId: sid });
+		const ended = await b.waitFor(turnEnd(sid), 5000);
+		expect(ended.p.update.stopReason).toBe("cancelled");
+		// The replay of the load itself stayed away from it.
+		expect(b.events.filter(e => e.ev === "session.update" && e.p.update.sessionUpdate === "user_message_chunk")).toHaveLength(1);
 	});
 
 	test("config changes go through session/set_config_option", async () => {

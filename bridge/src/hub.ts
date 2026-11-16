@@ -150,6 +150,15 @@ interface SessionState {
 	interrupting?: boolean;
 	/** gjc's own phase flag (session_info_update _meta.running): also true for turns started elsewhere. */
 	hostRunning: boolean;
+	/**
+	 * The TUI in the tmux window may be going on with a phone turn this process holds no prompt for: the gjc ACP
+	 * process died under it, its prompt failed, or this process first attached while the host was busy. Its tool approvals
+	 * still go to the phone (see `#allowTerminalRequest`) until the host is found idle (`#watchCutTurn`) or the phone
+	 * sends a prompt.
+	 */
+	phoneTurnCut?: boolean;
+	/** The next look of `#watchCutTurn`. */
+	cutTurnCheck?: ReturnType<typeof setTimeout>;
 	throughput: Throughput;
 	/** In-flight `session.stats` read feeding [throughput]. */
 	usageSample?: Promise<void>;
@@ -191,7 +200,7 @@ interface SessionState {
 	historySeq: number;
 	/** The permission mode last announced to the phones (`shownPermissionMode`). */
 	shownMode?: PermissionMode;
-	/** A reload the bridge started on its own (`#reattach`): its replay is kept from phones already showing the chat. */
+	/** While a reload replays: gjc's updates are kept from phones already showing the chat (every reload is quiet). */
 	quietReplay?: boolean;
 	/**
 	 * Phones (`HubClient.device`) that showed the chat during a quiet replay: they lack what the terminal did while gjc ACP
@@ -238,9 +247,14 @@ function shownPermissionMode(state: SessionState): PermissionMode {
 	return state.inTmux && !state.channel && state.permissionMode === "prompt" ? "allow" : state.permissionMode;
 }
 
+/** Wait between `session/load` attempts while gjc in a new tmux window registers its session (see `#attachWindow`). */
+const ATTACH_RETRY_MS = 250;
+
 /** Reads per trigger at most, and the wait between them while a pending tool call is not listed yet. */
 const CHANNEL_READS = 4;
 const CHANNEL_RETRY_MS = 1000;
+/** Wait between looks at whether the host a phone turn was cut from has gone idle (see `#watchCutTurn`). */
+const CUT_TURN_CHECK_MS = 3000;
 
 /** `permission.requests.list` result (`{sessionId, enabled, requests:[{id, sessionId, expiresAt, options, toolCall}]}`). */
 function channelRequests(result: unknown): { enabled: boolean; requests: ChannelRequest[] } {
@@ -422,6 +436,7 @@ export class SessionHub {
 			state.channel = undefined;
 			if (state.running) {
 				state.running = false;
+				state.phoneTurnCut = state.inTmux;
 				this.#append(state, { sessionUpdate: AGENT_EXIT, code, stderrTail: acp.stderrTail.slice(-2000) });
 			}
 		}
@@ -434,6 +449,7 @@ export class SessionHub {
 	stop(): void {
 		this.#stopped = true;
 		if (this.#statusTimer) clearInterval(this.#statusTimer);
+		for (const state of this.#sessions.values()) clearTimeout(state.cutTurnCheck);
 		this.#acp?.kill();
 	}
 
@@ -451,9 +467,12 @@ export class SessionHub {
 			if (known?.loaded || this.#stopped) continue;
 			const cwd = known?.cwd ?? (windowCwd || this.#saved.find(sessionId)?.cwd);
 			if (!cwd) continue;
-			await this.#load(this.#stateFor(sessionId, cwd), true).catch(error =>
-				this.#options.log?.(`reattach ${sessionId} failed: ${error instanceof Error ? error.message : String(error)}`),
-			);
+			const state = this.#stateFor(sessionId, cwd);
+			await this.#load(state).catch(async error => {
+				this.#options.log?.(`reattach ${sessionId} failed: ${error instanceof Error ? error.message : String(error)}`);
+				// A window closed before its gjc's first answer leaves nothing to load: no longer the bridge's window session.
+				if (this.#tmux && !(await this.#tmux.hosts(sessionId, cwd))) state.inTmux = false;
+			});
 		}
 	}
 
@@ -507,7 +526,7 @@ export class SessionHub {
 		if (method !== "session/update" || typeof params?.sessionId !== "string") return;
 		const state = this.#stateFor(params.sessionId);
 		if (this.#holdEcho(state, params.update)) return;
-		this.#append(state, state.inTmux ? terminalAsk(params.update) : params.update);
+		this.#append(state, state.inTmux ? terminalAsk(params.update) : params.update, state.quietReplay);
 		this.#lookForHandOver(state, params.update);
 		if (state.channel && !state.replaying) this.#watchChannel(state, params.update);
 	}
@@ -619,6 +638,44 @@ export class SessionHub {
 		}
 	}
 
+	/**
+	 * Allows a guarded tool of a turn the phone did not send, as gjc does in a terminal without the channel. The TUI
+	 * shows a waiting approval as a spinner only and cannot answer it, so a turn typed there stood still until a phone
+	 * answered, or until gjc rejected the tool after 60s (gm#114, measured 2026-11-11 on pve3, gjc 0.20.0). gjc tells
+	 * neither who started a run nor reliably when one starts, so the phone's own prompt is the line: its turn asks the
+	 * phone, as does a turn its queued prompt waits behind. False when the request is to be shown as a card.
+	 */
+	async #allowTerminalRequest(state: SessionState, channel: ApprovalChannel, request: ChannelRequest): Promise<boolean> {
+		// A mode other than prompt answers by itself, also what waited when the phone switched to it.
+		if (state.running || state.phoneTurnCut || state.permissionMode !== "prompt") return false;
+		const optionId = request.options.find(o => o.kind === "allow_once")?.optionId;
+		if (!optionId) return false;
+		try {
+			await this.#sdkCli!.control(state.sessionId, state.cwd, "permission.respond", { sessionId: state.sessionId, id: request.id, optionId });
+		} catch (error) {
+			this.#options.log?.(`permission.respond (terminal turn) failed for ${state.sessionId}: ${error instanceof Error ? error.message : String(error)}`);
+			return false;
+		}
+		channel.settled.add(request.id);
+		return true;
+	}
+
+	/**
+	 * Looks every `CUT_TURN_CHECK_MS` whether the host a phone turn was cut from has nothing left to do: gjc reports
+	 * the end of a run it started for no ACP prompt unreliably (measured 2026-11-11 on pve3, gjc 0.20.0: no idle
+	 * report after such a turn), and until then a turn typed at the terminal would wait for the phone again.
+	 */
+	#watchCutTurn(state: SessionState): void {
+		if (!state.phoneTurnCut || state.cutTurnCheck || this.#stopped) return;
+		state.cutTurnCheck = setTimeout(async () => {
+			state.cutTurnCheck = undefined;
+			// Not loaded: the next load looks, and watches on.
+			if (this.#stopped || !state.phoneTurnCut || !state.loaded) return;
+			if (!state.running && (await this.#hostState(state))?.idle) state.phoneTurnCut = false;
+			else this.#watchCutTurn(state);
+		}, CUT_TURN_CHECK_MS);
+	}
+
 	/** Lists the channel's requests into phone permission cards; one read at a time, another queued behind it. */
 	#readChannel(state: SessionState): void {
 		const channel = state.channel;
@@ -652,7 +709,10 @@ export class SessionHub {
 				for (const id of channel.requests.keys()) if (!ids.has(id)) this.#dropChannelRequest(state, id);
 				for (const request of listed) {
 					channel.waitingTools.delete(request.toolCallId);
-					if (!channel.requests.has(request.id)) this.#showChannelRequest(state, request);
+					if (channel.requests.has(request.id)) continue;
+					const allowed = await this.#allowTerminalRequest(state, channel, request);
+					if (state.channel !== channel) return;
+					if (!allowed) this.#showChannelRequest(state, request);
 				}
 				// A gated call shows up in the channel a moment after it arrives here; one that never does was not gated.
 				if (!channel.again && channel.waitingTools.size === 0) return;
@@ -751,6 +811,8 @@ export class SessionHub {
 				loaded: false,
 				running: false,
 				hostRunning: false,
+				// Until its first load finds the host idle: it may be a window from before this bridge started.
+				phoneTurnCut: true,
 				throughput: new Throughput(),
 				queued: [],
 				remoteAsks: new Map(),
@@ -768,7 +830,8 @@ export class SessionHub {
 		return state;
 	}
 
-	#append(state: SessionState, update: Record<string, unknown>): void {
+	/** `quiet`: gjc's replay while the session reloads; it stays in the buffer but is not sent live (see `quietReplay`). */
+	#append(state: SessionState, update: Record<string, unknown>, quiet = false): void {
 		if (update.sessionUpdate === "config_option_update" && Array.isArray(update.configOptions)) {
 			update = { ...update, configOptions: supportedConfigOptions(update.configOptions) };
 			state.configOptions = update.configOptions as unknown[];
@@ -784,8 +847,9 @@ export class SessionHub {
 			const dropped = state.buffer.shift()!;
 			state.bufferBytes -= jsonBytes(dropped.update);
 		}
-		// A phone showing the chat already has the history a reload of the bridge's own replays.
-		if (state.quietReplay) return;
+		// A phone showing the chat already has the history a quiet reload replays. What the bridge appends itself during
+		// the reload (a turn end, a held message, a host ask row) is news and goes out.
+		if (quiet) return;
 		for (const { client, sessions } of this.#clients.values()) {
 			if (sessions.has(state.sessionId)) client.deliver("session.update", { sessionId: state.sessionId, ...entry });
 		}
@@ -1056,7 +1120,7 @@ export class SessionHub {
 		};
 	}
 
-	listSessions(params: { cwd?: string; cursor?: string; query?: string }) {
+	async listSessions(params: { cwd?: string; cursor?: string; query?: string }) {
 		const page = this.#saved.list(params);
 		const listed = new Set(page.sessions.map(s => s.sessionId));
 		// Sessions this bridge created but that have not written a transcript yet (no prompt sent).
@@ -1071,8 +1135,13 @@ export class SessionHub {
 						(!needle || `${s.cwd}\n${s.sessionId}`.toLowerCase().includes(needle)),
 				);
 		const saved = candidates.length > 0 ? this.#saved.ids() : new Set<string>();
-		const fresh = candidates
-			.filter(s => !saved.has(s.sessionId))
+		const unsaved = candidates.filter(s => !saved.has(s.sessionId));
+		// A tmux window's session stays loaded here after the window deleted it (`/session delete`) or ended before its
+		// first answer, and is saved nowhere then: it is a new session only while its window hosts it (gm#95).
+		const tmux = this.#tmux;
+		const open = await Promise.all(unsaved.map(async s => !s.inTmux || !tmux || (await tmux.hosts(s.sessionId, s.cwd))));
+		const fresh = unsaved
+			.filter((_, i) => open[i])
 			.map(s => ({ sessionId: s.sessionId, cwd: s.cwd, updatedAt: new Date().toISOString() }));
 		const sessions = [...fresh, ...page.sessions].map(s => {
 			const state = this.#sessions.get(s.sessionId);
@@ -1088,26 +1157,53 @@ export class SessionHub {
 		if (!isDirectory(cwd)) throw new AcpError(-32602, `호스트에 작업 디렉터리가 없습니다: ${cwd}`);
 		const tmuxSkipped = this.#tmux && (await this.#tmux.unavailable());
 		if (tmuxSkipped) this.#options.log?.(`tmux skipped (opening over ACP): ${tmuxSkipped.slice(0, 200)}`);
-		const result = await acp.request("session/new", { cwd, mcpServers: [] });
 		if (this.#tmux && !tmuxSkipped) {
-			// ACP lets go of the session it just wrote, and gjc in the window resumes it; the phone then attaches
-			// to that TUI host like to any terminal session. A failure leaves the (empty) session saved.
+			// gjc in the window starts the session; the phone then attaches to that TUI host like to any terminal
+			// session. Nothing is saved until its first answer, so a window closed unused leaves no transcript behind.
+			let window: { sessionId: string; pane: string };
 			try {
-				await acp.request("session/close", { sessionId: result.sessionId });
-				await this.#tmux.open(result.sessionId, cwd);
+				window = await this.#tmux.open(cwd);
 			} catch (error) {
-				const message = error instanceof Error ? error.message : String(error);
-				throw new AcpError(-32021, `새 세션을 tmux 창으로 열지 못했습니다(${result.sessionId}): ${message}`, {
-					code: error instanceof TmuxError ? error.code : "tmux_handoff_failed",
-				});
+				if (!(error instanceof TmuxError)) throw error;
+				throw new AcpError(-32021, `새 세션을 tmux 창으로 열지 못했습니다: ${error.message}`, { code: error.code });
 			}
-			this.#stateFor(result.sessionId, cwd).inTmux = true;
-			return this.openSession(clientId, { sessionId: result.sessionId, cwd });
+			return this.#attachWindow(clientId, this.#tmux, window, cwd);
 		}
+		const result = await acp.request("session/new", { cwd, mcpServers: [] });
 		const state = this.#stateFor(result.sessionId, cwd);
 		state.loaded = true;
 		state.configOptions = supportedConfigOptions(result.configOptions ?? state.configOptions);
 		return this.#subscribe(clientId, state, 0);
+	}
+
+	/**
+	 * Attaches the phone to the session gjc in a new tmux window started. gjc writes its SDK endpoint before it registers
+	 * the session with the broker, and `session/load` answers `not_found` until it has (gjc 0.19.3/0.20.0
+	 * `session-runtime.ts`), so the load is tried again while the window lives, up to `attachTimeoutMs`. A window the
+	 * phone could not attach to is removed: nobody would find it again before its first answer saved the session.
+	 */
+	async #attachWindow(clientId: string, tmux: TmuxLauncher, window: { sessionId: string; pane: string }, cwd: string): Promise<OpenSnapshot> {
+		const { sessionId, pane } = window;
+		const state = this.#stateFor(sessionId, cwd);
+		state.inTmux = true;
+		const deadline = Date.now() + tmux.attachTimeoutMs;
+		for (;;) {
+			try {
+				return await this.openSession(clientId, { sessionId, cwd });
+			} catch (error) {
+				const unregistered = errorCode(error) === "not_found";
+				const retry = unregistered && Date.now() < deadline && (await tmux.hosts(sessionId, cwd));
+				if (retry) {
+					await Bun.sleep(ATTACH_RETRY_MS);
+					continue;
+				}
+				await tmux.close(pane);
+				if (this.#sessions.get(sessionId) === state) this.#sessions.delete(sessionId);
+				if (!unregistered) throw error;
+				const message = error instanceof Error ? error.message : String(error);
+				throw new AcpError(-32021, `새 세션 창의 gjc에 붙지 못했습니다: ${message}`, { code: "tmux_attach_failed" });
+			}
+		}
 	}
 
 	async openSession(clientId: string, params: { sessionId: string; cwd?: string; afterSeq?: number }): Promise<OpenSnapshot> {
@@ -1115,6 +1211,7 @@ export class SessionHub {
 		// A turn being released (`#releaseTurn`) reloads the session itself.
 		await state.releasing?.catch(() => {});
 		if (!state.loaded) {
+			// The opener gets the replay as its snapshot; other phones showing the chat must not get it appended again.
 			await this.#load(state);
 			return this.#subscribe(clientId, state, 0, true);
 		}
@@ -1122,7 +1219,7 @@ export class SessionHub {
 	}
 
 	/** Loads the session into the ACP process (`session/load`); one load at a time per session. */
-	#load(state: SessionState, quiet = false): Promise<void> {
+	#load(state: SessionState): Promise<void> {
 		if (state.loaded) return Promise.resolve();
 		state.loading ??= (async () => {
 			const acp = await this.agent();
@@ -1142,7 +1239,7 @@ export class SessionHub {
 			for (const id of [...(state.channel?.requests.keys() ?? [])]) this.#dropChannelRequest(state, id);
 			state.channel = undefined;
 			state.replaying = true;
-			state.quietReplay = quiet;
+			state.quietReplay = true;
 			let result: any;
 			try {
 				result = await acp.request("session/load", { sessionId: state.sessionId, cwd: state.cwd, mcpServers: [] });
@@ -1153,7 +1250,7 @@ export class SessionHub {
 				state.replaying = false;
 				state.quietReplay = false;
 				state.historySeq = state.seq;
-				if (quiet) for (const { client, sessions } of this.#clients.values()) if (sessions.has(state.sessionId)) state.resync.add(client.device ?? client.id);
+				for (const { client, sessions } of this.#clients.values()) if (sessions.has(state.sessionId)) state.resync.add(client.device ?? client.id);
 			}
 			state.configOptions = supportedConfigOptions(result?.configOptions ?? state.configOptions);
 			// Judged on every load: a window the bridge opened (also before a restart) hosts it, or no longer does.
@@ -1161,7 +1258,10 @@ export class SessionHub {
 			// Before the mode: enabling the channel sets the session to prompt.
 			if (state.inTmux) await this.#enableChannel(state);
 			if (state.permissionMode !== "prompt") await this.#applyPermissionMode(acp, state.sessionId, state.permissionMode);
+			// The cut phone turn is over once the host has nothing left to do; only a tmux session's channel asks.
+			if (state.phoneTurnCut && (!state.inTmux || (await this.#hostState(state, acp))?.idle)) state.phoneTurnCut = false;
 			state.loaded = true;
+			this.#watchCutTurn(state);
 			this.#announceShownMode(state);
 			// Requests already waiting (from before a restart) are not announced by any later tool call.
 			this.#readChannel(state);
@@ -1180,18 +1280,74 @@ export class SessionHub {
 		return this.openSession(clientId, { sessionId: forked.sessionId, cwd });
 	}
 
-	/** Deletes a session's transcript and artifacts through gjc. */
+	/**
+	 * Deletes a session's transcript and artifacts through gjc. gjc refuses a session this ACP process is attached to
+	 * as a terminal's (`operation_prohibited`), and keeps that attachment until `session/close`, also after the TUI
+	 * ended (gjc 0.20.0 `acp-agent.ts` `deleteSession`; gm#95: a tmux window's session could not be deleted after its
+	 * window closed). So a refused delete of a session loaded here is tried once more on a fresh attachment: gjc ACP
+	 * then hosts a session whose TUI is gone and deletes it, and refuses again while a TUI still hosts it.
+	 */
 	async deleteSession(params: { sessionId: string }): Promise<{ ok: true }> {
 		const state = this.#sessions.get(params.sessionId);
 		if (state?.running) throw new AcpError(-32003, "Stop the running turn before deleting the session");
 		const acp = await this.agent();
+		const attachedBefore = state?.loaded === true;
 		if (!state?.loaded) {
 			// gjc resolves delete authority from sessions it knows; a saved-only session is loaded first.
 			const cwd = state?.cwd ?? this.#saved.find(params.sessionId)?.cwd;
 			if (!cwd) throw new AcpError(-32002, `Unknown session ${params.sessionId}`);
 			await acp.request("session/load", { sessionId: params.sessionId, cwd, mcpServers: [] });
 		}
-		await acp.request("session/delete", { sessionId: params.sessionId });
+		try {
+			await acp.request("session/delete", { sessionId: params.sessionId });
+		} catch (error) {
+			if (errorCode(error) !== "operation_prohibited") {
+				// gjc ends its attachment before it deletes (0.20.0 `deleteSession`: `#teardownSession`, then the durable
+				// delete), so a delete that failed after that (`cleanup_pending`) leaves nothing loaded here: the phone's
+				// next call (-32002) opens the session again.
+				if (state && attachedBefore) state.loaded = false;
+				throw error;
+			}
+			if (!state || !attachedBefore) {
+				// Loaded just now: a TUI hosts it. The attachment made for the delete is let go, or gjc would refuse the
+				// session as the terminal's also after that TUI ended. Not one a phone opened meanwhile (the load above
+				// takes as long as the history is), nor while such a load is under way.
+				const opened = this.#sessions.get(params.sessionId);
+				if (!opened?.loading && !opened?.loaded)
+					await acp.request("session/close", { sessionId: params.sessionId }).catch(closing => {
+						this.#options.log?.(`closing ${params.sessionId} after its refused delete failed: ${closing instanceof Error ? closing.message : String(closing)}`);
+					});
+				throw terminalSession();
+			}
+			// The bridge's window still hosts it: refused again for certain, so its attachment is left as it is.
+			if (state.inTmux && (await this.#tmux?.hosts(state.sessionId, state.cwd))) throw terminalSession();
+			await state.releasing?.catch(() => {});
+			// A prompt that came in meanwhile would be ended by the close below.
+			if (state.running) throw new AcpError(-32003, "Stop the running turn before deleting the session");
+			// Nothing else goes to the attachment being closed; a failure below leaves the session closed, and the
+			// phone's next call (-32002) opens it again.
+			state.loaded = false;
+			await acp.request("session/close", { sessionId: params.sessionId });
+			// A TUI that ended before its first answer saved nothing: there is no session left to load or delete.
+			const saved = await this.#load(state).then(
+				() => true,
+				reload => {
+					if (errorCode(reload) !== "not_found") throw reload;
+					return false;
+				},
+			);
+			if (saved) {
+				try {
+					// The load may have started another gjc ACP process.
+					await (await this.agent()).request("session/delete", { sessionId: params.sessionId });
+				} catch (again) {
+					if (errorCode(again) === "operation_prohibited") throw terminalSession();
+					// As above: gjc ended the attachment the load made.
+					state.loaded = false;
+					throw again;
+				}
+			}
+		}
 		this.#sessions.delete(params.sessionId);
 		for (const { sessions } of this.#clients.values()) sessions.delete(params.sessionId);
 		return { ok: true };
@@ -1281,6 +1437,8 @@ export class SessionHub {
 		const promptBytes = Buffer.byteLength(JSON.stringify(params.prompt));
 		if (promptBytes > PROMPT_BYTES_LIMIT) throw promptTooLarge(params.prompt, promptBytes);
 		state.running = true;
+		// From here this prompt is what asks the phone; it ends behind whatever the cut turn left running.
+		state.phoneTurnCut = false;
 		const turnId = crypto.randomUUID();
 		state.turnId = turnId;
 		state.turnBehindHost = state.hostRunning;
@@ -1311,7 +1469,14 @@ export class SessionHub {
 				if (message.includes(STALE_ATTACHMENT)) state.loaded = false;
 				// A stop, not a failure; `undelivered` tells the phone that sent it to put the message back in its composer.
 				if (message.includes(PREFLIGHT_CANCELLED)) this.#endTurn(state, { sessionUpdate: TURN_END, stopReason: "cancelled", undelivered: true });
-				else this.#endTurn(state, { sessionUpdate: TURN_END, stopReason: "error", error: message });
+				else {
+					// The failure does not tell whether the TUI host took the prompt and runs it.
+					if (state.inTmux) {
+						state.phoneTurnCut = true;
+						this.#watchCutTurn(state);
+					}
+					this.#endTurn(state, { sessionUpdate: TURN_END, stopReason: "error", error: message });
+				}
 			},
 		);
 		state.turn = turn;
@@ -1378,9 +1543,9 @@ export class SessionHub {
 	 * nothing left to do (`context.get` `isStreaming` false with empty queues, and no compaction or retry under way:
 	 * `isStreaming` does not cover those). `undefined` when it cannot say.
 	 */
-	async #hostState(state: SessionState): Promise<{ terminal: boolean; idle: boolean } | undefined> {
+	async #hostState(state: SessionState, attached?: AcpProcess): Promise<{ terminal: boolean; idle: boolean } | undefined> {
 		try {
-			const acp = await this.agent();
+			const acp = attached ?? (await this.agent());
 			const [capabilities, context] = await Promise.all([
 				this.#sdkRequest(acp, state, "query", "runtime.capabilities", {}),
 				this.#sdkRequest(acp, state, "query", "context.get", {}),
@@ -1423,7 +1588,7 @@ export class SessionHub {
 			}
 			// The turn is over either way; a failed load leaves the session closed, and the phone's next call (-32002)
 			// opens it again.
-			await this.#load(state, true).catch(error =>
+			await this.#load(state).catch(error =>
 				this.#options.log?.(`loading ${state.sessionId} again after releasing its turn failed: ${error instanceof Error ? error.message : String(error)}`),
 			);
 		})().finally(() => {
@@ -2005,6 +2170,16 @@ function hostTurnStop(phoneTurn: boolean): AcpError {
 
 function noPendingSteer(): AcpError {
 	return new AcpError(-32005, "대기 중인 끼어들기 메시지가 없습니다. 이미 전달됐습니다.", { code: "no_pending_steer" });
+}
+
+/** The adapter's code gjc ACP puts in a failure's data (`not_found`, `operation_prohibited`, …). */
+function errorCode(error: unknown): unknown {
+	return error instanceof AcpError ? (error.data as { code?: unknown } | undefined)?.code : undefined;
+}
+
+/** A session a TUI hosts is deleted there (gjc refuses it over ACP). */
+function terminalSession(): AcpError {
+	return new AcpError(-32004, "PC 터미널(gjc TUI)에서 열려 있는 세션입니다. 그 창에서 /session delete로 지우거나, 창을 닫은 뒤 다시 지우세요.", { code: "terminal_session" });
 }
 
 function isActive(state: SessionState): boolean {

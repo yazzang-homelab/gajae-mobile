@@ -5,18 +5,35 @@
 import fs from "node:fs";
 import path from "node:path";
 
-// Launched by the bridge's tmux path as the TUI (`<agent> --resume <id>`): like gjc, publish the session's SDK
-// endpoint under <cwd>/.gjc/state/sdk with this process's pid (and the agent dir it got) and stay up. It refuses
-// a session ACP still holds (no session/close yet). `--tui=exit` quits at once, `--tui=silent` never publishes.
-const resumeAt = process.argv.indexOf("--resume");
-if (resumeAt >= 0) {
-	const mode = process.argv.find(arg => arg.startsWith("--tui="))?.slice("--tui=".length);
-	const dir = path.join(process.cwd(), ".gjc", "state", "sdk");
-	const sessionId = process.argv[resumeAt + 1];
-	if (mode === "exit" || !fs.existsSync(path.join(dir, `${sessionId}.closed`))) process.exit(1);
-	if (mode !== "silent") {
+// Launched by the bridge's tmux path as the TUI (the tmux tests' agent command, which carries `--tui=<mode>`, without
+// `--mode=acp`): like gjc, start a new session, publish its SDK endpoint under <cwd>/.gjc/state/sdk with this
+// process's pid (and the agent dir it got), and only then register the session with the broker, without waiting
+// (gjc 0.19.3/0.20.0 `session-runtime.ts`: `runtime.start()`, then `registerBroker()`). `<id>.tui` stands for that
+// registration for the ACP process below: like gjc's broker, it attaches a live host on session/load before any
+// transcript exists, and answers not_found until then. The registration goes with this process.
+// `--tui=run` registers 400ms after publishing, `--tui=late` publishes 800ms after starting, `--tui=unregistered`
+// never registers, `--tui=exit` quits at once, `--tui=silent` never publishes.
+const tuiMode = process.argv.find(arg => arg.startsWith("--tui="))?.slice("--tui=".length);
+if (tuiMode && !process.argv.includes("--mode=acp") && !process.argv.includes("sdk")) {
+	if (tuiMode === "exit") process.exit(1);
+	if (tuiMode !== "silent") {
+		const dir = path.join(process.cwd(), ".gjc", "state", "sdk");
+		const sessionId = `tui-${process.pid}`;
 		const agentDir = process.env.GJC_CODING_AGENT_DIR;
-		fs.writeFileSync(path.join(dir, `${sessionId}.json`), JSON.stringify({ version: 1, sessionId, pid: process.pid, agentDir }));
+		const registration = path.join(dir, `${sessionId}.tui`);
+		const publish = () => {
+			fs.mkdirSync(dir, { recursive: true });
+			fs.writeFileSync(path.join(dir, `${sessionId}.json`), JSON.stringify({ version: 1, sessionId, pid: process.pid, agentDir }));
+			if (tuiMode !== "unregistered") setTimeout(() => fs.writeFileSync(registration, ""), 400);
+		};
+		if (tuiMode === "late") setTimeout(publish, 800);
+		else publish();
+		const leave = () => {
+			fs.rmSync(registration, { force: true });
+			process.exit(0);
+		};
+		process.on("SIGHUP", leave);
+		process.on("SIGTERM", leave);
 	}
 	setInterval(() => {}, 60_000);
 	await new Promise(() => {});
@@ -110,6 +127,9 @@ const queuedPrompts = new Map<
 	string,
 	{ steerId: string; blocks: any[]; taken?: boolean; orphan?: boolean; settle: (outcome: "consumed" | "removed" | "closed") => void }
 >();
+// Sessions this process is attached to as a terminal's: a live TUI hosted them when they were loaded. Like gjc 0.20.0,
+// the attachment stays until session/close, also after that TUI ended, and session/delete refuses such a session.
+const terminalHosted = new Set<string>();
 // Sessions whose next session/load fails once ("fail next load").
 const failNextLoad = new Set<string>();
 // gjc's SDK permission policy; every ACP attachment (session/new, session/load) resets it to prompt.
@@ -148,7 +168,8 @@ function channelOn(sid: string): string | undefined {
 	return dir && fs.existsSync(path.join(dir, `${sid}.channel`)) ? dir : undefined;
 }
 async function channelApproval(sid: string, dir: string, toolCall: Record<string, unknown>): Promise<string | undefined> {
-	const id = `req-${nextChannelRequest++}`;
+	// Unique across gjc ACP processes, as gjc's own ids are.
+	const id = `req-${process.pid}-${nextChannelRequest++}`;
 	const requests = path.join(dir, `${sid}.requests.json`);
 	const answer = path.join(dir, `${sid}.answer.json`);
 	// gjc lists the request a moment after the pending tool call arrives over ACP (measured ~1.4s).
@@ -177,6 +198,29 @@ async function channelApproval(sid: string, dir: string, toolCall: Record<string
 	}
 }
 
+function channelWaiting(sid: string): boolean {
+	const cwd = sessionCwds.get(sid);
+	return cwd !== undefined && fs.existsSync(path.join(cwd, ".gjc", "state", "sdk", `${sid}.requests.json`));
+}
+// `<id>.typed` under the session's sdk directory stands for a turn typed in the TUI itself, which no ACP client asked
+// for: gjc reports the host working, the turn's bash call waits on the permission channel (runs unasked without
+// one), and the host goes idle when the call ends.
+setInterval(() => {
+	for (const [sid, cwd] of sessionCwds) {
+		const typed = path.join(cwd, ".gjc", "state", "sdk", `${sid}.typed`);
+		if (!fs.existsSync(typed)) continue;
+		fs.rmSync(typed);
+		const dir = channelOn(sid);
+		const toolCall = { toolCallId: "ty1", title: "make build", kind: "execute", status: "pending", rawInput: { command: "make build" } };
+		update(sid, { sessionUpdate: "session_info_update", _meta: { gjcPhase: "working", running: true } });
+		update(sid, { sessionUpdate: "tool_call", ...toolCall });
+		void (dir ? channelApproval(sid, dir, toolCall) : Promise.resolve("allow_once")).then(optionId => {
+			update(sid, { sessionUpdate: "tool_call_update", toolCallId: "ty1", status: optionId === "allow_once" ? "completed" : "failed" });
+			update(sid, { sessionUpdate: "session_info_update", _meta: { gjcPhase: "idle", running: false } });
+		});
+	}
+}, 50);
+
 async function handle(msg: any) {
 	const { id, method, params } = msg;
 	const reply = (result: unknown) => write({ jsonrpc: "2.0", id, result });
@@ -190,8 +234,8 @@ async function handle(msg: any) {
 			attached.add(sessionId);
 			permissionModes.delete(sessionId);
 			persist();
-			// Like gjc's ACP session host, publish the SDK endpoint (it stays behind after session/close). Only the
-			// tmux tests, whose cwd is a scratch dir, need it.
+			// Like gjc's ACP session host, publish the SDK endpoint (it stays behind after session/close): the tmux tests,
+			// whose cwd is a scratch dir, check that a new window is never taken for it.
 			const sdkDir = path.join(params.cwd, ".gjc", "state", "sdk");
 			if (process.env.GJCM_TEST_TMUX) {
 				fs.mkdirSync(sdkDir, { recursive: true });
@@ -206,13 +250,33 @@ async function handle(msg: any) {
 				return write({ jsonrpc: "2.0", id, error: { code: -32603, message: "Internal error: load failed" } });
 			if (params.sessionId === "broker-lost")
 				return write({ jsonrpc: "2.0", id, error: { code: -32603, message: "Internal error: SDK request outcome is uncertain after the frame was sent." } });
-			const history = sessions.get(params.sessionId);
-			if (!history) return write({ jsonrpc: "2.0", id, error: { code: -32002, message: "not found" } });
+			// Like gjc's broker, a session a live TUI registered attaches before its first answer saved it; until it
+			// registered, or once it is gone, such a session is saved nowhere.
+			const registered = fs.existsSync(path.join(params.cwd, ".gjc", "state", "sdk", `${params.sessionId}.tui`));
+			const saved = sessions.get(params.sessionId);
+			const unsaved = !saved || (params.sessionId.startsWith("tui-") && saved.length === 0);
+			// What gjc answers (acpRequestFailure): -32603 with the adapter's code in data.
+			const missing = `Saved ACP session does not exist: ${params.sessionId}`;
+			if (unsaved && !registered)
+				return write({ jsonrpc: "2.0", id, error: { code: -32603, message: `Internal error: ${missing}`, data: { code: "not_found", details: missing } } });
+			const history = saved ?? [];
+			sessions.set(params.sessionId, history);
 			staleAttachments.delete(params.sessionId);
+			// Like gjc (`#attachExisting`), a session already attached keeps the owner it was attached with.
+			if (!attached.has(params.sessionId)) {
+				if (registered) terminalHosted.add(params.sessionId);
+				else terminalHosted.delete(params.sessionId);
+			}
 			attached.add(params.sessionId);
 			permissionModes.delete(params.sessionId);
 			sessionCwds.set(params.sessionId, params.cwd);
 			for (const text of history) update(params.sessionId, { sessionUpdate: "user_message_chunk", content: { type: "text", text } });
+			// FAKE_LOAD_SETTLES_PROMPT: the prompt the lost attachment left unsettled ends while the load is still answering.
+			if (process.env.FAKE_LOAD_SETTLES_PROMPT && cancellable.has(params.sessionId)) {
+				cancellable.get(params.sessionId)!();
+				cancellable.delete(params.sessionId);
+				await new Promise(resolve => setTimeout(resolve, 300));
+			}
 			return reply({ configOptions });
 		}
 		case "session/fork": {
@@ -228,6 +292,7 @@ async function handle(msg: any) {
 		}
 		case "session/close": {
 			attached.delete(params.sessionId);
+			terminalHosted.delete(params.sessionId);
 			// Like gjc 0.19.3 (measured with a TUI host): closing the attachment settles a prompt still waiting on it as
 			// cancelled; the host's own turn is left alone.
 			const waiting = queuedPrompts.get(params.sessionId);
@@ -236,11 +301,20 @@ async function handle(msg: any) {
 				steers.set(params.sessionId, (steers.get(params.sessionId) ?? []).filter(s => s.id !== waiting.steerId));
 				waiting.settle("closed");
 			}
-			const cwd = sessionCwds.get(params.sessionId);
-			if (cwd && process.env.GJCM_TEST_TMUX) fs.writeFileSync(path.join(cwd, ".gjc", "state", "sdk", `${params.sessionId}.closed`), "");
 			return reply({});
 		}
 		case "session/delete": {
+			if (terminalHosted.has(params.sessionId)) {
+				const owned = `ACP session ${params.sessionId} is owned by its terminal host; delete it from that session instead.`;
+				return write({ jsonrpc: "2.0", id, error: { code: -32603, message: `Internal error: ${owned}`, data: { code: "operation_prohibited", details: owned } } });
+			}
+			// FAKE_DELETE_PENDING: like gjc 0.20.0 on Linux for a session with an artifacts directory, the delete ends the
+			// attachment and then fails with the transcript still there.
+			if (process.env.FAKE_DELETE_PENDING) {
+				attached.delete(params.sessionId);
+				const pending = "Saved session cleanup is pending in artifacts: Exact detached artifact removal rejected: cleanup_pending";
+				return write({ jsonrpc: "2.0", id, error: { code: -32603, message: `Internal error: ${pending}`, data: { code: "cleanup_pending", details: pending } } });
+			}
 			sessions.delete(params.sessionId);
 			persist();
 			if (agentDir) fs.rmSync(`${agentDir}/sessions/v2-fake/2026-10-21T00-00-00-000Z_${params.sessionId}.jsonl`, { force: true });
@@ -314,6 +388,12 @@ async function handle(msg: any) {
 			saveTranscript(sid, sessionCwds.get(sid) ?? "/tmp");
 			for (const block of params.prompt) update(sid, { sessionUpdate: "user_message_chunk", content: block });
 			if (texts.join(" ") === "crash") process.exit(3);
+			// "malformed" stands for a gjc that writes lines outside the protocol before its real reply.
+			if (texts.join(" ") === "malformed") {
+				process.stdout.write("null\n");
+				process.stdout.write("42\n");
+				write({ jsonrpc: "2.0", method: "session/update", params: { sessionId: sid } });
+			}
 			// "huge" stands for a single update bigger than any frame (a tool's output, say): 33 MiB of text.
 			if (texts.join(" ") === "huge") {
 				update(sid, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "x".repeat(33 * 1024 * 1024) } });
@@ -338,10 +418,10 @@ async function handle(msg: any) {
 				update(sid, { sessionUpdate: "tool_call", ...toolCall });
 				const mode = permissionModes.get(sid) ?? "prompt";
 				const channel = mode === "prompt" ? channelOn(sid) : undefined;
-				// Measured on gjc 0.19.3: a TUI host (the session ACP closed for the tmux window) does not ask over ACP; without
-				// its approval channel it runs the tool unasked.
+				// Measured on gjc 0.19.3: a TUI host (the tmux window's gjc) does not ask over ACP; without its approval
+				// channel it runs the tool unasked.
 				const sdkDir = path.join(sessionCwds.get(sid) ?? process.cwd(), ".gjc", "state", "sdk");
-				const tuiHost = fs.existsSync(path.join(sdkDir, `${sid}.closed`));
+				const tuiHost = fs.existsSync(path.join(sdkDir, `${sid}.tui`));
 				const res = channel
 					? { outcome: { outcome: "selected", optionId: (await channelApproval(sid, channel, toolCall)) ?? "reject_once" } }
 					: tuiHost && mode === "prompt"
@@ -433,7 +513,8 @@ async function handle(msg: any) {
 				const queue = steers.get(params.sessionId) ?? [];
 				const item = {
 					usage: { tokens: 1200, contextWindow: 100000, percent: 1.2 },
-					isStreaming: terminalTurns.has(params.sessionId) || cancellable.has(params.sessionId),
+					// A tool waiting on the permission channel belongs to a run under way (also one a restarted ACP finds).
+					isStreaming: terminalTurns.has(params.sessionId) || cancellable.has(params.sessionId) || channelWaiting(params.sessionId),
 					steeringQueueDepth: queue.filter(s => s.mode === "steer").length,
 					followupQueueDepth: queue.filter(s => s.mode === "followUp").length,
 					systemPrompt: ["abc", "de"],
@@ -503,6 +584,8 @@ async function handle(msg: any) {
 						);
 					return reply({ accepted: true });
 				}
+				// "crash" stands for the ACP process dying while a prompt is in flight.
+				if (text === "crash") process.exit(3);
 				if (text === "expire") {
 					expiring.get(params.sessionId)?.();
 					return reply({ accepted: true });

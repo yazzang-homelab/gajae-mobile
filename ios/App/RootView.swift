@@ -68,7 +68,7 @@ struct RootView: View {
                 setSidebar(false)
             }
         }
-        .onChange(of: model.pairingURL) { _, url in if url != nil { showPairing = true } }
+        .onChange(of: model.pairingLink) { _, link in if link != nil { showPairing = true } }
         .onChange(of: model.requestedHostId) { _, id in
             guard let id else { return }
             selectedHostId = id
@@ -150,8 +150,10 @@ struct RootView: View {
                 if DemoHost.offerURL != nil {
                     Button {
                         Task {
-                            // The pairing sheet opens on pairingURL and pairs with it right away.
-                            if let link = try? await DemoHost.pairingLink() { model.pairingURL = link } else { demoError = DemoHost.failure }
+                            // The pairing sheet opens on pairingLink and pairs with it right away.
+                            if let link = try? await DemoHost.pairingLink() {
+                                model.pairingLink = PairingLink(text: link, fromLink: false)
+                            } else { demoError = DemoHost.failure }
                         }
                     } label: {
                         Label("컴퓨터 없이 데모로 체험", systemImage: "play.circle").frame(maxWidth: 220).padding(.vertical, 6)

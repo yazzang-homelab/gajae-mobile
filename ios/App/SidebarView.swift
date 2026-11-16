@@ -171,6 +171,9 @@ struct SidebarView: View {
         } header: {
             Text(connection.searchQuery.isEmpty ? "\(connection.host.name) · 최근 세션" : "'\(connection.searchQuery)' 검색 결과")
         } footer: {
+            if let listError = connection.listError {
+                Text(listError).font(.caption2).foregroundStyle(Palette.gajaeRed)
+            }
             if connection.nextCursor == nil, !connection.sessions.isEmpty {
                 Text("세션 \(connection.sessions.count)개 · 호스트 ~/.gjc/agent/sessions").font(.caption2)
             }

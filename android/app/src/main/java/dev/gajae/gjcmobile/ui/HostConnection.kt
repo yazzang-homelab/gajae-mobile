@@ -13,8 +13,10 @@ import dev.gajae.gjcmobile.core.HostInfo
 import dev.gajae.gjcmobile.core.PairedHost
 import dev.gajae.gjcmobile.core.PermissionRequest
 import dev.gajae.gjcmobile.core.ReconnectBackoff
+import dev.gajae.gjcmobile.core.SessionListFailure
 import dev.gajae.gjcmobile.core.SessionSummary
 import dev.gajae.gjcmobile.widget.WidgetStore
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.currentCoroutineContext
@@ -52,6 +54,8 @@ class HostConnection(
     var permissions by mutableStateOf<List<PermissionRequest>>(emptyList()); private set
     var nextCursor by mutableStateOf<String?>(null); private set
     var loadingMore by mutableStateOf(false); private set
+    /** Why the last session-list request failed while the connection stayed up (an error reply from the bridge). */
+    var listError by mutableStateOf<String?>(null); private set
     var searchQuery by mutableStateOf(""); private set
     /** The host home's chat (null shows the new-chat composer) and that composer's directory. */
     var activeChat by mutableStateOf<ChatModel?>(null)
@@ -82,6 +86,7 @@ class HostConnection(
         eventJob?.cancel()
         client?.close()
         client = null
+        listError = null
         status = Status.Idle
     }
 
@@ -115,7 +120,7 @@ class HostConnection(
                 status = Status.Failed(e.userMessage())
                 return // unpaired: retrying cannot help
             } catch (e: Exception) {
-                if (e is kotlinx.coroutines.CancellationException) throw e
+                if (e is CancellationException) throw e
                 currentCoroutineContext().ensureActive()
                 status = Status.Failed(e.userMessage())
                 delay(backoff.failedDial())
@@ -124,8 +129,13 @@ class HostConnection(
     }
 
     private fun attach(client: BridgeClient, endpoint: String) {
+        // The previous client's socket and event queue outlive a plain overwrite; the bridge would keep both links.
+        // Stop its collector first so the Disconnected event that close() emits is never handled as a drop.
+        eventJob?.cancel()
+        this.client?.takeIf { it !== client }?.close()
         this.client = client
         status = Status.Connected
+        listError = null
         listKnown = false
         waitingKnown = false
         arrivedSinceAttach.clear()
@@ -134,7 +144,6 @@ class HostConnection(
             host = host.copy(lastEndpoint = endpoint)
             onHostChange(host)
         }
-        eventJob?.cancel()
         eventJob = scope.launch { client.events.collect(::handle) }
         scope.launch {
             info = runCatching { client.hostInfo() }.getOrNull()
@@ -180,6 +189,7 @@ class HostConnection(
                 client = null
                 listKnown = false
                 waitingKnown = false
+                listError = null
                 status = Status.Failed(event.reason)
                 // A drop right after attaching waits before the next dial (see ReconnectBackoff).
                 ensureConnected(backoff.dropped(SystemClock.elapsedRealtime()))
@@ -206,14 +216,23 @@ class HostConnection(
             alerts.sessions(list.sessions).forEach(::notify)
             sessions = list.sessions
             nextCursor = list.nextCursor
+            listError = null
             if (searchQuery.isEmpty()) {
                 listKnown = true
                 recordWidget()
             }
-        } catch (e: BridgeException.Disconnected) {
-            // the event stream reports the drop and reconnects
         } catch (e: Exception) {
-            status = Status.Failed(e.userMessage())
+            handleListFailure(e)
+        }
+    }
+
+    /** Cancellation is rethrown, a drop is left to the event stream, an error reply only marks the list. */
+    private fun handleListFailure(e: Exception) {
+        when (SessionListFailure.classify(e)) {
+            SessionListFailure.Cancelled -> throw e
+            SessionListFailure.Disconnected -> Unit // the event stream reports the drop and reconnects
+            SessionListFailure.Remote -> listError = e.userMessage()
+            SessionListFailure.Transport -> status = Status.Failed(e.userMessage())
         }
     }
 
@@ -226,8 +245,15 @@ class HostConnection(
     suspend fun search(query: String) {
         val trimmed = query.trim()
         if (trimmed == searchQuery) return
+        val previous = searchQuery
         searchQuery = trimmed
-        refreshSessions()
+        try {
+            refreshSessions()
+        } catch (e: CancellationException) {
+            // The list still shows the previous query's results: typing the same text again must search again.
+            searchQuery = SessionListFailure.queryAfterCancelledSearch(searchQuery, trimmed, previous)
+            throw e
+        }
     }
 
     suspend fun loadMoreSessions() {
@@ -241,8 +267,9 @@ class HostConnection(
             alerts.sessions(page.sessions).forEach(::notify)
             sessions = sessions + page.sessions.filter { it.sessionId !in known }
             nextCursor = page.nextCursor
+            listError = null
         } catch (e: Exception) {
-            status = Status.Failed(e.userMessage())
+            handleListFailure(e)
         } finally {
             loadingMore = false
         }

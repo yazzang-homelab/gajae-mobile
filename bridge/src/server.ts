@@ -83,6 +83,22 @@ export function startBridgeServer(options: BridgeServerOptions): Server<Conn> {
 	const sendBody = (ws: ServerWebSocket<Conn>, body: Buffer) => {
 		const conn = ws.data;
 		if (conn.phase !== "open" || !conn.cipher) return;
+		// `gjcm-bridge revoke` runs in another process and rewrites devices.json; check it before anything goes out.
+		let paired: boolean;
+		try {
+			paired = state.findDevice(conn.deviceKey!) !== undefined;
+		} catch (error) {
+			// An unreadable devices.json must not travel up into the hub's delivery loop: only this connection ends.
+			log(`device check failed, closing the connection: ${error instanceof Error ? error.message : String(error)}`);
+			conn.phase = "closed";
+			ws.close(1011, "internal_error");
+			return;
+		}
+		if (!paired) {
+			conn.phase = "closed";
+			ws.close(4403, "device_revoked");
+			return;
+		}
 		ws.sendBinary(conn.cipher.seal(body));
 	};
 	const send = (ws: ServerWebSocket<Conn>, message: { id?: number; e?: unknown; ev?: string; p?: unknown }) => {
@@ -203,7 +219,14 @@ export function startBridgeServer(options: BridgeServerOptions): Server<Conn> {
 			clientNonce,
 			serverNonce,
 		};
-		const keys = serverKeys(host.keyPair, serverEph, transcript);
+		let keys: ReturnType<typeof serverKeys>;
+		try {
+			keys = serverKeys(host.keyPair, serverEph, transcript);
+		} catch {
+			// A device key is public, so anyone can send an ephemeral key that the key agreement rejects (all zero bytes).
+			log(`rejected hello device=${deviceKeyText.slice(0, 8)}: key agreement failed`);
+			return fail(ws, "bad_hello", "malformed keys");
+		}
 		ws.data.cipher = new FrameCipher(keys.s2c, keys.c2s);
 		ws.data.deviceKey = deviceKeyText;
 		ws.data.deviceName = state.findDevice(deviceKeyText)?.name;
@@ -219,6 +242,26 @@ export function startBridgeServer(options: BridgeServerOptions): Server<Conn> {
 		);
 	};
 
+	const handleMessage = (ws: ServerWebSocket<Conn>, raw: string | Buffer) => {
+		const conn = ws.data;
+		if (conn.phase === "hello") {
+			if (typeof raw !== "string") return fail(ws, "bad_hello", "hello must be a text frame");
+			return onHello(ws, raw);
+		}
+		if (conn.phase === "closed") return;
+		if (typeof raw === "string") {
+			conn.phase = "closed";
+			ws.close(4400, "binary_frames_required");
+			return;
+		}
+		// `onFrame` is async, so the `message` handler's catch does not see what it throws.
+		onFrame(ws, Buffer.from(raw)).catch(error => {
+			log(`frame handler failed: ${error instanceof Error ? error.message : String(error)}`);
+			ws.data.phase = "closed";
+			ws.close(1011, "internal_error");
+		});
+	};
+
 	const onFrame = async (ws: ServerWebSocket<Conn>, frame: Buffer) => {
 		const conn = ws.data;
 		let message: any;
@@ -229,7 +272,7 @@ export function startBridgeServer(options: BridgeServerOptions): Server<Conn> {
 			ws.close(4400, "decrypt_failed");
 			return;
 		}
-		// Revocation (`gjcm-bridge revoke`) takes effect on the device's next frame.
+		// Revocation (`gjcm-bridge revoke`) also takes effect on the device's next frame.
 		if (!state.findDevice(conn.deviceKey!)) {
 			conn.phase = "closed";
 			ws.close(4403, "device_revoked");
@@ -290,18 +333,14 @@ export function startBridgeServer(options: BridgeServerOptions): Server<Conn> {
 				}, HANDSHAKE_TIMEOUT_MS);
 			},
 			message(ws, raw) {
-				const conn = ws.data;
-				if (conn.phase === "hello") {
-					if (typeof raw !== "string") return fail(ws, "bad_hello", "hello must be a text frame");
-					return onHello(ws, raw);
+				try {
+					handleMessage(ws, raw);
+				} catch (error) {
+					// One bad frame must not take the whole bridge down with every other phone's connection.
+					log(`message handler failed: ${error instanceof Error ? error.message : String(error)}`);
+					ws.data.phase = "closed";
+					ws.close(1011, "internal_error");
 				}
-				if (conn.phase === "closed") return;
-				if (typeof raw === "string") {
-					conn.phase = "closed";
-					ws.close(4400, "binary_frames_required");
-					return;
-				}
-				void onFrame(ws, Buffer.from(raw));
 			},
 			close(ws, code, reason) {
 				// Who closed tells a drop the app chose (it closes with 1000, e.g. on a frame over its limit) from a lost network

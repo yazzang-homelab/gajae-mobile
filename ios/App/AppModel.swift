@@ -3,23 +3,36 @@ import GjcMobileCore
 import Observation
 import UIKit
 
+struct PairingLink: Equatable {
+    let text: String
+    let fromLink: Bool
+}
+
+enum PairingRefused: LocalizedError {
+    case keyChanged
+
+    var errorDescription: String? { "이미 등록된 호스트의 키가 바뀌어 연결하지 않았습니다." }
+}
+
 @MainActor
 @Observable
 final class AppModel {
     private(set) var hosts: [PairedHost]
     private(set) var connections: [String: HostConnection] = [:]
-    var pairingURL: String?
+    /// A pairing link for the pairing sheet. `fromLink` (deep link, system camera) means the user is asked to confirm
+    /// it first; the demo button's link is not.
+    var pairingLink: PairingLink?
     /// Host to bring to the front, set by a widget link and consumed by `RootView`.
     var requestedHostId: String?
     private let store = SecureStore()
     private let cache = SessionCache()
-    let device: DeviceIdentity
+    private(set) var device: DeviceIdentity
 
     init() {
         device = store.deviceIdentity()
         hosts = store.hosts()
         for host in hosts { connections[host.hostId] = makeConnection(host) }
-        WidgetStore.sync(hosts)
+        if store.hostsAvailable { WidgetStore.sync(hosts) }
     }
 
     var deviceName: String { UIDevice.current.name }
@@ -38,8 +51,10 @@ final class AppModel {
     }
 
     /// First connection from a QR offer: proves the pairing secret, then remembers the host.
-    func pair(with offerText: String) async throws -> PairedHost {
+    func pair(with offerText: String, replaceChangedKey: Bool = false) async throws -> PairedHost {
         let offer = try PairingOffer.parse(offerText)
+        // A known hostId under a different key is replaced only when the user explicitly approved it.
+        if !offer.isAllowed(among: hosts, keyChangeApproved: replaceChangedKey) { throw PairingRefused.keyChanged }
         guard let hostKey = Data(base64URL: offer.hostKey), let secret = Data(base64URL: offer.secret) else {
             throw PairingOffer.ParseError.malformed
         }
@@ -74,16 +89,29 @@ final class AppModel {
         } else {
             hosts.append(host)
         }
-        store.save(hosts: hosts)
-        WidgetStore.sync(hosts)
+        persistHosts()
+        if store.hostsAvailable { WidgetStore.sync(hosts) }
+    }
+
+    /// Saves the list; hosts that were stored but unreadable at launch come back into memory with the merge.
+    private func persistHosts(forgetting hostId: String? = nil) {
+        guard let saved = store.save(hosts: hosts, forgetting: hostId) else { return }
+        adopt(saved)
+    }
+
+    private func adopt(_ stored: [PairedHost]) {
+        for host in stored where !hosts.contains(where: { $0.hostId == host.hostId }) {
+            hosts.append(host)
+            connections[host.hostId] = makeConnection(host)
+        }
     }
 
     func forget(_ host: PairedHost) {
         connections.removeValue(forKey: host.hostId)?.disconnect()
         hosts.removeAll { $0.hostId == host.hostId }
         cache.remove(hostId: host.hostId)
-        store.save(hosts: hosts)
-        WidgetStore.sync(hosts)
+        persistHosts(forgetting: host.hostId)
+        if store.hostsAvailable { WidgetStore.sync(hosts) }
     }
 
     /// `gjcm://session?host=…&id=…&cwd=…` from a widget row: switches to that host and opens the chat.
@@ -97,6 +125,22 @@ final class AppModel {
         connection.ensureConnected()
     }
 
+    /// The Keychain could not be read at launch (locked after a reboot): read the device key and the hosts again.
+    /// Hosts are not connected before the real key is back, since a throwaway key is an unknown device to the host.
+    /// The hosts go through the same save as every other change, which re-reads, merges and writes.
+    private func recoverUnreadableStorage() {
+        if store.deviceIsTemporary {
+            guard let recovered = store.recoverDeviceIdentity() else { return }
+            device = recovered
+            for connection in connections.values { connection.disconnect() }
+            connections = [:]
+            for host in hosts { connections[host.hostId] = makeConnection(host) }
+        }
+        guard !store.hostsAvailable else { return }
+        persistHosts()
+        if store.hostsAvailable { WidgetStore.sync(hosts) }
+    }
+
     /// Leaving the screen: the connections are still up for a moment, so their view goes to the widget as fresh,
     /// and iOS is asked for a background refresh later.
     func appWentToBackground() {
@@ -105,6 +149,8 @@ final class AppModel {
     }
 
     func appBecameActive() {
+        recoverUnreadableStorage()
+        guard !store.deviceIsTemporary else { return }
         for connection in connections.values { connection.ensureConnected() }
     }
 }

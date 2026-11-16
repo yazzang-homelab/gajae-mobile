@@ -17,7 +17,7 @@
 | iOS OTA | `MARKETING_VERSION` (`ios/project.yml`) | `ci.yml`의 `run_number` |
 | App Store | 같음 | `appstore.yml`의 `run_number` + `000` |
 | Xcode Cloud | 같음 | Xcode Cloud가 매기는 `CI_BUILD_NUMBER`(App Store Connect의 Xcode Cloud 설정에서 다음 번호를 지정. 이미 올린 빌드보다 크게) |
-| Google Play | `-PversionName` (기본 `1.0.5`) | `android.yml`의 `run_number` + `000` |
+| Google Play | `-PversionName` (기본 `1.0.6`) | `android.yml`의 `run_number` + `000` |
 
 스토어 빌드 번호에 `000`을 붙이는 이유는 OTA로 설치한 빌드보다 항상 커서 충돌하지 않게 하기 위해서입니다.
 
@@ -86,7 +86,9 @@ git push origin HEAD:playstore              # 또는
 gh workflow run android.yml --ref <브랜치>
 ```
 
-산출물 `gjc-mobile-release`에 `app-release.aab`(Play 업로드용)와 `app-release.apk`(직접 설치용)가 들어 있습니다.
+산출물 `gjc-mobile-release`에 `app-release.aab`(Play 업로드용)와 `app-release.apk`(직접 설치용), `mapping.txt`가 들어 있습니다.
+
+릴리스 빌드는 R8로 축소·난독화합니다(`isMinifyEnabled`, `isShrinkResources`). 유지 규칙은 `android/app/proguard-rules.pro`에 둡니다. AAB에 매핑이 들어 있어 Play Console이 크래시 스택을 자동으로 풀고, APK로 받은 스택은 `mapping.txt`로 풉니다. 리플렉션을 쓰는 라이브러리를 추가하면 릴리스 빌드를 기기에서 실행해 확인합니다.
 
 ### 업로드 키
 

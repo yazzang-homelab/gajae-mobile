@@ -107,7 +107,7 @@ export class AcpProcess {
 			while (newline >= 0) {
 				const line = buffer.slice(0, newline).trim();
 				buffer = buffer.slice(newline + 1);
-				if (line) this.#dispatch(line);
+				if (line) this.#dispatchSafely(line);
 				newline = buffer.indexOf("\n");
 			}
 		}
@@ -117,6 +117,16 @@ export class AcpProcess {
 		const decoder = new TextDecoder();
 		for await (const chunk of this.#proc.stderr) {
 			this.stderrTail = (this.stderrTail + decoder.decode(chunk, { stream: true })).slice(-8192);
+		}
+	}
+
+	// One malformed or unhandled line must not end the read loop (and with it the bridge): drop it and go on.
+	#dispatchSafely(line: string): void {
+		try {
+			this.#dispatch(line);
+		} catch (error) {
+			// The stack says whether gjc's line or the bridge's own handler was at fault; the line itself is never logged.
+			console.error("gjc ACP line dropped:", error);
 		}
 	}
 

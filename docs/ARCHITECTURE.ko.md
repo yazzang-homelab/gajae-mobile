@@ -24,7 +24,7 @@
 - `hostKey`가 오퍼에 들어 있으므로 앱은 첫 연결부터 호스트를 인증합니다(중간자 차단).
 - 코드는 기본 10분, 1회용입니다(`--ttl-min`). `--reusable`은 데모 호스트 전용이며 여러 기기가 같은 코드를 씁니다.
 - 앱은 `endpoints`를 순서대로 시도하고, 마지막으로 성공한 주소를 다음 연결 때 맨 앞에 둡니다.
-- 기기 해제는 `gjcm-bridge revoke <id>`이며, 해당 기기의 다음 프레임에서 연결이 닫힙니다(`4403 device_revoked`).
+- 기기 해제는 `gjcm-bridge revoke <id>`이며, 그 기기와 오가는 다음 프레임 전에 연결이 닫힙니다(`4403 device_revoked`). 해제 뒤에는 그 기기로 어떤 이벤트도 나가지 않습니다. 아무것도 오가지 않는 연결은 다음 전송 때까지 열려 있을 수 있습니다.
 
 ## 3. 암호화 채널 `gjcm-e2ee-v1`
 
@@ -72,7 +72,7 @@ GCM nonce = 0x00000000 ‖ 카운터,  AAD = "gjcm1"
 
 ## 4. 세션 흐름
 
-1. `session.new{cwd}` → gjc ACP `session/new`. 0.19.3 실측 중간값 6.2초(4.7~13.8초, 45회)이고 대부분은 세션 호스트 기동입니다. 그래서 앱은 첫 메시지와 함께 생성합니다. 브리지를 `--tmux-session`으로 띄우면 새 세션을 tmux 창의 TUI가 이어받고 폰은 그 TUI에 붙습니다. 그 세션의 도구 승인은 gjc 세션 CLI의 승인 채널로 폰에 오고, 브리지는 gjc ACP를 다시 띄울 때마다 그 창들에 스스로 다시 붙어 채널을 지켜봅니다(생성 약 15~23초, [브리지 README](../bridge/README.md#새-세션을-tmux-창으로-열기-옵트인)).
+1. `session.new{cwd}` → gjc ACP `session/new`. 0.19.3 실측 중간값 6.2초(4.7~13.8초, 45회)이고 대부분은 세션 호스트 기동입니다. 그래서 앱은 첫 메시지와 함께 생성합니다. 브리지를 `--tmux-session`으로 띄우면 tmux 창의 TUI가 새 세션을 시작하고 폰은 그 TUI에 붙습니다. 그 세션에서 폰이 보낸 턴의 도구 승인은 gjc 세션 CLI의 승인 채널로 폰에 오고(터미널에서 친 턴의 도구는 브리지가 바로 허용), 브리지는 gjc ACP를 다시 띄울 때마다 그 창들에 스스로 다시 붙어 채널을 지켜봅니다(2026-11-09 실측 lab 5.3~7.4초, pve3·pve1 14~18초, [브리지 README](../bridge/README.md#새-세션을-tmux-창으로-열기-옵트인)).
 2. `session.prompt`는 수락 즉시 `{accepted: true, turnId}`로 응답하고 진행 상황은 `session.update` 이벤트로 흘러옵니다. 턴 종료는 브리지가 붙이는 `x_gjcm_turn_end`로 알리며, 폰이 시작한 턴의 끝에는 같은 `turnId`가 붙습니다.
 3. 작업 중 메시지는 `turn.steer`(다음 모델 단계에 주입) 또는 `turn.follow_up`(턴 종료 후 전송)으로 보냅니다.
 4. **끼어들기**(`session.interrupt`): 대기열 조회 → `session/cancel` → 남은 지시 제거 → 같은 텍스트로 새 `session/prompt`. 실측 응답 196ms.

@@ -5,7 +5,7 @@ plugins {
 }
 
 val appVersionCode = (project.findProperty("versionCode") as String?)?.toInt() ?: 1
-val appVersionName = (project.findProperty("versionName") as String?) ?: "1.0.5"
+val appVersionName = (project.findProperty("versionName") as String?) ?: "1.0.6"
 
 android {
     namespace = "dev.gajae.gjcmobile"
@@ -24,7 +24,11 @@ android {
 
     buildTypes {
         release {
-            isMinifyEnabled = false
+            // R8: shrink, optimize, obfuscate. Keep rules live in proguard-rules.pro. The AAB carries its
+            // own mapping for Play Console; the release lane also uploads mapping.txt for the APK.
+            isMinifyEnabled = true
+            isShrinkResources = true
+            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
         }
     }
     compileOptions {

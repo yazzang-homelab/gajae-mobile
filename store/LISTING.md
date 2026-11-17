@@ -36,7 +36,15 @@ App Store Connect와 Play Console에 그대로 붙여 넣는 값입니다. 앱 U
 
 에이전트와 세션, 모델 로그인 정보는 컴퓨터를 떠나지 않습니다. 휴대폰과 컴퓨터 사이는 종단 간 암호화(X25519, AES-256-GCM)되며, 개발자는 어떤 데이터도 수집하지 않습니다.
 
-사용하려면 컴퓨터에 가재코드와 오픈소스 브리지(gjcm-bridge)를 설치하고 QR 코드로 페어링합니다. 컴퓨터가 없으면 첫 화면의 "컴퓨터 없이 데모로 체험"으로 정해진 응답만 돌려주는 데모 호스트에 연결해 둘러볼 수 있습니다.
+컴퓨터와 연결하기
+1. 컴퓨터에 Bun과 가재코드(gjc)를 설치합니다.
+2. 터미널에서 bunx gjcm-bridge serve 를 실행해 브리지를 켭니다.
+3. 다른 터미널에서 bunx gjcm-bridge pair 를 실행하면 QR 코드와 gjcm:// 링크가 나옵니다.
+4. 앱 첫 화면에서 QR 스캔 버튼을 눌러 QR 코드를 찍습니다. 카메라를 쓸 수 없으면 링크를 붙여 넣고 "연결"을 누릅니다.
+
+QR 코드는 10분 동안 한 번만 쓸 수 있습니다. 만료되면 pair를 다시 실행하세요. 휴대폰과 컴퓨터는 같은 네트워크에 있어야 합니다. 밖에서도 쓰려면 두 기기에 Tailscale을 켠 뒤 pair를 실행하세요. 이미 연결했다면 pair를 다시 실행해 QR 코드를 한 번 더 찍습니다. 휴대폰을 잃어버리면 컴퓨터에서 bunx gjcm-bridge revoke <기기 이름> 으로 바로 끊을 수 있습니다.
+
+컴퓨터가 없으면 첫 화면의 "컴퓨터 없이 데모로 체험"으로 정해진 응답만 돌려주는 데모 호스트에 연결해 둘러볼 수 있습니다.
 
 소스 코드: https://github.com/yazzang-homelab/gajae-mobile (AGPL-3.0)
 ```
@@ -59,7 +67,15 @@ Gajae Code mobile is a companion app for Gajae Code (gjc), the coding agent that
 
 The agent, its sessions and your model logins never leave your computer. Phone and computer talk end-to-end encrypted (X25519, AES-256-GCM), and the developer collects no data.
 
-To use it, install Gajae Code and the open-source bridge (gjcm-bridge) on your computer and pair with a QR code. No computer? Tap "컴퓨터 없이 데모로 체험" (try the demo) on the first screen to connect to a scripted demo host.
+Connect to your computer
+1. Install Bun and Gajae Code (gjc) on your computer.
+2. In a terminal, run bunx gjcm-bridge serve to start the bridge.
+3. In another terminal, run bunx gjcm-bridge pair. It prints a QR code and a gjcm:// link.
+4. On the app's first screen, tap the QR scan button and scan the code. No camera? Paste the link and tap "연결" (Connect).
+
+The code works once, for 10 minutes. If it expires, run pair again. Phone and computer must be on the same network. To also use it away from home, turn on Tailscale on both before you run pair; if you have already paired, run pair again and scan the new code. If you lose your phone, run bunx gjcm-bridge revoke <device name> on the computer to cut it off right away.
+
+No computer? Tap "컴퓨터 없이 데모로 체험" (try the demo) on the first screen to connect to a scripted demo host.
 
 The app interface is in Korean.
 Source code: https://github.com/yazzang-homelab/gajae-mobile (AGPL-3.0)
@@ -83,7 +99,15 @@ Gajae Code mobile 是 Gajae Code（gjc）的伴侣应用。Gajae Code 是运行�
 
 智能体、会话和模型登录信息都不会离开你的电脑。手机与电脑之间端到端加密（X25519、AES-256-GCM），开发者不收集任何数据。
 
-使用前请在电脑上安装 Gajae Code 和开源桥接器（gjcm-bridge），然后扫码配对。没有电脑？在首页点击"컴퓨터 없이 데모로 체험"（试用演示），连接只返回脚本化回复的演示主机。
+连接电脑
+1. 在电脑上安装 Bun 和 Gajae Code（gjc）。
+2. 在终端运行 bunx gjcm-bridge serve 启动桥接器。
+3. 在另一个终端运行 bunx gjcm-bridge pair，会显示二维码和 gjcm:// 链接。
+4. 在应用首页点击扫码按钮并扫码。无法使用相机时，粘贴链接后点击"연결"（连接）。
+
+二维码 10 分钟内有效，只能使用一次，过期后请重新运行 pair。手机和电脑需要在同一网络。如需在外使用，请先在两台设备上开启 Tailscale，再运行 pair；如果已经配对，请重新运行 pair 并再次扫码。手机丢失时，可在电脑上运行 bunx gjcm-bridge revoke <设备名> 立即断开。
+
+没有电脑？在首页点击"컴퓨터 없이 데모로 체험"（试用演示），连接只返回脚本化回复的演示主机。
 
 应用界面为韩文。
 源代码：https://github.com/yazzang-homelab/gajae-mobile（AGPL-3.0）

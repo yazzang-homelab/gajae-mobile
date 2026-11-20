@@ -448,7 +448,14 @@ export function startBridgeServer(options: BridgeServerOptions): Server<Conn> {
 			if (url.pathname === "/privacy" && options.demoOffer)
 				return new Response(Bun.file(new URL("../demo/privacy.html", import.meta.url)), { headers: { "content-type": "text/html; charset=utf-8" } });
 			if (url.pathname === "/offer" && options.demoOffer)
-				return options.demoOffer().then(offer => Response.json({ url: offer }, { headers: { "cache-control": "no-store" } }));
+				return options.demoOffer().then(
+					offer => Response.json({ url: offer }, { headers: { "cache-control": "no-store" } }),
+					error => {
+						// A `pair` holding pairings.lock is a moment's wait, not a server error.
+						if (!(error instanceof PairingsBusyError)) throw error;
+						return Response.json({ error: "pairing_busy" }, { status: 503, headers: { "retry-after": "1", "cache-control": "no-store" } });
+					},
+				);
 			if (url.pathname === "/ws") {
 				const upgraded = server.upgrade(req, { data: { id: crypto.randomUUID(), phase: "hello" } as Conn });
 				return upgraded ? undefined : new Response("upgrade required", { status: 426 });

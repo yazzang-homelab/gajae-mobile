@@ -93,14 +93,16 @@ jobs:
           NOTES_KO: ${{ inputs.notes_ko }}
           NOTES_EN: ${{ inputs.notes_en }}
           NOTES_ZH: ${{ inputs.notes_zh }}
-          SUBMIT: ${{ inputs.submit && '--submit' || '' }}
+          SUBMIT: ${{ inputs.submit }}
         run: |
           aab=$(find "$RUNNER_TEMP/release" -name '*.aab')
           [ "$(printf '%s\n' "$aab" | grep -c .)" = 1 ] || { echo "expected one AAB, found: $aab"; exit 1; }
+          submit_flag=()
+          [ "$SUBMIT" = true ] && submit_flag=(--submit)
           python3 play_submit.py --key-file "$RUNNER_TEMP/play-service-account.json" \
             --package dev.gajae.gjcmobile --aab "$aab" --version-code "$VERSION_CODE" \
             --track "$TRACK" --status "$STATUS" --release-name "$RELEASE_NAME" \
-            --notes-ko "$NOTES_KO" --notes-en "$NOTES_EN" --notes-zh "$NOTES_ZH" $SUBMIT
+            --notes-ko "$NOTES_KO" --notes-en "$NOTES_EN" --notes-zh "$NOTES_ZH" "${submit_flag[@]}"
 
       - name: Remove service account
         if: always()

@@ -83,6 +83,8 @@ class Play:
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode(errors="replace")[:800]
             raise PlayError(f"Play {method} {path} -> HTTP {exc.code}: {detail}") from None
+        except OSError as exc:  # URLError, timeouts
+            raise PlayError(f"Play {method} {path} -> {exc}") from None
 
 
 class PlayError(Exception):
@@ -178,10 +180,18 @@ def main() -> None:
     # The release is already committed; a failure here only loses the printout.
     try:
         check = play.call("POST", "/edits", {})["id"]
-        print_tracks(play.call("GET", f"/edits/{check}/tracks").get("tracks", []))
-        play.call("DELETE", f"/edits/{check}")
     except PlayError as exc:
         print(f"warning: committed, but reading the tracks back failed: {exc}", file=sys.stderr)
+        return
+    try:
+        print_tracks(play.call("GET", f"/edits/{check}/tracks").get("tracks", []))
+    except PlayError as exc:
+        print(f"warning: committed, but reading the tracks back failed: {exc}", file=sys.stderr)
+    finally:
+        try:
+            play.call("DELETE", f"/edits/{check}")
+        except PlayError:
+            pass
 
 
 if __name__ == "__main__":

@@ -62,11 +62,15 @@ jobs:
           RUN_ID: ${{ inputs.run_id }}
           TRACK: ${{ inputs.track }}
         run: |
-          read -r workflow conclusion number branch sha <<<"$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID" \
-            --jq '[.path, .conclusion, .run_number, .head_branch, .head_sha] | @tsv')"
+          read -r workflow conclusion number branch sha event <<<"$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID" \
+            --jq '[.path, .conclusion, .run_number, .head_branch, .head_sha, .event] | @tsv')"
           echo "run $RUN_ID: $workflow #$number $conclusion on $branch $sha"
           [ "$workflow" = .github/workflows/android.yml ] || { echo "run $RUN_ID is not the android workflow"; exit 1; }
           [ "$conclusion" = success ] || { echo "run $RUN_ID did not succeed"; exit 1; }
+          # android.yml signs a release only for a manual run or a push to `playstore`.
+          if [ "$event" != workflow_dispatch ] && [ "$branch" != playstore ]; then
+            echo "run $RUN_ID ($event on $branch) has no signed release; run android.yml manually"; exit 1
+          fi
           if [ "$TRACK" = production ] && [ "$branch" != main ]; then
             echo "production releases are built from main; run $RUN_ID built $branch"; exit 1
           fi

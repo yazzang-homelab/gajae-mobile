@@ -96,7 +96,7 @@ gh workflow run android.yml --ref <브랜치>
 
 ```bash
 gh workflow run android.yml --ref main            # 서명된 AAB
-gh run list -w android --branch main -L 1         # 끝난 실행의 ID(databaseId, 실행 번호와 다름)
+gh run list -w android --branch main --event workflow_dispatch -L 1   # 끝난 실행의 ID(databaseId, 실행 번호와 다름)
 gh workflow run play-submit.yml -f run_id=<실행 ID> \
   -f notes_ko=… -f notes_en=… [-f notes_zh=…] [-f track=production] [-f status=completed] -f submit=true
 ```

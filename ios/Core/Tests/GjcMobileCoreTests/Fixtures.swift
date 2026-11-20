@@ -19,6 +19,22 @@ enum Fixtures {
         try JSONDecoder().decode(JSONValue.self, from: data(name))
     }
 
+    /// Lowercase hex (as in cpace-vector.json) to bytes.
+    static func hex(_ text: String) -> Data {
+        var bytes: [UInt8] = []
+        var index = text.startIndex
+        while index < text.endIndex {
+            let next = text.index(index, offsetBy: 2)
+            bytes.append(UInt8(text[index ..< next], radix: 16)!)
+            index = next
+        }
+        return Data(bytes)
+    }
+
+    static func hexString(_ data: Data) -> String {
+        data.map { String(format: "%02x", $0) }.joined()
+    }
+
     /// `session/update` notifications from a recorded real gjc ACP run, numbered like the bridge does.
     static func recordedUpdates(_ name: String) throws -> [SequencedUpdate] {
         let text = String(decoding: try data(name), as: UTF8.self)

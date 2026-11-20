@@ -52,14 +52,19 @@ final class AppModel {
 
     /// First connection from a QR offer: proves the pairing secret, then remembers the host.
     func pair(with offerText: String, replaceChangedKey: Bool = false) async throws -> PairedHost {
-        let offer = try PairingOffer.parse(offerText)
+        try await pair(offer: try PairingOffer.parse(offerText), replaceChangedKey: replaceChangedKey)
+    }
+
+    /// First connection from a validated offer (QR, link, or a device code's box): proves the pairing secret on
+    /// `endpoints` in order (a code's `HeldCodeOffer.helloEndpoints`), or on the offer's endpoints when none are given.
+    func pair(offer: PairingOffer, endpoints: [String]? = nil, replaceChangedKey: Bool = false) async throws -> PairedHost {
         // A known hostId under a different key is replaced only when the user explicitly approved it.
         if !offer.isAllowed(among: hosts, keyChangeApproved: replaceChangedKey) { throw PairingRefused.keyChanged }
         guard let hostKey = Data(base64URL: offer.hostKey), let secret = Data(base64URL: offer.secret) else {
             throw PairingOffer.ParseError.malformed
         }
         var lastError: Error = BridgeError.noReachableEndpoint
-        for endpoint in offer.endpoints {
+        for endpoint in endpoints ?? offer.endpoints {
             guard let url = URL(string: endpoint) else { continue }
             do {
                 let client = try await BridgeClient.connect(url: url, device: device, hostKey: hostKey,
@@ -81,6 +86,63 @@ final class AppModel {
             }
         }
         throw lastError
+    }
+
+    /// Where the running code pairing is, for the progress line.
+    private(set) var codeStage: CodePairingStage?
+
+    /// The device-code offer kept across a key-change confirmation or a failed hello.
+    private var codeOffers = CodeOfferKeeper()
+
+    /// The offer waiting for a key-change confirmation or a retry after a failed hello.
+    var pendingCodeOffer: PairingOffer? { codeOffers.held?.offer }
+
+    /// Forgets a held code offer (the user cancelled): nothing was saved, and its secret is dropped.
+    func discardCodeOffer() {
+        codeOffers.discard()
+    }
+
+    /// Pairing by device code (gjcm-code-v1): CPace on the code's address returns the offer, then the usual hello
+    /// pairs. Throws `CodePairingError`, or `PairingRefused.keyChanged` before any hello when the offer would replace
+    /// a known host's key (confirm, then call again with the same code and `replaceChangedKey`, or
+    /// `discardCodeOffer()`). Calling again with the same code after a failed hello retries the hello with the held
+    /// offer. `replaceChangedKey` approves only the held offer of that code; a new code's offer is confirmed on its own.
+    func pair(code input: String, replaceChangedKey: Bool = false) async throws -> PairedHost {
+        let decoded = try DecodedCode.parse(input)
+        if codeOffers.submit(code: decoded.code, approvingKeyChange: replaceChangedKey) {
+            // Stages reach the main actor through one ordered stream, so a late one cannot overwrite a newer state.
+            let (stages, continuation) = AsyncStream.makeStream(of: CodePairingStage.self)
+            let relay = Task { @MainActor [weak self] in
+                for await stage in stages { self?.codeStage = stage }
+            }
+            codeStage = .connecting
+            let fetched: Result<PairingOffer, Error>
+            do {
+                fetched = .success(try await BridgeClient.fetchOfferWithCode(url: decoded.endpoint, code: decoded.code, onStage: { stage in
+                    continuation.yield(stage)
+                }))
+            } catch {
+                fetched = .failure(error)
+            }
+            continuation.finish()
+            await relay.value
+            codeStage = nil
+            let offer = try fetched.get()
+            codeOffers.keep(code: decoded.code, offer: offer, endpoint: decoded.endpoint.absoluteString)
+        }
+        // The keeper's approval is the gate: a changed key is never sent a hello before the user approved it.
+        if codeOffers.needsKeyChangeApproval(among: hosts) { throw PairingRefused.keyChanged }
+        guard let held = codeOffers.held else { throw CodePairingError.pakeFailed }
+        do {
+            let host = try await pair(offer: held.offer, endpoints: held.helloEndpoints, replaceChangedKey: held.keyChangeApproved)
+            codeOffers.helloSucceeded()
+            return host
+        } catch PairingRefused.keyChanged {
+            // pair(offer:) checks the same rule again; the keeper already passed it, so this is not a hello failure.
+            throw PairingRefused.keyChanged
+        } catch {
+            throw codeOffers.helloFailed(error)
+        }
     }
 
     func update(host: PairedHost) {

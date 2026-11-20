@@ -59,6 +59,7 @@ public enum BridgeError: Error, Equatable, LocalizedError {
             switch code {
             case "unknown_device": return "이 호스트와 페어링되지 않은 기기입니다. 다시 페어링하세요."
             case "pairing_invalid": return "페어링 코드가 만료됐거나 이미 사용됐습니다. 호스트에서 `gjcm-bridge pair`를 다시 실행하세요."
+            case "pairing_busy": return "호스트가 다른 페어링을 처리하는 중입니다. 잠시 후 다시 시도하세요."
             default: return "\(message) (\(code))"
             }
         case let .remote(_, message, _): return message
@@ -369,5 +370,280 @@ public extension BridgeClient {
 
     func respondPermission(_ requestId: String, optionId: String?) async throws {
         _ = try await request("permission.respond", ["requestId": .string(requestId), "optionId": optionId.map(JSONValue.string) ?? .null])
+    }
+}
+
+// MARK: device-code pairing (gjcm-code-v1, #128)
+
+/// Where a code pairing is, for the progress line.
+public enum CodePairingStage: Sendable, Equatable {
+    /// Dialing the host and waiting for its first answer.
+    case connecting
+    /// The host answered; the code is being proven (CPace key confirmation). `left` is the host's count of wrong
+    /// attempts still allowed for this code (`pake.reply`), when it says.
+    case verifying(left: Int?)
+}
+
+/// Failures of the code flow. The bridge's own codes (`code_expired`, `code_wrong`, `code_locked`, `code_busy`,
+/// `bad_pake`) arrive as `.remote`; the rest are decided on the phone.
+public enum CodePairingError: Error, Equatable, LocalizedError {
+    /// `code_format`; `position` is the first character outside the alphabet.
+    case invalidCode(position: Int?)
+    /// `code_unsupported`: a code format newer than this app.
+    case unsupportedCode
+    case timedOut(host: String)
+    case refused
+    case unreachable(host: String)
+    /// The connection dropped or timed out after the host's `pake.reply`: the host may have counted an attempt.
+    case hostInterrupted
+    /// A 0.1.5 bridge answers `pake` with `bad_hello`.
+    case bridgeOutdated
+    /// Tb mismatch, a box that does not open, a bad offer, or an aborted key agreement.
+    case pakeFailed
+    case remote(code: String, left: Int?)
+    /// The code was accepted but the hello that follows failed. `reason` is the hello's own description; the offer is
+    /// kept, and `retryable` says whether trying again can help.
+    case helloFailed(reason: String, retryable: Bool)
+    /// The hello was refused with `pairing_invalid`: the host has to run `pair` again.
+    case pairingExpired
+
+    init(_ error: DeviceCodeError) {
+        switch error {
+        case let .format(position): self = .invalidCode(position: position)
+        case .unsupported: self = .unsupportedCode
+        }
+    }
+
+    /// A hello failure that trying again can fix: no endpoint answered, the link dropped, or the host was busy.
+    /// Everything else (a malformed offer, a protocol violation, other rejections) is shown as it is, without a retry.
+    public static func helloFailure(_ error: Error) -> CodePairingError {
+        let reason = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+        switch error {
+        case BridgeError.noReachableEndpoint, BridgeError.disconnected:
+            return .helloFailed(reason: reason, retryable: true)
+        case let BridgeError.rejected(code, _) where code == "pairing_busy":
+            // The retry hint is added by `errorDescription`; the busy reason must not carry its own.
+            return .helloFailed(reason: "호스트가 다른 페어링을 처리하는 중입니다.", retryable: true)
+        default:
+            return .helloFailed(reason: reason, retryable: false)
+        }
+    }
+
+    /// Whether the app offers "다시 시도" for this failure.
+    public var isRetryable: Bool {
+        switch self {
+        case let .helloFailed(_, retryable): return retryable
+        case .hostInterrupted: return true
+        default: return false
+        }
+    }
+
+    /// How to read an address that did not answer: Tailscale codes point at `--code-lan`, LAN codes at the iOS
+    /// local-network permission.
+    private static func unreachableAdvice(host: String) -> String {
+        if DeviceCode.isTailscale(host) {
+            return "폰의 Tailscale 연결을 확인하세요. 폰이 Tailscale 밖이면 호스트에서 `pair --code-lan`을 쓰거나 QR을 쓰세요."
+        }
+        return "폰이 호스트와 같은 Wi-Fi에 있는지 확인하세요. 설정 > 개인정보 > 로컬 네트워크에서 가재코드가 허용돼 있는지도 확인하세요."
+    }
+
+    public var errorDescription: String? {
+        switch self {
+        case let .invalidCode(position):
+            if let position { return "코드가 올바르지 않습니다. \(position)번째 글자를 확인하세요." }
+            return "코드가 올바르지 않습니다. 글자 수와 글자를 다시 확인하세요."
+        case .unsupportedCode:
+            return "첫 글자를 다시 확인하세요. 맞게 입력했다면 이 앱이 모르는 코드 형식이니 앱을 업데이트하세요."
+        case let .timedOut(host):
+            let target = DeviceCode.isTailscale(host) ? "\(host)(Tailscale)" : host
+            return "\(target)에 닿지 않습니다. " + Self.unreachableAdvice(host: host)
+        case .refused:
+            return "호스트에서 `gjcm-bridge serve`가 실행 중인지, `pair`와 `serve`의 포트가 같은지 확인하세요."
+        case let .unreachable(host):
+            return "호스트에 연결할 수 없습니다. " + Self.unreachableAdvice(host: host)
+        case .hostInterrupted:
+            return "호스트 응답이 끊겼습니다. 남은 시도가 줄었을 수 있습니다. 다시 시도하세요."
+        case .bridgeOutdated:
+            return "호스트의 gjcm-bridge를 0.1.6 이상으로 업데이트하거나 QR을 쓰세요."
+        case .pakeFailed:
+            return "호스트 확인에 실패했습니다. 코드를 다시 확인하세요."
+        case let .remote(code, left):
+            switch code {
+            case "code_expired": return "코드가 만료됐거나 이미 사용됐습니다. 호스트에서 `gjcm-bridge pair`를 다시 실행하세요."
+            case "code_wrong":
+                let base = "코드가 맞지 않습니다(가장 최근 `pair`의 코드인지 확인)."
+                guard let left else { return base }
+                return base + " 남은 시도 \(left)회"
+            case "code_locked": return "틀린 시도가 많아 코드가 폐기됐습니다. `pair`를 다시 실행하세요."
+            case "code_busy": return "다른 기기가 이 코드로 연결 중이거나 호스트가 다른 페어링을 처리하는 중입니다. 잠시 후 다시 시도하세요."
+            case "bad_pake": return "호스트와 프로토콜이 맞지 않습니다. 앱과 브리지를 업데이트하세요."
+            default: return "호스트가 코드를 받아들이지 않았습니다(\(code))."
+            }
+        case let .helloFailed(reason, retryable):
+            return "인증은 끝났지만 연결하지 못했습니다. " + reason + (retryable ? " ‘다시 시도’를 누르세요." : "")
+        case .pairingExpired:
+            return "코드가 만료됐습니다. 호스트에서 `pair`를 다시 실행하세요."
+        }
+    }
+}
+
+/// The result of a completed code pairing.
+struct CodePairing: Sendable {
+    let client: BridgeClient
+    let offer: PairingOffer
+    /// The address that answered, which the hello used.
+    let endpoint: URL
+}
+
+public extension DecodedCode {
+    /// `DeviceCode.decode` with the failure as the app's `CodePairingError`.
+    static func parse(_ input: String) throws -> DecodedCode {
+        switch DeviceCode.decode(input) {
+        case let .success(decoded): return decoded
+        case let .failure(error): throw CodePairingError(error)
+        }
+    }
+}
+
+/// How far a code exchange got, shared between the exchange and its watchdog: whether the time ran out, and whether
+/// the host's `pake.reply` arrived (a failure after that may have cost an attempt).
+private final class CodeExchangeProgress: @unchecked Sendable {
+    private let lock = NSLock()
+    private var isTimedOut = false
+    private var hasReplied = false
+
+    func markReplied() {
+        lock.lock()
+        hasReplied = true
+        lock.unlock()
+    }
+
+    var replied: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return hasReplied
+    }
+
+    func markTimedOut() {
+        lock.lock()
+        isTimedOut = true
+        lock.unlock()
+    }
+
+    var timedOut: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return isTimedOut
+    }
+}
+
+public extension BridgeClient {
+    /// Runs the CPace exchange of a normalized device code over `transport` and returns the offer out of `pake.ok`.
+    /// Closes the transport when done. Transport failures propagate unchanged; protocol failures are `CodePairingError`.
+    internal static func fetchOfferWithCode(
+        transport: FrameTransport,
+        code: String,
+        onStage: (@Sendable (CodePairingStage) -> Void)? = nil
+    ) async throws -> PairingOffer {
+        defer { transport.close() }
+        guard let cpace = CPaceInitiator(prs: Data(code.utf8)) else { throw CodePairingError.pakeFailed }
+        onStage?(.connecting)
+        try await sendCodeFrame(transport, ["t": "pake", "v": 1, "sid": .string(cpace.sid.base64URL), "ya": .string(cpace.ya.base64URL)])
+        let reply = try await expectCodeFrame("pake.reply", from: transport)
+        onStage?(.verifying(left: reply["left"]?.int))
+        guard let yb = reply["yb"]?.string.flatMap(Data.init(base64URL:)), let session = cpace.finish(yb: yb) else {
+            throw CodePairingError.pakeFailed
+        }
+        try await sendCodeFrame(transport, ["t": "pake.confirm", "ta": .string(session.ta.base64URL)])
+        let ok = try await expectCodeFrame("pake.ok", from: transport)
+        guard let tb = ok["tb"]?.string.flatMap(Data.init(base64URL:)), session.verifyTb(tb) else { throw CodePairingError.pakeFailed }
+        guard let box = ok["box"]?.string.flatMap(Data.init(base64URL:)), let plain = session.open(box) else {
+            throw CodePairingError.pakeFailed
+        }
+        do {
+            return try PairingOffer.parse(json: plain)
+        } catch {
+            throw CodePairingError.pakeFailed
+        }
+    }
+
+    /// The exchange over URLSession. An unreachable address would hang for the TCP timeout, so the whole exchange is
+    /// bounded by `timeout`; a timeout and a refused connection are told apart for the message.
+    static func fetchOfferWithCode(
+        url: URL,
+        code: String,
+        timeout: Duration = .seconds(10),
+        makeTransport: @Sendable (URL) -> FrameTransport = { URLSessionFrameTransport(url: $0) },
+        onStage: (@Sendable (CodePairingStage) -> Void)? = nil
+    ) async throws -> PairingOffer {
+        let transport = makeTransport(url)
+        let progress = CodeExchangeProgress()
+        let notify: @Sendable (CodePairingStage) -> Void = { stage in
+            if case .verifying = stage { progress.markReplied() }
+            onStage?(stage)
+        }
+        let watchdog = Task {
+            try await Task.sleep(for: timeout)
+            progress.markTimedOut()
+            transport.close()
+        }
+        defer { watchdog.cancel() }
+        do {
+            return try await fetchOfferWithCode(transport: transport, code: code, onStage: notify)
+        } catch let error as CodePairingError {
+            throw error
+        } catch {
+            if progress.replied { throw CodePairingError.hostInterrupted }
+            if progress.timedOut { throw CodePairingError.timedOut(host: url.host ?? "") }
+            if let urlError = error as? URLError {
+                switch urlError.code {
+                case .timedOut: throw CodePairingError.timedOut(host: url.host ?? "")
+                case .cannotConnectToHost: throw CodePairingError.refused
+                default: break
+                }
+            }
+            throw CodePairingError.unreachable(host: url.host ?? "")
+        }
+    }
+
+    /// Device-code pairing: a CPace session on the code's address gets the offer, then the usual pairing hello follows
+    /// on the same address. `dial` overrides the address only (tests dial 127.0.0.1); the password is still the code.
+    internal static func pairWithCode(
+        _ code: String,
+        dial: URL? = nil,
+        device: DeviceIdentity,
+        deviceName: String,
+        timeout: Duration = .seconds(10),
+        onStage: (@Sendable (CodePairingStage) -> Void)? = nil
+    ) async throws -> CodePairing {
+        let decoded = try DecodedCode.parse(code)
+        let endpoint = dial ?? decoded.endpoint
+        let offer = try await fetchOfferWithCode(url: endpoint, code: decoded.code, timeout: timeout, onStage: onStage)
+        guard let hostKey = Data(base64URL: offer.hostKey), let secret = Data(base64URL: offer.secret) else {
+            throw CodePairingError.pakeFailed
+        }
+        let client = try await connect(url: endpoint, device: device, hostKey: hostKey, deviceName: deviceName,
+                                       pairing: (offer.pairingId, secret))
+        return CodePairing(client: client, offer: offer, endpoint: endpoint)
+    }
+}
+
+private extension BridgeClient {
+    static func sendCodeFrame(_ transport: FrameTransport, _ frame: JSONValue) async throws {
+        try await transport.send(.text(String(decoding: try JSONEncoder().encode(frame), as: UTF8.self)))
+    }
+
+    static func expectCodeFrame(_ type: String, from transport: FrameTransport) async throws -> JSONValue {
+        let message = try await transport.receive()
+        guard case let .text(text) = message, let frame = try? JSONDecoder().decode(JSONValue.self, from: Data(text.utf8)) else {
+            throw CodePairingError.pakeFailed
+        }
+        if frame["t"]?.string == type { return frame }
+        if frame["t"]?.string == "error" {
+            let remote = frame["code"]?.string ?? ""
+            if remote == "bad_hello" { throw CodePairingError.bridgeOutdated }
+            throw CodePairingError.remote(code: remote, left: frame["left"]?.int)
+        }
+        throw CodePairingError.remote(code: "bad_pake", left: nil)
     }
 }

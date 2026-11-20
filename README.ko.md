@@ -91,7 +91,7 @@ bunx gjcm-bridge pair
 ```bash
 cd bridge && bun test && bun x tsc --noEmit -p .            # 브리지
 cd android && ./gradlew :app:testDebugUnitTest :app:assembleDebug   # Android
-cd ios/Core && swift test                                    # iOS 코어 (macOS 또는 Linux, Swift 6)
+cd ios/Core && swift test                                    # iOS 코어 (Swift 6. CI는 macOS에서 실행, Linux는 확인하지 않음)
 ```
 
 iOS 앱 빌드는 CI(macOS)에서 확인합니다. 기여는 이슈를 열고 `dev` 대상 PR로 보내 주세요. 착수·제출 게이트는 [CONTRIBUTING.md](CONTRIBUTING.md)에 있습니다.

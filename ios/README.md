@@ -18,6 +18,7 @@ Swift 6 · SwiftUI · iOS 17 이상 · iPhone 전용. 번들 ID `dev.gajae.gjcmo
 | `E2EE.swift` | `gjcm-e2ee-v1` 키 유도와 프레임 암호 |
 | `BridgeClient.swift` | URLSessionWebSocket, 핸드셰이크, RPC, 이벤트 스트림 |
 | `Pairing.swift` | 오퍼 파싱, 페어링된 호스트 |
+| `CPace.swift`, `DeviceCode.swift` | 코드 입력 페어링(gjcm-code-v1): CPace(Elligator2 5×51비트 필드)와 코드 형식·입력 포매터. 브리지 `cpace.ts`·`device-code.ts`와 같은 벡터(`fixtures/cpace-vector.json`)로 검증 |
 | `Models.swift`, `JSONValue.swift`, `Transcript.swift` | 모델, JSON, 대화 트랜스크립트 |
 | `Attachments.swift` | 분할 업로드 |
 | `SlashCommands.swift` | 슬래시 명령 해석 |
@@ -33,14 +34,14 @@ Swift 6 · SwiftUI · iOS 17 이상 · iPhone 전용. 번들 ID `dev.gajae.gjcmo
 | `ChatView.swift`, `TranscriptViews.swift`, `InsightViews.swift` | 대화 화면 |
 | `SelectableText.swift` | 대화 본문용 `UITextView`: 부분 선택·드래그·복사, 링크는 기본 브라우저(Safari)로 |
 | `ModelSettingsView.swift` | 역할별 모델·추론 강도 |
-| `PairingView.swift` | QR 스캔, 링크 붙여 넣기, 데모 체험(`DemoHost`) |
+| `PairingView.swift` | 코드 입력(gjcm-code-v1), QR 스캔, 링크 붙여 넣기, 데모 체험(`DemoHost`) |
 | `SecureStore.swift` | 키체인 |
 | `WidgetStore.swift`, `WidgetRefresher.swift` | 위젯 스냅샷을 App Group에 기록, 백그라운드 갱신(`BGAppRefreshTask`) |
 | `PrivacyInfo.xcprivacy` | 개인정보 매니페스트(추적 없음, 수집 없음, UserDefaults 사유 CA92.1) |
 
 ## 빌드와 테스트
 
-이 호스트(Linux)에는 Swift 툴체인이 없으므로 iOS는 CI(macos-15)로만 빌드·테스트합니다.
+이 호스트(Linux)에는 Swift 툴체인이 없으므로 iOS는 CI(macos-15)로만 빌드·테스트합니다. 코드 페어링(CPace) 시험 벡터도 macOS CI에서 돌며, Core의 Linux 빌드·테스트는 확인하지 않았습니다.
 
 ```bash
 cd ios/Core && swift test          # macOS에서

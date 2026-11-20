@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -143,6 +143,44 @@ describe("pairings.json lock", () => {
 		fs.rmSync(lock);
 		clearStaleLock(lock, "old\n");
 		expect(fs.existsSync(lock)).toBe(false);
+	});
+
+	test("stale takeover fails loudly on I/O errors instead of spinning, and never leaves the moved file", () => {
+		const home = tempHome();
+		const lock = path.join(home, "pairings.lock");
+		const leftovers = () => fs.readdirSync(home).filter(name => name.startsWith("pairings.lock."));
+		// rename fails with something other than ENOENT: thrown.
+		const file = path.join(home, "plain");
+		fs.writeFileSync(file, "");
+		expect(() => clearStaleLock(path.join(file, "pairings.lock"), "old\n")).toThrow(/ENOTDIR/);
+		// link back meets a lock taken in the window (EEXIST): no error, moved file removed.
+		const link = spyOn(fs, "linkSync");
+		try {
+			link.mockImplementation(() => {
+				throw Object.assign(new Error("EEXIST: exists"), { code: "EEXIST" });
+			});
+			fs.writeFileSync(lock, "new\n");
+			clearStaleLock(lock, "old\n");
+			expect(leftovers()).toEqual([]);
+			// any other link error: thrown, moved file still removed.
+			link.mockImplementation(() => {
+				throw Object.assign(new Error("EPERM: not permitted"), { code: "EPERM" });
+			});
+			fs.writeFileSync(lock, "new\n");
+			expect(() => clearStaleLock(lock, "old\n")).toThrow(/EPERM/);
+			expect(leftovers()).toEqual([]);
+		} finally {
+			link.mockRestore();
+		}
+	});
+
+	test("a lock that cannot be stat'ed is polled, not spun on, and ends busy", async () => {
+		const home = tempHome();
+		// A dangling symlink: open(wx) says EEXIST, read and stat say ENOENT.
+		fs.symlinkSync(path.join(home, "missing"), path.join(home, "pairings.lock"));
+		const started = Date.now();
+		await expect(new BridgeState(home).createPairing()).rejects.toBeInstanceOf(PairingsBusyError);
+		expect(Date.now() - started).toBeGreaterThanOrEqual(900);
 	});
 
 	test("release removes only its own lock", async () => {

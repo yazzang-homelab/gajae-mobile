@@ -120,12 +120,15 @@ describe("CPace protocol properties", () => {
 		// The bridge hands out neither Tb nor a seal for a wrong Ta.
 		expect(b.confirm(session.ta)).toBeUndefined();
 		expect(b.confirm(Buffer.alloc(64))).toBeUndefined();
-		// And a bridge that confirms under its own code anyway proves nothing to the phone: its Tb and box,
-		// made from the ISK of the code it holds, fail on the phone's side.
-		const own = new CPaceInitiator(Buffer.from("4PUXU36F4X"), { sid: a.sid });
-		const ownIsk = own.finish(b.yb)!.isk;
-		expect(session.verifyTb(confirmationTag(a.sid, ownIsk, b.yb, Buffer.alloc(0)))).toBe(false);
-		expect(session.open(sealBox(ownIsk, Buffer.from("offer")))).toBeUndefined();
+		// And a bridge that confirmed under its own code anyway would prove nothing to the phone: its Tb and box,
+		// made from this session's bridge-side ISK, fail on the phone's side.
+		const scalar = crypto.randomBytes(32);
+		const own = cpaceRespond(Buffer.from("4PUXU36F4X"), a.sid, a.ya, { scalar })!;
+		const bridgeIsk = deriveIsk(a.sid, x25519(scalar, a.ya)!, a.ya, Buffer.alloc(0), own.yb, Buffer.alloc(0));
+		const phone = a.finish(own.yb)!;
+		expect(hex(bridgeIsk)).not.toBe(hex(phone.isk));
+		expect(phone.verifyTb(confirmationTag(a.sid, bridgeIsk, own.yb, Buffer.alloc(0)))).toBe(false);
+		expect(phone.open(sealBox(bridgeIsk, Buffer.from("offer")))).toBeUndefined();
 	});
 
 	test("a replayed sid and Ya get a fresh Yb and ISK every time (seal nonce invariant 1)", () => {
@@ -137,6 +140,11 @@ describe("CPace protocol properties", () => {
 		const secondIsk = a.finish(second.yb)!.isk;
 		expect(hex(firstIsk)).not.toBe(hex(secondIsk));
 		expect(hex(sealKey(firstIsk))).not.toBe(hex(sealKey(secondIsk)));
+		// The responders' own seals: the same offer under the fixed nonce gives different boxes, so each
+		// responder sealed with a fresh kSeal.
+		const firstBox = first.confirm(a.finish(first.yb)!.ta)!.seal(Buffer.from("offer"));
+		const secondBox = second.confirm(a.finish(second.yb)!.ta)!.seal(Buffer.from("offer"));
+		expect(hex(firstBox)).not.toBe(hex(secondBox));
 	});
 
 	test("one session seals exactly once (invariant 2)", () => {

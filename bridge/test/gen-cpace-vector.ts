@@ -319,12 +319,21 @@ const rejectInputs = [
 	// only ASCII letters are uppercased: ß and ſ do not become SS and S
 	`${sample.slice(0, 4)}ß${sample.slice(4)}`,
 	`${sample.slice(0, 4)}ſ${sample.slice(5)}`,
+	// next to the separator set but not in it
+	...["\u001c", "\u001d", "\u001e", "\u001f", "\u180e", "\u2060", "\u00ad"].map(c => `${sample.slice(0, 4)}${c}${sample.slice(4)}`),
 ];
 const reject = rejectInputs.map(input => {
 	const decoded = decodeCode(input);
 	if (decoded.ok) throw new Error(`${input} should be rejected`);
 	return { input, error: decoded.error, ...("position" in decoded && decoded.position ? { position: decoded.position } : {}) };
 });
+/** The hyphen and JavaScript's \s, spelled out (the apps carry the same list). */
+const SEPARATORS = [
+	"-",
+	..."\t\n\v\f\r \u00a0\u1680\u2028\u2029\u202f\u205f\u3000\ufeff",
+	...Array.from({ length: 11 }, (_, i) => String.fromCharCode(0x2000 + i)),
+];
+if (SEPARATORS.length !== 26) throw new Error("separator list drifted");
 const normalize = [
 	{ input: formatCode(sample).toLowerCase(), code: sample },
 	{ input: ` ${formatCode(sample)} `, code: sample },
@@ -333,6 +342,8 @@ const normalize = [
 	{ input: `\ufeff${formatCode(sample).replaceAll("-", "\u00a0")}`, code: sample },
 	{ input: `${sample.slice(0, 4)}\u3000${sample.slice(4, 8)}\u2009${sample.slice(8)}\r\n`, code: sample },
 	{ input: `\t${sample.slice(0, 3)}\u2028${sample.slice(3, 6)}\u202f${sample.slice(6)}\u205f\u1680\v\f`, code: sample },
+	// every separator, once: the hyphen and all 25 characters of JavaScript's \s
+	{ input: `${SEPARATORS.join("")}${sample}`, code: sample },
 ];
 for (const n of normalize) {
 	const d = decodeCode(n.input);

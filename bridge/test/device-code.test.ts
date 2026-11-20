@@ -56,6 +56,20 @@ describe("gjcm-code-v1 device codes", () => {
 		expect(caught / total).toBeGreaterThan(0.9);
 	});
 
+	test("separators are exactly the hyphen and JavaScript's \\s; only ASCII letters are uppercased", () => {
+		const wrong: string[] = [];
+		for (let c = 0; c <= 0xffff; c++) {
+			if (c >= 0xd800 && c <= 0xdfff) continue;
+			const ch = String.fromCharCode(c);
+			const upper = ch >= "a" && ch <= "z" ? ch.toUpperCase() : ch;
+			const expected = ch === "-" || /\s/.test(ch) ? "23" : CODE_ALPHABET.includes(upper) ? `2${upper}3` : undefined;
+			const r = normalizeCode(`2${ch}3`);
+			const ok = expected === undefined ? !r.ok && r.position === 2 : r.ok && r.code === expected;
+			if (!ok) wrong.push(c.toString(16));
+		}
+		expect(wrong).toEqual([]);
+	});
+
 	test("only ws:// to a private IPv4 on /ws fits in a code", () => {
 		expect(encodableEndpoint("ws://100.85.215.116:7787/ws")).toEqual({ ok: true, address: { ip: "100.85.215.116", port: 7787, range: "tailscale" } });
 		expect(encodableEndpoint("ws://192.168.0.5/ws")).toMatchObject({ ok: true, address: { port: 80 } });

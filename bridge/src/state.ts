@@ -218,13 +218,13 @@ export class BridgeState {
 				};
 			}
 			const held = readText(lock);
-			let age: number;
+			let age: number | undefined;
 			try {
 				age = Date.now() - fs.statSync(lock).mtimeMs;
 			} catch {
-				continue; // released between open and stat
+				// Released between open and stat (or a lock that cannot be read): poll again below, never spin.
 			}
-			if (held !== undefined && age > STALE_LOCK_MS) {
+			if (held !== undefined && age !== undefined && age > STALE_LOCK_MS) {
 				clearStaleLock(lock, held);
 				continue;
 			}

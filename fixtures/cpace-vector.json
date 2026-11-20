@@ -1822,6 +1822,41 @@
         "input": "4PUXſ36F4W",
         "error": "code_format",
         "position": 5
+      },
+      {
+        "input": "4PUX\u001cU36F4W",
+        "error": "code_format",
+        "position": 5
+      },
+      {
+        "input": "4PUX\u001dU36F4W",
+        "error": "code_format",
+        "position": 5
+      },
+      {
+        "input": "4PUX\u001eU36F4W",
+        "error": "code_format",
+        "position": 5
+      },
+      {
+        "input": "4PUX\u001fU36F4W",
+        "error": "code_format",
+        "position": 5
+      },
+      {
+        "input": "4PUX᠎U36F4W",
+        "error": "code_format",
+        "position": 5
+      },
+      {
+        "input": "4PUX⁠U36F4W",
+        "error": "code_format",
+        "position": 5
+      },
+      {
+        "input": "4PUX­U36F4W",
+        "error": "code_format",
+        "position": 5
       }
     ],
     "normalize": [
@@ -1847,6 +1882,10 @@
       },
       {
         "input": "\t4PU XU3 6F4W  \u000b\f",
+        "code": "4PUXU36F4W"
+      },
+      {
+        "input": "-\t\n\u000b\f\r       　﻿           4PUXU36F4W",
         "code": "4PUXU36F4W"
       }
     ]

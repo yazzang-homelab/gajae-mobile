@@ -4,6 +4,7 @@
  * in-process vs 0/80 across processes), so tests use the real topology: phone and bridge in
  * different processes.
  */
+import fs from "node:fs";
 import { SessionHub } from "../src/hub";
 import { demoOfferUrl } from "../src/offer";
 import { startBridgeServer } from "../src/server";
@@ -32,6 +33,8 @@ const server = startBridgeServer({
 	state,
 	hub,
 	uploads: new UploadStore(state.uploadsDir),
+	// The front door's own log (pairing, device codes) goes to a file the test reads back.
+	...(process.env.GJCM_TEST_LOG ? { log: (line: string) => fs.appendFileSync(process.env.GJCM_TEST_LOG!, `${line}\n`) } : {}),
 	...(demoEndpoint ? { demoOffer: () => demoOfferUrl(state, demoEndpoint) } : {}),
 });
 process.stdout.write(`${JSON.stringify({ port: server.port })}\n`);

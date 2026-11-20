@@ -6,7 +6,7 @@
 
 ```bash
 bunx gjcm-bridge serve --host 0.0.0.0 --port 7787 --cwd ~/work --gjc "gjc --mode=acp"
-bunx gjcm-bridge pair        # 페어링 QR/URL(gjcm://pair?o=…) 출력
+bunx gjcm-bridge pair        # 페어링 코드(앱에 입력)와 QR/URL(gjcm://pair?o=…) 출력
 bunx gjcm-bridge devices     # 페어링된 기기 목록
 bunx gjcm-bridge revoke <id> # 기기 해제
 ```
@@ -23,7 +23,7 @@ npm 패키지 `gjcm-bridge`이며 [Bun](https://bun.sh)으로만 실행됩니다
 |---|---|
 | gjc 세션 기록 | `~/.gjc/agent/sessions` (gjc 소유, 브리지는 읽기만 함) |
 | 구독 OAuth | `~/.gjc/agent/auth.db` (호스트 밖으로 나가지 않음) |
-| 브리지 상태 | `GJCM_HOME`(기본 `~/.gjc-mobile`): `host.json`, `devices.json`, `pairings.json`, `uploads/` |
+| 브리지 상태 | `GJCM_HOME`(기본 `~/.gjc-mobile`): `host.json`, `devices.json`, `pairings.json`(+ `pairings.lock`), `uploads/` |
 | 폰 | 기기 키·호스트 목록은 iOS 키체인 |
 
 ## RPC
@@ -98,7 +98,9 @@ npm 패키지 `gjcm-bridge`이며 [Bun](https://bun.sh)으로만 실행됩니다
 2. **WSS 리버스 프록시.** 도메인과 TLS 인증서가 있으면 Caddy·nginx 같은 프록시가 `wss://<도메인>/ws`를 받아 `ws://127.0.0.1:7787/ws`로 넘기고, 브리지는 `--host 127.0.0.1`로 띄웁니다. 프록시에서 WebSocket Upgrade를 허용하고 연결 수·속도 제한을 겁니다. TLS는 E2EE를 대체하지 않고 전송 계층과 접속 메타데이터를 더 보호합니다.
 3. **공유기 포트포워딩(DDNS).** 권장하지 않습니다. 써야 한다면 브리지 포트 하나만 그 PC로 넘기고, 브리지 앞에 연결 제한이 없다는 점(인증 전 접속은 15초 핸드셰이크 타임아웃만 있음)을 감안합니다.
 
-페어링 QR에는 주소를 여러 개 넣을 수 있고 앱은 연결되는 주소를 씁니다: `gjcm-bridge pair --endpoint wss://<도메인>/ws --endpoint ws://<LAN IP>:7787/ws`. 외부에 연 브리지에서는 `pair --reusable`과 `serve --demo-endpoint`를 쓰지 않습니다(둘 다 여러 기기가 같은 코드로 페어링하는 심사용 데모 기능입니다). 페어링 코드는 기본 10분 동안 한 번만 쓸 수 있고, 잃어버린 기기는 `gjcm-bridge revoke <이름>`으로 끊습니다.
+페어링 QR에는 주소를 여러 개 넣을 수 있고 앱은 연결되는 주소를 씁니다: `gjcm-bridge pair --endpoint wss://<도메인>/ws --endpoint ws://<LAN IP>:7787/ws`. 외부에 연 브리지에서는 `pair --reusable`과 `serve --demo-endpoint`를 쓰지 않습니다(둘 다 여러 기기가 같은 코드로 페어링하는 심사용 데모 기능입니다). 페어링 코드와 QR은 기본 15분 동안 한 번만 쓸 수 있고(둘 중 하나로 페어링하면 둘 다 소멸), 코드는 5번 틀리면 폐기됩니다. 잃어버린 기기는 `gjcm-bridge revoke <이름>`으로 끊습니다.
+
+페어링 코드는 Tailscale 주소(없으면 사설 LAN 주소)를 담습니다. 폰이 Tailscale에 없고 같은 Wi-Fi에 있으면 `gjcm-bridge pair --code-lan`으로 LAN 주소를 담은 코드를 만듭니다. wss·도메인 주소처럼 코드에 담을 수 없는 주소만 있으면 `pair`는 이유를 알리고 QR만 보여 줍니다. 프로토콜은 `docs/ARCHITECTURE.ko.md` 2.1절에 있습니다.
 
 ## 문제 해결
 

@@ -1,5 +1,7 @@
 /**
  * WebSocket front door. One connection = one phone.
+ *   0. (device code, #128) text `pake` → `pake.reply`, `pake.confirm` → `pake.ok` with the sealed offer, then close;
+ *      the phone dials again with the hello below. See code-pairing.ts and cpace.ts.
  *   1. text frame `hello` → text frame `welcome` (or `error` + close)
  *   2. binary frames only, each sealed with FrameCipher; payloads are JSON:
  *        phone → bridge   { id, m, p }            request
@@ -11,6 +13,8 @@
 import crypto from "node:crypto";
 import type { Server, ServerWebSocket } from "bun";
 import { AcpError } from "./acp";
+import { decideConfirm, decideStart } from "./code-pairing";
+import { type CPaceResponderSession, cpaceRespond } from "./cpace";
 import {
 	b64urlDecode,
 	b64urlEncode,
@@ -22,7 +26,7 @@ import {
 	serverKeys,
 } from "./crypto";
 import type { HubClient, SessionHub } from "./hub";
-import type { BridgeState } from "./state";
+import { type BridgeState, PairingsBusyError } from "./state";
 import type { UploadStore } from "./uploads";
 
 /** The largest frame either side takes (the apps' iOS `maximumMessageSize` is the same 32 MiB). */
@@ -50,7 +54,9 @@ const HANDSHAKE_TIMEOUT_MS = 15_000;
 
 interface Conn {
 	id: string;
-	phase: "hello" | "confirming" | "open" | "closed";
+	/** `verifying`: a pairing hello waits for pairings.json; `pake`: a device-code session (#128). */
+	phase: "hello" | "verifying" | "pake" | "confirming" | "open" | "closed";
+	pake?: { pairingId: string; prs: string; session: CPaceResponderSession };
 	cipher?: FrameCipher;
 	deviceKey?: string;
 	deviceName?: string;
@@ -66,7 +72,7 @@ export interface BridgeServerOptions {
 	log?: (line: string) => void;
 	/** Review demo host only: `GET /offer` hands out its reusable pairing link (the apps' "데모로 체험");
 	 *  `GET /privacy` serves the store listings' privacy policy (bridge/demo/privacy.html). */
-	demoOffer?: () => string;
+	demoOffer?: () => Promise<string>;
 }
 
 export function startBridgeServer(options: BridgeServerOptions): Server<Conn> {
@@ -109,8 +115,8 @@ export function startBridgeServer(options: BridgeServerOptions): Server<Conn> {
 		log(`skipped ${what}: ${body.length} bytes over the ${MAX_FRAME_BYTES}-byte frame limit`);
 	};
 
-	const fail = (ws: ServerWebSocket<Conn>, code: string, message: string) => {
-		ws.send(JSON.stringify({ t: "error", code, message }));
+	const fail = (ws: ServerWebSocket<Conn>, code: string, message: string, extra: Record<string, unknown> = {}) => {
+		ws.send(JSON.stringify({ t: "error", code, message, ...extra }));
 		ws.data.phase = "closed";
 		ws.close(4401, code);
 	};
@@ -168,13 +174,7 @@ export function startBridgeServer(options: BridgeServerOptions): Server<Conn> {
 		}
 	};
 
-	const onHello = (ws: ServerWebSocket<Conn>, text: string) => {
-		let hello: any;
-		try {
-			hello = JSON.parse(text);
-		} catch {
-			return fail(ws, "bad_hello", "hello must be JSON");
-		}
+	const onHello = async (ws: ServerWebSocket<Conn>, hello: any) => {
 		if (hello?.t !== "hello" || hello.v !== 1) return fail(ws, "bad_hello", "expected hello v1");
 		let deviceKey: Buffer;
 		let clientEph: Buffer;
@@ -192,10 +192,19 @@ export function startBridgeServer(options: BridgeServerOptions): Server<Conn> {
 		const deviceKeyText = b64urlEncode(deviceKey);
 		if (hello.pairing) {
 			const proof = Buffer.from(String(hello.pairing.proof ?? ""), "base64url");
-			const pending = state.consumePairing(String(hello.pairing.id ?? ""), candidate => {
-				const expected = pairingProof(b64urlDecode(candidate.secret), deviceKey, clientEph);
-				return proof.length === expected.length && crypto.timingSafeEqual(proof, expected);
-			});
+			ws.data.phase = "verifying";
+			let pending: Awaited<ReturnType<typeof state.consumePairing>>;
+			try {
+				pending = await state.consumePairing(String(hello.pairing.id ?? ""), candidate => {
+					const expected = pairingProof(b64urlDecode(candidate.secret), deviceKey, clientEph);
+					return proof.length === expected.length && crypto.timingSafeEqual(proof, expected);
+				});
+			} catch (error) {
+				if (!(error instanceof PairingsBusyError)) throw error;
+				log(`pairing busy device=${deviceKeyText.slice(0, 8)}`);
+				return fail(ws, "pairing_busy", "the host is busy; try again in a moment");
+			}
+			if (ws.data.phase !== "verifying") return; // closed meanwhile
 			if (!pending) {
 				log(`pairing rejected device=${deviceKeyText.slice(0, 8)}`);
 				return fail(ws, "pairing_invalid", "pairing code is invalid, used, or expired");
@@ -242,13 +251,127 @@ export function startBridgeServer(options: BridgeServerOptions): Server<Conn> {
 		);
 	};
 
+	/** The connection running a device-code session: one per bridge, as there is one active code (#128). */
+	let pakeInFlight: string | undefined;
+
+	const onPake = async (ws: ServerWebSocket<Conn>, message: any) => {
+		const conn = ws.data;
+		let sid: Buffer;
+		let ya: Buffer;
+		try {
+			sid = b64urlDecode(String(message.sid ?? ""));
+			ya = b64urlDecode(String(message.ya ?? ""));
+		} catch {
+			return fail(ws, "bad_pake", "malformed pake");
+		}
+		if (message.v !== 1 || sid.length !== 16 || ya.length !== 32) return fail(ws, "bad_pake", "malformed pake");
+		if (pakeInFlight !== undefined) {
+			log("pake busy");
+			return fail(ws, "code_busy", "another device is using the code");
+		}
+		pakeInFlight = conn.id;
+		conn.phase = "pake";
+		let decision: Awaited<ReturnType<typeof decideStart>>["result"];
+		try {
+			decision = await state.mutatePairings(rows => decideStart(rows));
+		} catch (error) {
+			if (!(error instanceof PairingsBusyError)) throw error;
+			log("pake busy (pairings locked)");
+			return fail(ws, "code_busy", "the host is busy; try again in a moment");
+		}
+		if (conn.phase !== "pake") return; // closed meanwhile; the attempt stays used
+		if (decision.kind === "expired") {
+			log("pake expired");
+			return fail(ws, "code_expired", "no active code, or it expired or was used");
+		}
+		if (decision.kind === "locked") {
+			log("pake locked");
+			return fail(ws, "code_locked", "too many wrong attempts; run gjcm-bridge pair again");
+		}
+		const session = cpaceRespond(Buffer.from(decision.prs), sid, ya);
+		if (!session) {
+			log(`pake rejected point left=${decision.left}`);
+			return fail(ws, "bad_pake", "invalid pake point");
+		}
+		conn.pake = { pairingId: decision.pairingId, prs: decision.prs, session };
+		log(`pake start left=${decision.left}`);
+		ws.send(JSON.stringify({ t: "pake.reply", yb: b64urlEncode(session.yb), left: decision.left }));
+	};
+
+	const onPakeConfirm = async (ws: ServerWebSocket<Conn>, message: any) => {
+		const conn = ws.data;
+		const pake = conn.pake;
+		if (!pake || message?.t !== "pake.confirm") return fail(ws, "bad_pake", "expected pake.confirm");
+		conn.pake = undefined;
+		let ta: Buffer;
+		try {
+			ta = b64urlDecode(String(message.ta ?? ""));
+		} catch {
+			return fail(ws, "bad_pake", "malformed pake.confirm");
+		}
+		const tagOk = pake.session.verifyTa(ta);
+		let decision: Awaited<ReturnType<typeof decideConfirm>>["result"];
+		try {
+			decision = await state.mutatePairings(rows => decideConfirm(rows, pake, tagOk));
+		} catch (error) {
+			if (!(error instanceof PairingsBusyError)) throw error;
+			log("pake busy (pairings locked)");
+			return fail(ws, "code_busy", "the host is busy; try again in a moment");
+		}
+		if (conn.phase !== "pake") return;
+		switch (decision.kind) {
+			case "expired":
+				log("pake expired");
+				return fail(ws, "code_expired", "the code expired or was used");
+			case "locked":
+				log("pake locked");
+				return fail(ws, "code_locked", "too many wrong attempts; run gjcm-bridge pair again");
+			case "wrong":
+				log(`pake wrong left=${decision.left}`);
+				return fail(ws, "code_wrong", "wrong code", { left: decision.left });
+			case "ok": {
+				// Tb and the box go out only now that Ta proved the phone knows the code.
+				const box = pake.session.seal(Buffer.from(JSON.stringify(decision.offer)));
+				log("pake ok");
+				ws.send(JSON.stringify({ t: "pake.ok", tb: b64urlEncode(pake.session.tb), box: b64urlEncode(box) }));
+				conn.phase = "closed";
+				ws.close(1000, "pake_ok");
+				return;
+			}
+		}
+	};
+
+	const onText = async (ws: ServerWebSocket<Conn>, text: string) => {
+		const conn = ws.data;
+		let message: any;
+		try {
+			message = JSON.parse(text);
+		} catch {
+			return fail(ws, conn.phase === "pake" ? "bad_pake" : "bad_hello", "expected JSON");
+		}
+		if (conn.phase === "pake") return onPakeConfirm(ws, message);
+		if (message?.t === "pake") return onPake(ws, message);
+		return onHello(ws, message);
+	};
+
 	const handleMessage = (ws: ServerWebSocket<Conn>, raw: string | Buffer) => {
 		const conn = ws.data;
-		if (conn.phase === "hello") {
-			if (typeof raw !== "string") return fail(ws, "bad_hello", "hello must be a text frame");
-			return onHello(ws, raw);
+		if (conn.phase === "hello" || conn.phase === "pake") {
+			if (typeof raw !== "string") return fail(ws, conn.phase === "pake" ? "bad_pake" : "bad_hello", "expected a text frame");
+			// Async: report a failure on this connection only.
+			onText(ws, raw).catch(error => {
+				log(`handshake failed: ${error instanceof Error ? error.message : String(error)}`);
+				ws.data.phase = "closed";
+				ws.close(1011, "internal_error");
+			});
+			return;
 		}
 		if (conn.phase === "closed") return;
+		if (conn.phase === "verifying") {
+			conn.phase = "closed";
+			ws.close(4400, "unexpected_frame");
+			return;
+		}
 		if (typeof raw === "string") {
 			conn.phase = "closed";
 			ws.close(4400, "binary_frames_required");
@@ -316,7 +439,7 @@ export function startBridgeServer(options: BridgeServerOptions): Server<Conn> {
 			if (url.pathname === "/privacy" && options.demoOffer)
 				return new Response(Bun.file(new URL("../demo/privacy.html", import.meta.url)), { headers: { "content-type": "text/html; charset=utf-8" } });
 			if (url.pathname === "/offer" && options.demoOffer)
-				return Response.json({ url: options.demoOffer() }, { headers: { "cache-control": "no-store" } });
+				return options.demoOffer().then(offer => Response.json({ url: offer }, { headers: { "cache-control": "no-store" } }));
 			if (url.pathname === "/ws") {
 				const upgraded = server.upgrade(req, { data: { id: crypto.randomUUID(), phase: "hello" } as Conn });
 				return upgraded ? undefined : new Response("upgrade required", { status: 426 });
@@ -349,6 +472,8 @@ export function startBridgeServer(options: BridgeServerOptions): Server<Conn> {
 				if (ws.data.deviceKey) log(`disconnected device=${ws.data.deviceKey.slice(0, 8)} code=${code}${reason ? ` reason=${JSON.stringify(reason)}` : ""}`);
 				clearTimeout(ws.data.timer);
 				ws.data.phase = "closed";
+				ws.data.pake = undefined;
+				if (pakeInFlight === ws.data.id) pakeInFlight = undefined;
 				hub.detach(ws.data.id);
 				uploads.abortOwner(ws.data.id);
 			},

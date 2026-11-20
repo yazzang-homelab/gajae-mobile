@@ -2,7 +2,9 @@ import { afterEach, describe, expect, test } from "bun:test";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { BridgeClient, BridgeClientError } from "../src/client";
+import { BridgeClient, BridgeClientError, fetchOfferWithCode } from "../src/client";
+import { CPaceInitiator } from "../src/cpace";
+import { encodeCode } from "../src/device-code";
 import { generateKeyPair } from "../src/crypto";
 import { AGENT_EXIT, foldBtwExchanges, PERMISSION_MODE_UPDATE, TURN_END, supportedConfigOptions } from "../src/hub";
 import { parseOfferUrl, offerUrl } from "../src/offer";
@@ -26,7 +28,7 @@ const turnEnd = (sessionId: string) => (e: { ev: string; p: any }) =>
 describe("pairing and authentication", () => {
 	test("offer URL round-trips", async () => {
 		const bridge = await useBridge();
-		const offer = bridge.offer();
+		const offer = await bridge.offer();
 		expect(parseOfferUrl(offerUrl(offer))).toEqual(offer);
 	});
 
@@ -43,7 +45,7 @@ describe("pairing and authentication", () => {
 
 	test("a used or forged pairing secret is rejected", async () => {
 		const bridge = await useBridge();
-		const offer = bridge.offer();
+		const offer = await bridge.offer();
 		const first = await BridgeClient.connect(bridge.endpoint, BridgeClient.identityFromOffer(offer), {
 			pairing: { id: offer.pairingId, secret: offer.secret },
 		});
@@ -52,7 +54,7 @@ describe("pairing and authentication", () => {
 			pairing: { id: offer.pairingId, secret: offer.secret },
 		});
 		await expect(reuse).rejects.toMatchObject({ code: "pairing_invalid" });
-		const o2 = bridge.offer();
+		const o2 = await bridge.offer();
 		const forged = BridgeClient.connect(bridge.endpoint, BridgeClient.identityFromOffer(o2), {
 			pairing: { id: o2.pairingId, secret: Buffer.alloc(32).toString("base64url") },
 		});
@@ -72,7 +74,7 @@ describe("pairing and authentication", () => {
 
 	test("unknown devices are refused and wrong host keys never get a response", async () => {
 		const bridge = await useBridge();
-		const offer = bridge.offer();
+		const offer = await bridge.offer();
 		await expect(BridgeClient.connect(bridge.endpoint, BridgeClient.identityFromOffer(offer))).rejects.toMatchObject({
 			code: "unknown_device",
 		});
@@ -152,6 +154,170 @@ describe("pairing and authentication", () => {
 		await expect(client.request("ping")).rejects.toBeInstanceOf(BridgeClientError);
 		expect((await client.closed).reason).toBe("device_revoked");
 		await expect(BridgeClient.connect(bridge.endpoint, identity)).rejects.toMatchObject({ code: "unknown_device" });
+	});
+});
+
+describe("device-code pairing (gjcm-code-v1, #128)", () => {
+	/** A raw pake session that stops after `pake.reply` (holds the bridge's one in-flight slot until closed). */
+	const openPake = (endpoint: string, code: string, message?: Record<string, unknown>) =>
+		new Promise<{ ws: WebSocket; reply: any }>((resolve, reject) => {
+			const ws = new WebSocket(endpoint);
+			const cpace = new CPaceInitiator(Buffer.from(code));
+			ws.onopen = () =>
+				ws.send(JSON.stringify(message ?? { t: "pake", v: 1, sid: cpace.sid.toString("base64url"), ya: cpace.ya.toString("base64url") }));
+			ws.onmessage = e => resolve({ ws, reply: JSON.parse(String(e.data)) });
+			ws.onerror = () => reject(new Error("websocket error"));
+		});
+	const attemptsLeft = (home: string) =>
+		JSON.parse(fs.readFileSync(path.join(home, "pairings.json"), "utf8")).find((r: any) => r.code)?.code.attemptsLeft;
+
+	test("the code pairs the device, retires the QR, and reconnects work", async () => {
+		const bridge = await useBridge();
+		const { code, offer: qr } = await bridge.codeOffer();
+		const { client, identity, offer } = await BridgeClient.pairWithCode(code, { dial: bridge.endpoint, name: "코드 폰" });
+		expect((await client.request("ping")).pong).toBeNumber();
+		client.close();
+		expect(offer.pairingId).toBe(qr.pairingId);
+		expect(offer.secret).not.toBe(qr.secret);
+		expect(bridge.state.devices().map(d => d.name)).toEqual(["코드 폰"]);
+		const again = await BridgeClient.connect(bridge.endpoint, identity);
+		expect((await again.request("host.info")).agentInfo.name).toBe("fake-gjc");
+		again.close();
+		// The QR shown next to the code is spent too.
+		await expect(
+			BridgeClient.connect(bridge.endpoint, BridgeClient.identityFromOffer(qr), { pairing: { id: qr.pairingId, secret: qr.secret } }),
+		).rejects.toMatchObject({ code: "pairing_invalid" });
+		// The log tells what happened and never carries the code or a secret.
+		const log = bridge.logText();
+		expect(log).toContain("pake start left=4");
+		expect(log).toContain("pake ok");
+		for (const secret of [code, qr.secret, offer.secret]) expect(log).not.toContain(secret);
+	});
+
+	test("the QR first leaves the code expired", async () => {
+		const bridge = await useBridge();
+		const { code, offer: qr } = await bridge.codeOffer();
+		const first = await BridgeClient.connect(bridge.endpoint, BridgeClient.identityFromOffer(qr), {
+			pairing: { id: qr.pairingId, secret: qr.secret },
+		});
+		first.close();
+		await expect(BridgeClient.pairWithCode(code, { dial: bridge.endpoint })).rejects.toMatchObject({ code: "code_expired" });
+		expect(bridge.logText()).toContain("pake expired");
+	});
+
+	test("a newer pair retires the older code; its QR stays valid", async () => {
+		const bridge = await useBridge();
+		const older = await bridge.codeOffer(0x11111);
+		const newer = await bridge.codeOffer(0x22222);
+		// The bridge only knows its one active code, so the older one is simply wrong (and takes an attempt).
+		await expect(BridgeClient.pairWithCode(older.code, { dial: bridge.endpoint })).rejects.toMatchObject({
+			code: "code_wrong",
+			data: { left: 4 },
+		});
+		const viaQr = await BridgeClient.connect(bridge.endpoint, BridgeClient.identityFromOffer(older.offer), {
+			pairing: { id: older.offer.pairingId, secret: older.offer.secret },
+		});
+		viaQr.close();
+		const viaCode = await BridgeClient.pairWithCode(newer.code, { dial: bridge.endpoint });
+		viaCode.client.close();
+		expect(bridge.state.devices()).toHaveLength(2);
+	});
+
+	test("wrong codes count down and lock the code after five", async () => {
+		const bridge = await useBridge();
+		const { code } = await bridge.codeOffer(0x33333);
+		const wrong = (secret: number) => BridgeClient.pairWithCode(encodeCode({ ip: "100.100.1.2", port: 7787 }, secret), { dial: bridge.endpoint });
+		for (const left of [4, 3, 2, 1]) {
+			const error = await wrong(left).catch(e => e);
+			expect(error).toMatchObject({ code: "code_wrong", data: { left } });
+			// Kept in pairings.json, so a serve restart does not refill the attempts.
+			expect(attemptsLeft(bridge.home)).toBe(left);
+		}
+		await expect(wrong(5)).rejects.toMatchObject({ code: "code_locked" });
+		await expect(BridgeClient.pairWithCode(code, { dial: bridge.endpoint })).rejects.toMatchObject({ code: "code_expired" });
+		expect(bridge.state.devices()).toHaveLength(0);
+		expect(bridge.logText()).toContain("pake wrong left=1");
+		expect(bridge.logText()).toContain("pake locked");
+	});
+
+	test("the right code on the last attempt still pairs", async () => {
+		const bridge = await useBridge();
+		const { code } = await bridge.codeOffer(0x44444);
+		for (let i = 1; i <= 4; i++)
+			await expect(
+				BridgeClient.pairWithCode(encodeCode({ ip: "100.100.1.2", port: 7787 }, i), { dial: bridge.endpoint }),
+			).rejects.toMatchObject({ code: "code_wrong" });
+		const { client } = await BridgeClient.pairWithCode(code, { dial: bridge.endpoint });
+		client.close();
+		expect(bridge.state.devices()).toHaveLength(1);
+	});
+
+	test("pake.ok without the hello registers nothing and spends the code (key-change cancel)", async () => {
+		const bridge = await useBridge();
+		const { code } = await bridge.codeOffer();
+		const offer = await fetchOfferWithCode(bridge.endpoint, code);
+		expect(bridge.state.devices()).toHaveLength(0);
+		await expect(fetchOfferWithCode(bridge.endpoint, code)).rejects.toMatchObject({ code: "code_expired" });
+		// Retrying the hello from memory still works while the pairing lives.
+		const client = await BridgeClient.connect(bridge.endpoint, BridgeClient.identityFromOffer(offer), {
+			pairing: { id: offer.pairingId, secret: offer.secret },
+		});
+		client.close();
+		expect(bridge.state.devices()).toHaveLength(1);
+	});
+
+	test("an expired code is reported as expired", async () => {
+		const bridge = await useBridge();
+		const { code } = await bridge.codeOffer();
+		const file = path.join(bridge.home, "pairings.json");
+		const rows = JSON.parse(fs.readFileSync(file, "utf8"));
+		rows[0].expiresAt = new Date(Date.now() - 1000).toISOString();
+		fs.writeFileSync(file, JSON.stringify(rows));
+		await expect(BridgeClient.pairWithCode(code, { dial: bridge.endpoint })).rejects.toMatchObject({ code: "code_expired" });
+	});
+
+	test("one code session at a time: a second gets code_busy without spending an attempt", async () => {
+		const bridge = await useBridge();
+		const { code } = await bridge.codeOffer();
+		const held = await openPake(bridge.endpoint, code);
+		expect(held.reply).toMatchObject({ t: "pake.reply", left: 4 });
+		await expect(BridgeClient.pairWithCode(code, { dial: bridge.endpoint })).rejects.toMatchObject({ code: "code_busy" });
+		expect(attemptsLeft(bridge.home)).toBe(4);
+		held.ws.close();
+		await Bun.sleep(100);
+		const { client } = await BridgeClient.pairWithCode(code, { dial: bridge.endpoint });
+		client.close();
+	});
+
+	test("malformed pake messages get bad_pake; a low-order point spends the attempt", async () => {
+		const bridge = await useBridge();
+		const { code } = await bridge.codeOffer();
+		const short = await openPake(bridge.endpoint, code, { t: "pake", v: 1, sid: "AAAA", ya: Buffer.alloc(32, 9).toString("base64url") });
+		expect(short.reply).toMatchObject({ t: "error", code: "bad_pake" });
+		expect(attemptsLeft(bridge.home)).toBe(5);
+		const zero = await openPake(bridge.endpoint, code, {
+			t: "pake",
+			v: 1,
+			sid: Buffer.alloc(16, 1).toString("base64url"),
+			ya: Buffer.alloc(32).toString("base64url"),
+		});
+		expect(zero.reply).toMatchObject({ t: "error", code: "bad_pake" });
+		expect(attemptsLeft(bridge.home)).toBe(4);
+		// A binary frame in the middle of a session.
+		const held = await openPake(bridge.endpoint, code);
+		const closed = new Promise<any>(resolve => {
+			held.ws.onmessage = e => resolve(JSON.parse(String(e.data)));
+		});
+		held.ws.send(new Uint8Array([1, 2, 3]));
+		expect(await closed).toMatchObject({ t: "error", code: "bad_pake" });
+	});
+
+	test("the hello path is unchanged for a pake-unaware app (hello v1)", async () => {
+		const bridge = await useBridge();
+		await bridge.codeOffer();
+		const { client } = await bridge.pairedClient("1.0.6 앱");
+		expect((await client.request("ping")).pong).toBeNumber();
+		client.close();
 	});
 });
 

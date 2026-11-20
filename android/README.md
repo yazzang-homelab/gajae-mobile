@@ -11,13 +11,15 @@ iOS 앱과 같은 브리지에 같은 프로토콜(`gjcm-e2ee-v1`)로 붙습니�
 | `core` | `E2EE.kt` | X25519(Tink) + HKDF-SHA256 + AES-256-GCM 프레임 암호, 페어링 증명 |
 | | `BridgeClient.kt` | OkHttp WebSocket, hello/welcome 핸드셰이크, 요청 id 기반 RPC, 이벤트 채널 |
 | | `Pairing.kt` | `gjcm://pair` 오퍼 파싱, 페어링된 호스트와 기기 키 |
+| | `CPace.kt`, `DeviceCode.kt` | 코드 입력 페어링(gjcm-code-v1): CPace(X25519, BigInteger)와 코드 형식·입력 포매터. 브리지 `cpace.ts`·`device-code.ts`와 같은 벡터(`fixtures/cpace-vector.json`)로 검증 |
+| | `CodePairingFlow.kt` | 코드로 받은 오퍼 보관, 키 교체 승인, hello 주소 순서와 실패 분류 |
 | | `Models.kt`, `Transcript.kt`, `Json.kt` | 세션·설정·권한 모델, `session.update`를 대화 행으로 바꾸는 트랜스크립트 |
 | | `Attachments.kt` | 분할 업로드(`upload.begin/chunk/commit`, sha256)와 프롬프트 블록 |
 | | `WidgetSnapshot.kt` | 위젯 스냅샷(호스트별 관측 시각, 세션 라벨·작업 중·대기 건수·종료 시각)과 표시 규칙(15분 지나면 "확인 필요") |
 | `ui` | `AppModel.kt` | 호스트 목록, 페어링, 데모 오퍼 조회 |
 | | `HostConnection.kt` | 호스트별 연결 유지(1초→30초 백오프), 이벤트 분배, 세션 목록 |
 | | `ChatModel.kt` | 대화 상태, 전송·지시·끼어들기·중단·승인·설정 |
-| | `RootScreen.kt`, `HostHome.kt`, `ChatScreen.kt`, `PairingScreen.kt` | 화면 |
+| | `RootScreen.kt`, `HostHome.kt`, `ChatScreen.kt`, `PairingScreen.kt` | 화면. 페어링 화면은 코드 입력이 기본이고 QR 스캔·링크 붙여 넣기는 버튼 |
 | | `SecureStore.kt` | Android Keystore 기반 EncryptedSharedPreferences(기기 키, 호스트 목록) |
 | `widget` | `GjcWidget.kt` | 홈 화면 위젯(Glance). 행을 누르면 그 세션으로(`gjcm://session`) |
 | | `WidgetStore.kt` | 앱이 관측한 스냅샷 저장(`gjcm_widget` 환경설정). 질문·명령 본문은 넣지 않음 |

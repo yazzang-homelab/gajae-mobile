@@ -67,7 +67,7 @@ import java.time.format.DateTimeFormatter
 @Composable
 fun RootScreen(model: AppModel) {
     if (model.showPairing || model.hosts.isEmpty()) {
-        PairingScreen(model, onClose = if (model.hosts.isEmpty()) null else ({ model.showPairing = false }))
+        PairingScreen(model, onClose = if (model.hosts.isEmpty()) null else ({ model.closePairing() }))
         return
     }
     val drawer = rememberDrawerState(DrawerValue.Closed)
@@ -129,7 +129,7 @@ private fun Sidebar(model: AppModel, connection: HostConnection, onClose: () -> 
             Spacer(Modifier.size(6.dp))
         }
         item {
-            TextButton(onClick = { model.showPairing = true; onClose() }) {
+            TextButton(onClick = { model.openPairing(); onClose() }) {
                 Icon(Icons.Filled.Add, contentDescription = null, tint = Palette.strawGold)
                 Text(" 호스트 추가", color = Palette.strawGold)
             }

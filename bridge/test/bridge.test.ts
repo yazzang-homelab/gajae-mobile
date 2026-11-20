@@ -285,10 +285,30 @@ describe("device-code pairing (gjcm-code-v1, #128)", () => {
 		expect(attemptsLeft(bridge.home)).toBe(4);
 		held.ws.close();
 		await Bun.sleep(100);
-		// A wrong code frees the slot with its answer: retyping at once is not `code_busy`.
-		await expect(
-			BridgeClient.pairWithCode(encodeCode({ ip: "100.100.1.2", port: 7787 }, 1), { dial: bridge.endpoint }),
-		).rejects.toMatchObject({ code: "code_wrong" });
+		// A session that starts the moment `code_wrong` arrives gets its reply, not `code_busy`. fail() frees the slot
+		// with the answer; Bun also runs the close handler inside ws.close, so this pins the behaviour rather than
+		// catching a missing endPake.
+		const wrong = await openPake(bridge.endpoint, encodeCode({ ip: "100.100.1.2", port: 7787 }, 1));
+		const next = new WebSocket(bridge.endpoint);
+		await new Promise(resolve => {
+			next.onopen = resolve;
+		});
+		const nextReply = new Promise<any>(resolve => {
+			next.onmessage = e => resolve(JSON.parse(String(e.data)));
+		});
+		const retype = new CPaceInitiator(Buffer.from(code));
+		const wrongAnswer = new Promise<any>(resolve => {
+			wrong.ws.onmessage = e => {
+				next.send(JSON.stringify({ t: "pake", v: 1, sid: retype.sid.toString("base64url"), ya: retype.ya.toString("base64url") }));
+				resolve(JSON.parse(String(e.data)));
+			};
+		});
+		const wrongSession = wrong.cpace.finish(Buffer.from(wrong.reply.yb, "base64url"))!;
+		wrong.ws.send(JSON.stringify({ t: "pake.confirm", ta: wrongSession.ta.toString("base64url") }));
+		expect(await wrongAnswer).toMatchObject({ t: "error", code: "code_wrong", left: 3 });
+		expect(await nextReply).toMatchObject({ t: "pake.reply", left: 2 });
+		next.close();
+		await Bun.sleep(100);
 		const { client } = await BridgeClient.pairWithCode(code, { dial: bridge.endpoint });
 		client.close();
 	});

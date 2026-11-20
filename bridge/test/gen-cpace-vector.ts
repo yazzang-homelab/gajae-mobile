@@ -312,6 +312,13 @@ const rejectInputs = [
 	// the reported position counts code characters only: hyphens and spaces before the bad character are not counted
 	`${sample.slice(0, 4)}-${sample.slice(4, 6)}O${sample.slice(7)}`,
 	` ${sample.slice(0, 2)} ${sample.slice(2, 4)}-1${sample.slice(5)}`,
+	// not separators: zero-width space, NEL, and a full-width letter
+	`${sample.slice(0, 4)}\u200b${sample.slice(4)}`,
+	`${sample.slice(0, 4)}\u0085${sample.slice(4)}`,
+	`${sample.slice(0, 4)}Ａ${sample.slice(5)}`,
+	// only ASCII letters are uppercased: ß and ſ do not become SS and S
+	`${sample.slice(0, 4)}ß${sample.slice(4)}`,
+	`${sample.slice(0, 4)}ſ${sample.slice(5)}`,
 ];
 const reject = rejectInputs.map(input => {
 	const decoded = decodeCode(input);
@@ -322,6 +329,10 @@ const normalize = [
 	{ input: formatCode(sample).toLowerCase(), code: sample },
 	{ input: ` ${formatCode(sample)} `, code: sample },
 	{ input: sample.split("").join(" "), code: sample },
+	// the full separator set: hyphen and JavaScript's \s, nothing else
+	{ input: `\ufeff${formatCode(sample).replaceAll("-", "\u00a0")}`, code: sample },
+	{ input: `${sample.slice(0, 4)}\u3000${sample.slice(4, 8)}\u2009${sample.slice(8)}\r\n`, code: sample },
+	{ input: `\t${sample.slice(0, 3)}\u2028${sample.slice(3, 6)}\u202f${sample.slice(6)}\u205f\u1680\v\f`, code: sample },
 ];
 for (const n of normalize) {
 	const d = decodeCode(n.input);

@@ -143,11 +143,21 @@ export function newCode(address: { ip: string; port: number }): string {
 
 export type NormalizeResult = { ok: true; code: string } | { ok: false; error: "code_format"; position: number; char: string };
 
-/** Uppercase, drop spaces and hyphens; any other character outside the alphabet (0 O 1 I …) is rejected with its 1-based position. */
+/**
+ * Separators dropped from input: the hyphen and exactly JavaScript's `\s` (tab, LF, VT, FF, CR, space, NBSP, U+1680,
+ * U+2000–U+200A, U+2028, U+2029, U+202F, U+205F, U+3000, BOM). The apps spell out the same set.
+ */
+const SEPARATOR = /^[-\t\n\v\f\r \u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff]$/;
+
+/**
+ * Uppercase ASCII a–z only (Unicode case mapping would turn ß into SS and ſ into S), drop separators; any other
+ * character outside the alphabet (0 O 1 I …) is rejected with its 1-based position.
+ */
 export function normalizeCode(input: string): NormalizeResult {
 	let code = "";
-	for (const ch of input.toUpperCase()) {
-		if (ch === "-" || /\s/.test(ch)) continue;
+	for (const raw of input) {
+		if (SEPARATOR.test(raw)) continue;
+		const ch = raw >= "a" && raw <= "z" ? raw.toUpperCase() : raw;
 		if (!CODE_ALPHABET.includes(ch)) return { ok: false, error: "code_format", position: code.length + 1, char: ch };
 		code += ch;
 	}

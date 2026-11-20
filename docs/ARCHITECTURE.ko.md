@@ -64,8 +64,8 @@ box     = AES-256-GCM(kSeal, nonce 0×12, AAD "gjcm-code-v1", 오퍼 JSON)
 - 브리지는 활성 코드 하나만 알기 때문에, 새 `pair`로 대체된 이전 코드를 입력하면 `code_expired`가 아니라 `code_wrong`이 나가고 활성 코드의 시도 1회가 줄어듭니다. 세션 전에 둘을 구별하려면 코드 식별자를 보내야 하는데, 그러면 비밀 비트가 샙니다. `code_expired`는 세션 시작 때 활성 코드가 없거나 만료된 경우, 그리고 세션 도중 코드가 쓰이거나 새 `pair`로 바뀐 경우(`pake.confirm` 때 다시 확인)에 나갑니다.
 - 오류 코드: `code_expired`(활성 코드 없음·만료·사용됨·세션 중 교체), `code_wrong`+`left`, `code_locked`(5회 소진, 코드 폐기), `code_busy`(다른 세션 진행 중), `bad_pake`(형식 오류). 0.1.5 브리지는 `pake`에 `bad_hello`로 답하고, 앱은 이것을 "브리지 업데이트 필요"로 안내합니다.
 - 상태: `pairings.json`의 행에 `code: {prs, attemptsLeft, offer}`가 붙습니다. `pair`와 `serve`는 `pairings.lock`(O_EXCL, 10초 넘은 잠금은 정리)으로 쓰기를 직렬화하고, 1초 안에 잠금을 못 잡으면 `code_busy`/`pairing_busy` 또는 CLI 오류로 끝냅니다.
-- 잠금 파일에는 잡은 프로세스의 토큰이 들어가고, 해제와 오래된 잠금 정리는 자기가 확인한 잠금만 지웁니다(정리는 `rename`으로 옮긴 뒤 내용을 확인).
-- 로그는 `pake start left=n`, `pake wrong left=n`, `pake locked`, `pake expired`, `pake ok`, `pake busy`(다른 세션 진행 중), `pake busy (pairings locked)`만 남기고 코드·ISK·secret은 남기지 않습니다.
+- 잠금 파일에는 잡은 프로세스의 토큰이 들어가고, 해제는 자기 토큰이 든 잠금만 지웁니다. 오래된 잠금은 `rename`으로 옮긴 뒤 내용을 확인하고, 그사이 다른 대기자가 잡은 새 잠금이었으면 되돌려 놓습니다. 되돌리는 동작은 원자적이지 않아서, 크래시로 남은 잠금이 있고 두세 프로세스가 같은 순간에 쓰는 드문 경우에는 쓰기 하나가 사라지거나 최대 10초 동안 busy가 날 수 있습니다.
+- 로그는 `pake start left=n`, `pake wrong left=n`, `pake rejected point left=n`(저차 점), `pake locked`, `pake expired`, `pake ok`, `pake busy`(다른 세션 진행 중), `pake busy (pairings locked)`, QR 경로의 `pairing busy device=…`(기기 키 앞 8자)만 남기고 코드·ISK·secret은 남기지 않습니다.
 - 정본은 `bridge/src/{cpace.ts,device-code.ts,code-pairing.ts}`이고, 시험 벡터는 `fixtures/cpace-vector.json`입니다(초안 B.1.1~B.1.5·B.1.10, 독립 Python 구현 `bridge/test/cpace_ref.py`와 대조한 의사 난수(고정 스트림)·경계 벡터, 코드 인코딩, 전체 거래). 다시 만들 때는 `bun test/gen-cpace-vector.ts`이고, 입력이 고정돼 있어 같은 파일이 다시 나옵니다.
 
 ## 3. 암호화 채널 `gjcm-e2ee-v1`

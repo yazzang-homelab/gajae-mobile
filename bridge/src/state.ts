@@ -244,24 +244,31 @@ function readText(file: string): string | undefined {
 
 /**
  * Clears a lock left by a crash, but only the one judged stale (`held`): the lock is moved aside atomically, and
- * if what was moved is a newer lock another waiter took in the meantime, it is put back.
+ * if what was moved is a newer lock another waiter took in the meantime, it is put back. The put-back is not
+ * atomic. In that window the newer lock's holder may release (its lock comes back without an owner, and writers
+ * get busy until it is 10 s old) or a third waiter may take a lock too (two writers at once; one update can be
+ * lost). Both need a crash-left lock and two or three processes writing within the same moment.
  */
-function clearStaleLock(lock: string, held: string): void {
+export function clearStaleLock(lock: string, held: string): void {
 	const aside = `${lock}.${process.pid}.${randomBytes(4).toString("hex")}.stale`;
 	try {
 		fs.renameSync(lock, aside);
-	} catch {
-		return; // another waiter cleared it first
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return; // another waiter cleared it first
+		throw error;
 	}
-	if (readText(aside) !== held) {
-		try {
-			fs.linkSync(aside, lock);
-		} catch {
-			// a third waiter already holds a new lock; the one moved aside is lost to its holder, whose release
-			// then finds a different token and leaves the new lock alone
+	try {
+		if (readText(aside) !== held) {
+			try {
+				fs.linkSync(aside, lock);
+			} catch (error) {
+				// EEXIST: a third waiter took a new lock in the window; see the note above.
+				if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+			}
 		}
+	} finally {
+		fs.rmSync(aside, { force: true });
 	}
-	fs.rmSync(aside, { force: true });
 }
 
 /** A pending pairing row (not stored yet). */

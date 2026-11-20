@@ -228,9 +228,9 @@ export interface CPaceInitiatorSession {
 	open(box: Uint8Array): Buffer | undefined;
 }
 
+/** The bridge's side. The ISK stays inside: Tb and the seal come only from `confirm`. */
 export interface CPaceResponderSession {
 	yb: Buffer;
-	isk: Buffer;
 	/**
 	 * Tb and the one-shot seal, handed out only for the right Ta: nothing that proves the code to the phone
 	 * exists before the phone has proved it to the bridge. Undefined for a wrong Ta.
@@ -272,7 +272,6 @@ export function cpaceRespond(
 	};
 	return {
 		yb,
-		isk,
 		confirm: ta => (tagsEqual(ta, confirmationTag(sid, isk, ya, peerAd)) ? confirmed : undefined),
 	};
 }

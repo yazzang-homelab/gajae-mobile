@@ -6,7 +6,7 @@ import { BridgeClient } from "../src/client";
 import { CODE_ATTEMPTS, decideConfirm, decideStart } from "../src/code-pairing";
 import { decodeCode, encodeCode } from "../src/device-code";
 import type { PairingOffer } from "../src/offer";
-import { BridgeState, PairingsBusyError, type PendingPairing } from "../src/state";
+import { BridgeState, clearStaleLock, PairingsBusyError, type PendingPairing } from "../src/state";
 
 const homes: string[] = [];
 afterEach(() => {
@@ -114,7 +114,7 @@ describe("pairings.json lock", () => {
 		expect(fs.existsSync(lock)).toBe(false);
 	});
 
-	test("a stale lock seen by two processes at once is cleared once, and every writer still gets through", async () => {
+	test("with a stale lock, writers that meet only at the lock file all get through and leave nothing behind", async () => {
 		const home = tempHome();
 		const lock = path.join(home, "pairings.lock");
 		fs.writeFileSync(lock, "999999\n");
@@ -125,6 +125,24 @@ describe("pairings.json lock", () => {
 		await Promise.all(writers.map(state => state.createPairing()));
 		expect(new BridgeState(home).pendingPairings()).toHaveLength(6);
 		expect(fs.readdirSync(home).filter(name => name.startsWith("pairings.lock"))).toEqual([]);
+	});
+
+	test("stale takeover removes only the lock it judged stale, and puts a newer one back", () => {
+		const home = tempHome();
+		const lock = path.join(home, "pairings.lock");
+		const leftovers = () => fs.readdirSync(home).filter(name => name.startsWith("pairings.lock."));
+		fs.writeFileSync(lock, "old\n");
+		clearStaleLock(lock, "old\n");
+		expect(fs.existsSync(lock)).toBe(false);
+		// Another waiter cleared the stale lock and took a new one before this waiter moved it aside.
+		fs.writeFileSync(lock, "new\n");
+		clearStaleLock(lock, "old\n");
+		expect(fs.readFileSync(lock, "utf8")).toBe("new\n");
+		expect(leftovers()).toEqual([]);
+		// Already gone: nothing to do.
+		fs.rmSync(lock);
+		clearStaleLock(lock, "old\n");
+		expect(fs.existsSync(lock)).toBe(false);
 	});
 
 	test("release removes only its own lock", async () => {

@@ -1797,6 +1797,31 @@
         "input": " 4P UX-136F4W",
         "error": "code_format",
         "position": 5
+      },
+      {
+        "input": "4PUX​U36F4W",
+        "error": "code_format",
+        "position": 5
+      },
+      {
+        "input": "4PUXU36F4W",
+        "error": "code_format",
+        "position": 5
+      },
+      {
+        "input": "4PUXＡ36F4W",
+        "error": "code_format",
+        "position": 5
+      },
+      {
+        "input": "4PUXßU36F4W",
+        "error": "code_format",
+        "position": 5
+      },
+      {
+        "input": "4PUXſ36F4W",
+        "error": "code_format",
+        "position": 5
       }
     ],
     "normalize": [
@@ -1810,6 +1835,18 @@
       },
       {
         "input": "4 P U X U 3 6 F 4 W",
+        "code": "4PUXU36F4W"
+      },
+      {
+        "input": "﻿4PUX U36F 4W",
+        "code": "4PUXU36F4W"
+      },
+      {
+        "input": "4PUX　U36F 4W\r\n",
+        "code": "4PUXU36F4W"
+      },
+      {
+        "input": "\t4PU XU3 6F4W  \u000b\f",
         "code": "4PUXU36F4W"
       }
     ]

@@ -58,8 +58,10 @@ describe("CPace vectors (draft-irtf-cfrg-cpace-21, fixtures/cpace-vector.json)",
 		// The same through the protocol objects, with the draft's scalars and AD.
 		const a = new CPaceInitiator(unhex(e.prs), { ci: unhex(e.ci), sid: unhex(e.sid), scalar: unhex(e.ya), ad: unhex(e.ADa) });
 		const b = cpaceRespond(unhex(e.prs), unhex(e.sid), a.ya, { ci: unhex(e.ci), scalar: unhex(e.yb), ad: unhex(e.ADb), peerAd: unhex(e.ADa) })!;
-		expect(hex(b.isk)).toBe(e.ISK);
-		expect(hex(a.finish(b.yb, unhex(e.ADb))!.isk)).toBe(e.ISK);
+		const session = a.finish(b.yb, unhex(e.ADb))!;
+		expect(hex(session.isk)).toBe(e.ISK);
+		// The responder reached the same ISK: it confirms Ta, and its Tb confirms back.
+		expect(session.verifyTb(b.confirm(session.ta)!.tb)).toBe(true);
 	});
 
 	test("B.1.10 low-order points abort, the rest match", () => {
@@ -98,9 +100,9 @@ describe("CPace vectors (draft-irtf-cfrg-cpace-21, fixtures/cpace-vector.json)",
 		expect(hex(a.ya)).toBe(t.Ya);
 		const b = cpaceRespond(Buffer.from(t.code), unhex(t.sid), a.ya, { scalar: unhex(t.yb) })!;
 		expect(hex(b.yb)).toBe(t.Yb);
-		expect(hex(b.isk)).toBe(t.ISK);
-		expect(hex(sealKey(b.isk))).toBe(t.kSeal);
 		const session = a.finish(b.yb)!;
+		expect(hex(session.isk)).toBe(t.ISK);
+		expect(hex(sealKey(session.isk))).toBe(t.kSeal);
 		expect(hex(session.ta)).toBe(t.Ta);
 		const confirmed = b.confirm(session.ta)!;
 		expect(hex(confirmed.tb)).toBe(t.Tb);
@@ -118,9 +120,12 @@ describe("CPace protocol properties", () => {
 		// The bridge hands out neither Tb nor a seal for a wrong Ta.
 		expect(b.confirm(session.ta)).toBeUndefined();
 		expect(b.confirm(Buffer.alloc(64))).toBeUndefined();
-		// And what it would have sent under its own code proves nothing to the phone.
-		expect(session.verifyTb(confirmationTag(a.sid, b.isk, b.yb, Buffer.alloc(0)))).toBe(false);
-		expect(session.open(sealBox(b.isk, Buffer.from("offer")))).toBeUndefined();
+		// And a bridge that confirms under its own code anyway proves nothing to the phone: its Tb and box,
+		// made from the ISK of the code it holds, fail on the phone's side.
+		const own = new CPaceInitiator(Buffer.from("4PUXU36F4X"), { sid: a.sid });
+		const ownIsk = own.finish(b.yb)!.isk;
+		expect(session.verifyTb(confirmationTag(a.sid, ownIsk, b.yb, Buffer.alloc(0)))).toBe(false);
+		expect(session.open(sealBox(ownIsk, Buffer.from("offer")))).toBeUndefined();
 	});
 
 	test("a replayed sid and Ya get a fresh Yb and ISK every time (seal nonce invariant 1)", () => {
@@ -128,8 +133,10 @@ describe("CPace protocol properties", () => {
 		const first = cpaceRespond(Buffer.from("4PUXU36F4W"), a.sid, a.ya)!;
 		const second = cpaceRespond(Buffer.from("4PUXU36F4W"), a.sid, a.ya)!;
 		expect(hex(first.yb)).not.toBe(hex(second.yb));
-		expect(hex(first.isk)).not.toBe(hex(second.isk));
-		expect(hex(sealKey(first.isk))).not.toBe(hex(sealKey(second.isk)));
+		const firstIsk = a.finish(first.yb)!.isk;
+		const secondIsk = a.finish(second.yb)!.isk;
+		expect(hex(firstIsk)).not.toBe(hex(secondIsk));
+		expect(hex(sealKey(firstIsk))).not.toBe(hex(sealKey(secondIsk)));
 	});
 
 	test("one session seals exactly once (invariant 2)", () => {
@@ -144,10 +151,12 @@ describe("CPace protocol properties", () => {
 	test("a tampered box does not open", () => {
 		const a = new CPaceInitiator(Buffer.from("CODE"));
 		const b = cpaceRespond(Buffer.from("CODE"), a.sid, a.ya)!;
-		const box = b.confirm(a.finish(b.yb)!.ta)!.seal(Buffer.from("offer"));
+		const session = a.finish(b.yb)!;
+		const box = b.confirm(session.ta)!.seal(Buffer.from("offer"));
+		expect(openBox(session.isk, box)?.toString()).toBe("offer");
 		box[0]! ^= 1;
-		expect(openBox(b.isk, box)).toBeUndefined();
-		expect(openBox(b.isk, Buffer.alloc(3))).toBeUndefined();
+		expect(openBox(session.isk, box)).toBeUndefined();
+		expect(openBox(session.isk, Buffer.alloc(3))).toBeUndefined();
 	});
 
 	test("malformed inputs abort instead of throwing", () => {

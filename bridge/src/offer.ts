@@ -5,8 +5,8 @@
  * it also carries a single-use pairing secret, so only someone who saw the QR can enroll a device.
  */
 import os from "node:os";
-import { b64urlEncode } from "./crypto";
-import type { BridgeState, HostIdentity, PendingPairing } from "./state";
+import { b64urlDecode, b64urlEncode } from "./crypto";
+import { type BridgeState, type HostIdentity, newPairing, type PendingPairing } from "./state";
 
 export interface PairingOffer {
 	v: 1;
@@ -42,8 +42,23 @@ export function parseOfferUrl(url: string): PairingOffer {
 	if (parsed.protocol !== "gjcm:") throw new Error("not a gjcm:// URL");
 	const encoded = parsed.searchParams.get("o");
 	if (!encoded) throw new Error("missing offer");
-	const offer = JSON.parse(Buffer.from(encoded, "base64url").toString("utf8"));
+	return checkOffer(JSON.parse(Buffer.from(encoded, "base64url").toString("utf8")));
+}
+
+/**
+ * The fields every offer needs, whether it came from a QR/link or out of a code's `pake.ok` box. The expiry is
+ * not compared with this clock: the bridge decides it when the pairing is used.
+ */
+export function checkOffer(value: unknown): PairingOffer {
+	const offer = value as PairingOffer | null;
 	if (offer?.v !== 1) throw new Error("unsupported offer version");
+	const text = (v: unknown) => typeof v === "string" && v.length > 0;
+	const key32 = (v: unknown) => text(v) && b64urlDecode(v as string).length === 32;
+	if (!text(offer.hostId) || typeof offer.name !== "string" || !text(offer.pairingId) || !text(offer.exp))
+		throw new Error("offer is missing fields");
+	if (!key32(offer.hostKey) || !key32(offer.secret)) throw new Error("offer keys must be 32 bytes");
+	if (!Array.isArray(offer.endpoints) || offer.endpoints.length === 0 || !offer.endpoints.every(text))
+		throw new Error("offer has no endpoints");
 	return offer;
 }
 
@@ -73,7 +88,12 @@ export async function discoverEndpoints(port: number): Promise<string[]> {
 const DEMO_PAIRING_TTL_MS = 30 * 24 * 60 * 60_000;
 const DEMO_RENEW_BEFORE_MS = 24 * 60 * 60_000;
 
-export function demoOfferUrl(state: BridgeState, endpoint: string, now = Date.now()): string {
-	const live = state.pendingPairings(now).find(p => p.reusable && Date.parse(p.expiresAt) - now > DEMO_RENEW_BEFORE_MS);
-	return offerUrl(buildOffer(state.host(), live ?? state.createPairing(DEMO_PAIRING_TTL_MS, true), [endpoint]));
+export async function demoOfferUrl(state: BridgeState, endpoint: string): Promise<string> {
+	const pairing = await state.mutatePairings((rows, now) => {
+		const live = rows.find(p => p.reusable && Date.parse(p.expiresAt) - now > DEMO_RENEW_BEFORE_MS);
+		if (live) return { result: live };
+		const created = newPairing({ ttlMs: DEMO_PAIRING_TTL_MS, reusable: true });
+		return { rows: [...rows, created], result: created };
+	});
+	return offerUrl(buildOffer(state.host(), pairing, [endpoint]));
 }

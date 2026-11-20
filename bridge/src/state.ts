@@ -2,7 +2,8 @@
  * Durable bridge state under GJCM_HOME (default ~/.gjc-mobile). Every file is owner-only (0600).
  *   host.json      host static X25519 identity + stable hostId
  *   devices.json   paired phones (device public keys); revoke = delete row
- *   pairings.json  pending single-use pairing secrets (from `gjcm-bridge pair`)
+ *   pairings.json  pending single-use pairing secrets (from `gjcm-bridge pair`), at most one with a device code
+ *   pairings.lock  held while `pair` or `serve` rewrites pairings.json (see `mutatePairings`)
  *   uploads/       files uploaded from the phone, per session
  * Agent sessions are NOT stored here: gjc keeps them in ~/.gjc/agent/sessions.
  */
@@ -10,6 +11,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { b64urlDecode, b64urlEncode, generateKeyPair, type KeyPair, randomBytes } from "./crypto";
+import type { PairingOffer } from "./offer";
 
 export interface DeviceRecord {
 	deviceKey: string; // base64url raw X25519 public key
@@ -24,6 +26,35 @@ export interface PendingPairing {
 	expiresAt: string;
 	/** Demo host only (`pair --reusable`): stays valid for every device until it expires. */
 	reusable?: boolean;
+	/** The device code for this pairing (gjcm-code-v1, #128). Only the newest pairing keeps one. */
+	code?: PairingCode;
+}
+
+export interface PairingCode {
+	/** The normalized code: the CPace password. */
+	prs: string;
+	/** Code sessions still allowed; each `pake` takes one before any key material leaves the bridge. */
+	attemptsLeft: number;
+	/** The same offer the QR carries; `pake.ok` seals it with the secret rotated. */
+	offer: PairingOffer;
+}
+
+/** Another process (or a stuck one) held pairings.lock past the wait. */
+export class PairingsBusyError extends Error {
+	constructor() {
+		super("pairings.json is locked by another gjcm-bridge process");
+	}
+}
+
+/** A lock older than this is from a process that died while holding it. */
+const STALE_LOCK_MS = 10_000;
+const LOCK_WAIT_MS = 1_000;
+const LOCK_POLL_MS = 25;
+
+export interface PairingsChange<T> {
+	/** The rows to store; omit to leave pairings.json as it was (expired rows are still pruned). */
+	rows?: PendingPairing[];
+	result: T;
 }
 
 export interface HostIdentity {
@@ -100,38 +131,155 @@ export class BridgeState {
 		return removed;
 	}
 
-	createPairing(ttlMs = 10 * 60_000, reusable = false): PendingPairing {
-		const pending = this.pendingPairings();
-		const pairing: PendingPairing = {
-			id: b64urlEncode(randomBytes(6)),
-			secret: b64urlEncode(randomBytes(32)),
-			expiresAt: new Date(Date.now() + ttlMs).toISOString(),
-			...(reusable ? { reusable: true } : {}),
-		};
-		writePrivate(path.join(this.home, "pairings.json"), [...pending, pairing]);
-		return pairing;
+	/**
+	 * A new pending pairing. `code` (when given) attaches a device code to it and drops the code of every older
+	 * pairing: one active code per host, while their QR secrets stay valid.
+	 */
+	createPairing(
+		options: { ttlMs?: number; reusable?: boolean; code?: (pairing: PendingPairing) => PairingCode } = {},
+	): Promise<PendingPairing> {
+		return this.mutatePairings(rows => {
+			const pairing = newPairing(options);
+			if (options.code) pairing.code = options.code(pairing);
+			const rest = options.code ? rows.map(({ code: _code, ...row }) => row) : rows;
+			return { rows: [...rest, pairing], result: pairing };
+		});
 	}
 
-	/** Unexpired pending pairings; expired rows are pruned on every read. */
+	/** Unexpired pending pairings, for diagnostics and tests (read only; writers prune expired rows under the lock). */
 	pendingPairings(now = Date.now()): PendingPairing[] {
-		const file = path.join(this.home, "pairings.json");
-		const all: PendingPairing[] = readJson(file, []);
-		const live = all.filter(p => Date.parse(p.expiresAt) > now);
-		if (live.length !== all.length) writePrivate(file, live);
-		return live;
+		const all: PendingPairing[] = readJson(path.join(this.home, "pairings.json"), []);
+		return all.filter(p => Date.parse(p.expiresAt) > now);
 	}
 
 	/**
 	 * Consumes the pairing `id` only if `proven` accepts it, so a request with a wrong proof cannot burn a
-	 * one-time code. Synchronous from lookup to removal: of two valid requests for the same code, one wins.
+	 * one-time code. Lookup and removal happen under the lock: of two valid requests for the same code, one wins.
 	 */
-	consumePairing(id: string, proven: (pairing: PendingPairing) => boolean): PendingPairing | undefined {
-		const pending = this.pendingPairings();
-		const found = pending.find(p => p.id === id);
-		if (!found || !proven(found)) return undefined;
-		if (!found.reusable) writePrivate(path.join(this.home, "pairings.json"), pending.filter(p => p !== found));
-		return found;
+	consumePairing(id: string, proven: (pairing: PendingPairing) => boolean): Promise<PendingPairing | undefined> {
+		return this.mutatePairings(rows => {
+			const found = rows.find(p => p.id === id);
+			if (!found || !proven(found)) return { result: undefined };
+			return { rows: found.reusable ? undefined : rows.filter(p => p !== found), result: found };
+		});
 	}
+
+	#pairingsQueue: Promise<unknown> = Promise.resolve();
+
+	/**
+	 * Read-modify-write of pairings.json under `pairings.lock`, the one lock `gjcm-bridge pair` (its own process)
+	 * and `serve` share. Expired rows are dropped before `change` sees the list. Calls in this process run one at a
+	 * time; waiting for another process polls asynchronously (never blocking serve's event loop) for about a second,
+	 * then fails with `PairingsBusyError`. A lock file older than 10 s is left over from a crash and is cleared.
+	 */
+	mutatePairings<T>(change: (rows: PendingPairing[], now: number) => PairingsChange<T>): Promise<T> {
+		const run = this.#pairingsQueue.then(async () => {
+			const release = await this.#lockPairings();
+			try {
+				const file = path.join(this.home, "pairings.json");
+				const all: PendingPairing[] = readJson(file, []);
+				const now = Date.now();
+				const live = all.filter(p => Date.parse(p.expiresAt) > now);
+				const { rows, result } = change(live, now);
+				if (rows) writePrivate(file, rows);
+				else if (live.length !== all.length) writePrivate(file, live);
+				return result;
+			} finally {
+				release();
+			}
+		});
+		this.#pairingsQueue = run.catch(() => {});
+		return run;
+	}
+
+	async #lockPairings(): Promise<() => void> {
+		const lock = path.join(this.home, "pairings.lock");
+		// The token makes the lock ours: release and stale takeover only ever remove the lock they looked at.
+		const token = `${process.pid} ${randomBytes(8).toString("hex")}\n`;
+		const deadline = Date.now() + LOCK_WAIT_MS;
+		for (;;) {
+			let fd: number | undefined;
+			try {
+				fd = fs.openSync(lock, "wx", 0o600);
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+			}
+			if (fd !== undefined) {
+				try {
+					fs.writeSync(fd, token);
+				} catch (error) {
+					fs.rmSync(lock, { force: true });
+					throw error;
+				} finally {
+					fs.closeSync(fd);
+				}
+				return () => {
+					if (readText(lock) === token) fs.rmSync(lock, { force: true });
+				};
+			}
+			const held = readText(lock);
+			let age: number | undefined;
+			try {
+				age = Date.now() - fs.statSync(lock).mtimeMs;
+			} catch {
+				// Released between open and stat (or a lock that cannot be read): poll again below, never spin.
+			}
+			if (held !== undefined && age !== undefined && age > STALE_LOCK_MS) {
+				clearStaleLock(lock, held);
+				continue;
+			}
+			if (Date.now() >= deadline) throw new PairingsBusyError();
+			await Bun.sleep(LOCK_POLL_MS);
+		}
+	}
+}
+
+function readText(file: string): string | undefined {
+	try {
+		return fs.readFileSync(file, "utf8");
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * Clears a lock left by a crash, but only the one judged stale (`held`): the lock is moved aside atomically, and
+ * if what was moved is a newer lock another waiter took in the meantime, it is put back. The put-back is not
+ * atomic. In that window the newer lock's holder may release (its lock comes back without an owner, and writers
+ * get busy until it is 10 s old) or a third waiter may take a lock too (two writers at once; one update can be
+ * lost). Both need a crash-left lock and two or three processes writing within the same moment.
+ */
+export function clearStaleLock(lock: string, held: string): void {
+	const aside = `${lock}.${process.pid}.${randomBytes(4).toString("hex")}.stale`;
+	try {
+		fs.renameSync(lock, aside);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return; // another waiter cleared it first
+		throw error;
+	}
+	try {
+		if (readText(aside) !== held) {
+			try {
+				fs.linkSync(aside, lock);
+			} catch (error) {
+				// EEXIST: a third waiter took a new lock in the window; see the note above.
+				if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+			}
+		}
+	} finally {
+		fs.rmSync(aside, { force: true });
+	}
+}
+
+/** A pending pairing row (not stored yet). */
+export function newPairing(options: { ttlMs?: number; reusable?: boolean } = {}): PendingPairing {
+	const { ttlMs = 15 * 60_000, reusable = false } = options;
+	return {
+		id: b64urlEncode(randomBytes(6)),
+		secret: b64urlEncode(randomBytes(32)),
+		expiresAt: new Date(Date.now() + ttlMs).toISOString(),
+		...(reusable ? { reusable: true } : {}),
+	};
 }
 
 function readJson<T>(file: string, fallback: T): T {

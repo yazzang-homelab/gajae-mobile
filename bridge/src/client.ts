@@ -12,7 +12,9 @@ import {
 	pairingProof,
 	randomBytes,
 } from "./crypto";
-import type { PairingOffer } from "./offer";
+import { CPaceInitiator } from "./cpace";
+import { decodeCode } from "./device-code";
+import { checkOffer, type PairingOffer } from "./offer";
 
 export interface ClientIdentity {
 	device: KeyPair;
@@ -110,6 +112,28 @@ export class BridgeClient {
 		return { device, hostKey: b64urlDecode(offer.hostKey) };
 	}
 
+	/**
+	 * Device-code pairing (gjcm-code-v1, #128): a CPace session on the code's address gets the offer, then the usual
+	 * pairing hello follows on the same address. `dial` overrides the address only (tests dial 127.0.0.1); the
+	 * password is still the code. Errors carry the bridge's code (`code_wrong` with `data.left`, …) or the app-side
+	 * ones: `code_format`, `code_unsupported`, `bridge_outdated` (a 0.1.5 bridge answers `bad_hello`), `pake_failed`.
+	 */
+	static async pairWithCode(
+		code: string,
+		options: { dial?: string; device?: KeyPair; name?: string } = {},
+	): Promise<{ client: BridgeClient; offer: PairingOffer; identity: ClientIdentity }> {
+		const decoded = decodeCode(code);
+		if (!decoded.ok) throw new BridgeClientError(decoded.error, "invalid code", decoded);
+		const endpoint = options.dial ?? decoded.endpoint;
+		const offer = await fetchOfferWithCode(endpoint, decoded.code);
+		const identity = BridgeClient.identityFromOffer(offer, options.device);
+		const client = await BridgeClient.connect(endpoint, identity, {
+			pairing: { id: offer.pairingId, secret: offer.secret },
+			name: options.name,
+		});
+		return { client, offer, identity };
+	}
+
 	request<T = any>(m: string, p?: unknown): Promise<T> {
 		const id = this.#nextId++;
 		return new Promise<T>((resolve, reject) => {
@@ -154,5 +178,68 @@ export class BridgeClient {
 			w.resolve(message);
 			return false;
 		});
+	}
+}
+
+/** Runs the CPace exchange of a device code and returns the offer out of `pake.ok`. */
+export async function fetchOfferWithCode(endpoint: string, code: string): Promise<PairingOffer> {
+	const ws = new WebSocket(endpoint);
+	const inbox: any[] = [];
+	const waiters: Array<(m: any) => void> = [];
+	let closedReason = "";
+	const deliver = (m: any) => {
+		const waiter = waiters.shift();
+		if (waiter) waiter(m);
+		else inbox.push(m);
+	};
+	ws.addEventListener("message", e => {
+		try {
+			deliver(JSON.parse(String(e.data)));
+		} catch {
+			deliver({ t: "error", code: "pake_failed", message: "unreadable reply" });
+		}
+	});
+	ws.addEventListener("close", e => {
+		closedReason = e.reason;
+		while (waiters.length) waiters.shift()!({ t: "closed" });
+	});
+	await new Promise<void>((resolve, reject) => {
+		ws.addEventListener("open", () => resolve(), { once: true });
+		ws.addEventListener("error", () => reject(new BridgeClientError("connect", "websocket error")), { once: true });
+	});
+	const next = () =>
+		new Promise<any>(resolve => {
+			if (inbox.length) resolve(inbox.shift());
+			else if (ws.readyState === WebSocket.CLOSED) resolve({ t: "closed" });
+			else waiters.push(resolve);
+		});
+	const expect = async (t: string) => {
+		const m = await next();
+		if (m?.t === t) return m;
+		if (m?.t === "error") {
+			const remote = String(m.code ?? "");
+			if (remote === "bad_hello") throw new BridgeClientError("bridge_outdated", "the bridge does not know device codes");
+			throw new BridgeClientError(remote, String(m.message ?? remote), typeof m.left === "number" ? { left: m.left } : undefined);
+		}
+		throw new BridgeClientError("closed", closedReason || "connection closed");
+	};
+	try {
+		const cpace = new CPaceInitiator(Buffer.from(code));
+		ws.send(JSON.stringify({ t: "pake", v: 1, sid: b64urlEncode(cpace.sid), ya: b64urlEncode(cpace.ya) }));
+		const reply = await expect("pake.reply");
+		const session = cpace.finish(b64urlDecode(String(reply.yb ?? "")));
+		if (!session) throw new BridgeClientError("pake_failed", "invalid point from the bridge");
+		ws.send(JSON.stringify({ t: "pake.confirm", ta: b64urlEncode(session.ta) }));
+		const ok = await expect("pake.ok");
+		if (!session.verifyTb(b64urlDecode(String(ok.tb ?? "")))) throw new BridgeClientError("pake_failed", "bridge failed key confirmation");
+		const plain = session.open(b64urlDecode(String(ok.box ?? "")));
+		if (!plain) throw new BridgeClientError("pake_failed", "offer box did not open");
+		try {
+			return checkOffer(JSON.parse(plain.toString("utf8")));
+		} catch (error) {
+			throw new BridgeClientError("pake_failed", `bad offer: ${error instanceof Error ? error.message : String(error)}`);
+		}
+	} finally {
+		ws.close();
 	}
 }

@@ -23,7 +23,7 @@ const updates = (client: BridgeClient, sid: string, kind: string) =>
 describe("review demo host", () => {
 	test("one reusable pairing code enrolls several reviewer devices until it expires", async () => {
 		const b = await demoBridge();
-		const offer = buildOffer(b.state.host(), b.state.createPairing(60_000, true), [b.endpoint]);
+		const offer = buildOffer(b.state.host(), await b.state.createPairing({ ttlMs: 60_000, reusable: true }), [b.endpoint]);
 		for (const name of ["App Review iPhone", "Play review Pixel"]) {
 			const identity = BridgeClient.identityFromOffer(offer, generateKeyPair());
 			const client = await BridgeClient.connect(b.endpoint, identity, { pairing: { id: offer.pairingId, secret: offer.secret }, name });
@@ -32,7 +32,7 @@ describe("review demo host", () => {
 		}
 		expect(b.state.devices().map(d => d.name)).toEqual(["App Review iPhone", "Play review Pixel"]);
 		// A normal code is still single use.
-		const once = buildOffer(b.state.host(), b.state.createPairing(), [b.endpoint]);
+		const once = buildOffer(b.state.host(), await b.state.createPairing(), [b.endpoint]);
 		const first = await BridgeClient.connect(b.endpoint, BridgeClient.identityFromOffer(once, generateKeyPair()), { pairing: { id: once.pairingId, secret: once.secret } });
 		first.close();
 		await expect(
@@ -57,6 +57,21 @@ describe("review demo host", () => {
 			c.close();
 		}
 		expect(b.state.devices()).toHaveLength(2);
+	});
+
+	test("GET /offer answers 503 with retry-after while another process holds pairings.lock", async () => {
+		const b = await demoBridge();
+		const http = b.endpoint.replace("ws://", "http://").replace(/\/ws$/, "/offer");
+		const lock = path.join(b.home, "pairings.lock");
+		fs.writeFileSync(lock, "another pair\n");
+		const busy = await fetch(http);
+		expect(busy.status).toBe(503);
+		expect(busy.headers.get("retry-after")).toBe("1");
+		expect(await busy.json()).toEqual({ error: "pairing_busy" });
+		fs.rmSync(lock);
+		const ok = await fetch(http);
+		expect(ok.status).toBe(200);
+		expect(parseOfferUrl((await ok.json()).url).endpoints).toEqual(["wss://demo.example/ws"]);
 	});
 
 	test("a reviewer can chat, approve a command, change effort and steer — all scripted, nothing executed", async () => {

@@ -12,7 +12,7 @@
 
 ## 2. 페어링
 
-1. 호스트에서 `gjcm-bridge pair`를 실행하면 페어링 코드를 만들고 아래 오퍼를 QR과 링크로 보여 줍니다.
+1. 호스트에서 `gjcm-bridge pair`를 실행하면 페어링을 하나 만들고, 사람이 입력하는 **기기 코드**(2.1)와 아래 오퍼의 QR·링크를 함께 보여 줍니다. 코드와 QR은 같은 페어링이라 어느 쪽으로든 한 번 페어링하면 둘 다 소멸합니다.
 2. 링크 형식은 `gjcm://pair?o=<base64url(JSON)>`입니다.
 
 ```json
@@ -22,9 +22,51 @@
 ```
 
 - `hostKey`가 오퍼에 들어 있으므로 앱은 첫 연결부터 호스트를 인증합니다(중간자 차단).
-- 코드는 기본 10분, 1회용입니다(`--ttl-min`). `--reusable`은 데모 호스트 전용이며 여러 기기가 같은 코드를 씁니다.
+- 페어링은 기본 15분, 1회용입니다(`--ttl-min`). `--reusable`은 데모 호스트 전용이며 여러 기기가 같은 QR을 씁니다(기기 코드는 만들지 않습니다).
 - 앱은 `endpoints`를 순서대로 시도하고, 마지막으로 성공한 주소를 다음 연결 때 맨 앞에 둡니다.
 - 기기 해제는 `gjcm-bridge revoke <id>`이며, 그 기기와 오가는 다음 프레임 전에 연결이 닫힙니다(`4403 device_revoked`). 해제 뒤에는 그 기기로 어떤 이벤트도 나가지 않습니다. 아무것도 오가지 않는 연결은 다음 전송 때까지 열려 있을 수 있습니다.
+
+### 2.1 기기 코드 `gjcm-code-v1` (#128)
+
+QR을 찍지 않고 9~14자 코드를 입력해 페어링합니다. 만남 서버 없이 코드가 브리지 주소를 직접 담습니다.
+
+**형식.** 알파벳 `23456789ABCDEFGHJKLMNPQRSTUVWXYZ`(0·O·1·I 없음), 5비트/자, 4자 묶음으로 표시합니다(`K7M2-9QXD-HP`).
+
+```
+type(4) ‖ addr ‖ [port(16)] ‖ secret(20) ‖ check(k ≥ 4)
+type 상위 1비트 = 포트 명시(없으면 7787), 하위 3비트 = 대역
+  001 Tailscale 100.64/10 (22비트)  010 10/8 (24)  011 172.16/12 (20)  100 192.168/16 (16)  나머지 예약
+check = SHA-256("gjcm-code-v1" ‖ m ‖ 앞 m비트)의 상위 k비트 (오타 검출용, 공개 함수)
+```
+
+길이는 기본 포트일 때 10·11·10·9자, 포트 명시일 때 14·14·13·12자입니다. 포트 0과 포트를 명시한 7787(더 짧은 정규 코드가 있음)은 비트와 check가 맞아도 `code_format`으로 거부합니다. `ws://<위 대역 IPv4>[:포트]/ws`만 담을 수 있고, wss·도메인·IPv6 주소이면 `pair`는 이유를 한 줄로 알리고 QR만 보여 줍니다. 코드 주소는 엔드포인트 중 앞에서부터 첫 번째로 담을 수 있는 주소이고, `--code-lan`은 Tailscale 대역을 건너뜁니다.
+
+**PAKE.** `CPACE-X25519-SHA512`([draft-irtf-cfrg-cpace-21](https://www.ietf.org/archive/id/draft-irtf-cfrg-cpace-21.txt) 고정). PRS = 정규화한 코드(대문자, 하이픈 없음), CI = `"gjcm-code-v1"`, 앱 = initiator, 브리지 = responder, AD는 비웁니다. 20비트 비밀이라도 오프라인 대입이 불가능하고, 온라인 시도는 코드당 5회로 묶입니다.
+
+| 방향 | 메시지 (`/ws`의 첫 텍스트 프레임이 `pake`이면 이 흐름) |
+|---|---|
+| 앱 → 브리지 | `{t:"pake", v:1, sid: 16바이트, ya: Ya}` |
+| 브리지 → 앱 | `{t:"pake.reply", yb: Yb, left}` (시도 1회를 이 시점에 차감) |
+| 앱 → 브리지 | `{t:"pake.confirm", ta: Ta}` |
+| 브리지 → 앱 | `{t:"pake.ok", tb: Tb, box}` 후 닫음 — Ta를 검증한 뒤에만 보냄 |
+
+```
+ISK     = SHA-512(lv_cat("CPace255_ISK", sid, K) ‖ lv_cat(Ya, "") ‖ lv_cat(Yb, ""))
+mac_key = SHA-512("CPaceMac" ‖ sid ‖ ISK);  Ta/Tb = HMAC-SHA512(mac_key, lv_cat(Y, ""))
+kSeal   = HKDF-SHA256(ISK, salt "", info "gjcm-code-v1 seal", 32)
+box     = AES-256-GCM(kSeal, nonce 0×12, AAD "gjcm-code-v1", 오퍼 JSON)
+```
+
+- `pake.ok` 때 브리지는 코드를 지우고 그 페어링의 `secret`을 새 값으로 바꾼 뒤, 바뀐 secret이 든 오퍼를 봉인합니다. 그래서 코드를 쓰면 화면의 QR은 곧바로 `pairing_invalid`가 되고, QR을 먼저 쓰면 코드는 `code_expired`가 됩니다.
+- 앱은 Tb를 확인하고 box를 연 뒤 키 변경 확인(KEY_CHANGED)을 거쳐 기존 hello(`pairing.proof`)로 등록합니다. 앱은 오퍼의 `exp`를 폰 시계로 검사하지 않습니다.
+- 브리지는 연결마다 새 yb를 뽑고(같은 sid·Ya를 다시 보내도 ISK가 달라짐), kSeal로는 한 번만 봉인합니다. 그래서 고정 nonce가 반복되지 않습니다.
+- 활성 코드는 호스트당 하나입니다. 코드를 만든 새 `pair`는 이전 코드를 없앱니다(이전 QR은 유지). 코드를 만들지 못하고 QR만 보여 준 `pair`는 이전 코드를 그대로 둡니다. 동시에 진행하는 코드 세션은 브리지당 하나입니다.
+- 브리지는 활성 코드 하나만 알기 때문에, 새 `pair`로 대체된 이전 코드를 입력하면 `code_expired`가 아니라 `code_wrong`이 나가고 활성 코드의 시도 1회가 줄어듭니다. 세션 전에 둘을 구별하려면 코드 식별자를 보내야 하는데, 그러면 비밀 비트가 샙니다. `code_expired`는 세션 시작 때 활성 코드가 없거나 만료된 경우, 그리고 세션 도중 코드가 쓰이거나 새 `pair`로 바뀐 경우(`pake.confirm` 때 다시 확인)에 나갑니다.
+- 오류 코드: `code_expired`(활성 코드 없음·만료·사용됨·세션 중 교체), `code_wrong`+`left`, `code_locked`(5회 소진, 코드 폐기), `code_busy`(다른 세션 진행 중), `bad_pake`(형식 오류). 0.1.5 브리지는 `pake`에 `bad_hello`로 답하고, 앱은 이것을 "브리지 업데이트 필요"로 안내합니다.
+- 상태: `pairings.json`의 행에 `code: {prs, attemptsLeft, offer}`가 붙습니다. `pair`와 `serve`는 `pairings.lock`(O_EXCL, 10초 넘은 잠금은 정리)으로 쓰기를 직렬화하고, 1초 안에 잠금을 못 잡으면 `code_busy`/`pairing_busy` 또는 CLI 오류로 끝냅니다.
+- 잠금 파일에는 잡은 프로세스의 토큰이 들어가고, 해제는 자기 토큰이 든 잠금만 지웁니다. 오래된 잠금은 `rename`으로 옮긴 뒤 내용을 확인하고, 그사이 다른 대기자가 잡은 새 잠금이었으면 되돌려 놓습니다. 되돌리는 동작은 원자적이지 않아서, 크래시로 남은 잠금이 있고 두세 프로세스가 같은 순간에 쓰는 드문 경우에는 쓰기 하나가 사라지거나 최대 10초 동안 busy가 날 수 있습니다.
+- 로그는 `pake start left=n`, `pake wrong left=n`, `pake rejected point left=n`(저차 점), `pake locked`, `pake expired`, `pake ok`, `pake busy`(다른 세션 진행 중), `pake busy (pairings locked)`, QR 경로의 `pairing busy device=…`(기기 키 앞 8자), 예상 밖 오류(잠금 파일 I/O 오류 등)의 `handshake failed: …`(1011로 끊음)만 남기고 코드·ISK·secret은 남기지 않습니다.
+- 정본은 `bridge/src/{cpace.ts,device-code.ts,code-pairing.ts}`이고, 시험 벡터는 `fixtures/cpace-vector.json`입니다(초안 B.1.1~B.1.5·B.1.10, 독립 Python 구현 `bridge/test/cpace_ref.py`와 대조한 의사 난수(고정 스트림)·경계 벡터, 코드 인코딩, 전체 거래). 다시 만들 때는 `bun test/gen-cpace-vector.ts`이고, 입력이 고정돼 있어 같은 파일이 다시 나옵니다.
 
 ## 3. 암호화 채널 `gjcm-e2ee-v1`
 
@@ -39,7 +81,7 @@
 
 - `D`는 기기의 장기 X25519 키(키체인·Keystore 보관), `H`는 호스트 장기 키, `Ec`·`Es`는 연결마다 새로 만드는 임시 키입니다.
 - 첫 페어링 때는 `proof = HMAC-SHA256(secret, "gjcm-pair-v1" ‖ D_pub ‖ Ec_pub)`를 보냅니다. 비밀값 자체는 전송하지 않습니다.
-- 오류 코드: `pairing_invalid`(코드 무효·사용됨·만료), `unknown_device`(페어링되지 않은 기기).
+- 오류 코드: `pairing_invalid`(코드 무효·사용됨·만료), `unknown_device`(페어링되지 않은 기기), `pairing_busy`(pairings.json 잠금을 1초 안에 못 잡음).
 
 ### 키 유도
 

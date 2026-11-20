@@ -88,6 +88,7 @@ sealed class BridgeException(message: String) : Exception(message) {
         when (code) {
             "unknown_device" -> "이 호스트와 페어링되지 않은 기기입니다. 다시 페어링하세요."
             "pairing_invalid" -> "페어링 코드가 만료됐거나 이미 사용됐습니다. 호스트에서 `gjcm-bridge pair`를 다시 실행하세요."
+            "pairing_busy" -> "호스트가 다른 페어링을 처리하는 중입니다. 잠시 후 다시 시도하세요."
             else -> "$detail ($code)"
         },
     )
@@ -97,6 +98,164 @@ sealed class BridgeException(message: String) : Exception(message) {
     class Disconnected : BridgeException("호스트와 연결이 끊겼습니다.")
     class NoReachableEndpoint : BridgeException("호스트에 연결할 수 없습니다. 같은 네트워크 또는 Tailscale에 연결돼 있는지 확인하세요.")
     class Closed(val code: Int, val reason: String) : BridgeException(reason.ifEmpty { "connection closed ($code)" })
+
+    /** A device-code pairing (gjcm-code-v1, #128) that failed; [failure] picks the message, [left] is the bridge's remaining attempts. */
+    class CodePairing(
+        val failure: CodeFailure,
+        val left: Int? = null,
+        address: CodeAddress? = null,
+        position: Int? = null,
+    ) : BridgeException(codeFailureMessage(failure, left, address, position))
+}
+
+/** App-side and bridge-side outcomes of a code pairing. `CODE_*` (except FORMAT/UNSUPPORTED), `BAD_PAKE` come from the bridge's `{t:"error"}`. */
+enum class CodeFailure {
+    CODE_FORMAT, CODE_UNSUPPORTED, CONNECT_TIMEOUT, CONNECT_REFUSED, UNREACHABLE, DISCONNECTED,
+    BRIDGE_OUTDATED, CODE_EXPIRED, CODE_WRONG, CODE_LOCKED, CODE_BUSY, BAD_PAKE, PAKE_FAILED,
+
+    /** The connection dropped or timed out after `pake.reply`: the bridge already spent one attempt. */
+    RESPONSE_LOST,
+
+    /** pake.ok succeeded but the pairing hello did not connect: the offer is kept and the user may retry. */
+    HELLO_FAILED,
+
+    /** The bridge refused the pairing hello (`pairing_invalid`): the code lapsed after pake.ok. */
+    HELLO_EXPIRED,
+}
+
+fun codeFailureMessage(failure: CodeFailure, left: Int? = null, address: CodeAddress? = null, position: Int? = null): String = when (failure) {
+    CodeFailure.CODE_FORMAT ->
+        if (position != null) "코드가 올바르지 않습니다. ${position}번째 글자를 확인하세요." else "코드가 올바르지 않습니다. 입력한 코드를 다시 확인하세요."
+    CodeFailure.CODE_UNSUPPORTED -> "첫 글자를 다시 확인하세요. 맞게 입력했다면 이 앱이 모르는 코드 형식이니 앱을 업데이트하세요."
+    CodeFailure.CONNECT_TIMEOUT ->
+        if (address == null) {
+            "호스트에 닿지 않습니다. 폰의 Tailscale이나 같은 Wi-Fi를 확인하세요."
+        } else if (address.range == CodeRange.TAILSCALE) {
+            "${address.ip}(Tailscale)에 닿지 않습니다. 폰의 Tailscale이나 같은 Wi-Fi를 확인하세요. 폰이 Tailscale 밖이면 호스트에서 `pair --code-lan`을 쓰거나 QR을 쓰세요."
+        } else {
+            "${address.ip}에 닿지 않습니다. 폰이 호스트와 같은 Wi-Fi에 있는지 확인하세요. 안 되면 QR을 쓰세요."
+        }
+    CodeFailure.CONNECT_REFUSED -> "호스트에서 `gjcm-bridge serve`가 실행 중인지, `pair`와 `serve`의 포트가 같은지 확인하세요."
+    CodeFailure.UNREACHABLE -> "호스트에 연결할 수 없습니다. 같은 네트워크 또는 Tailscale에 연결돼 있는지 확인하세요."
+    CodeFailure.DISCONNECTED -> "호스트와 연결이 끊겼습니다. 잠시 후 다시 시도하세요. 계속되면 호스트에서 `gjcm-bridge pair`를 다시 실행하세요."
+    CodeFailure.RESPONSE_LOST -> "호스트 응답이 끊겼습니다. 남은 시도가 줄었을 수 있습니다. 잠시 후 다시 시도하세요."
+    CodeFailure.BRIDGE_OUTDATED -> "호스트의 gjcm-bridge를 0.1.6 이상으로 업데이트하거나 QR을 쓰세요."
+    CodeFailure.CODE_EXPIRED -> "코드가 만료됐거나 이미 사용됐습니다. 호스트에서 `gjcm-bridge pair`를 다시 실행하세요."
+    CodeFailure.CODE_WRONG ->
+        "코드가 맞지 않습니다(가장 최근 `pair`의 코드인지 확인)." + (left?.let { " 남은 시도 ${it}회" } ?: "")
+    CodeFailure.CODE_LOCKED -> "틀린 시도가 많아 코드가 폐기됐습니다. `pair`를 다시 실행하세요."
+    CodeFailure.CODE_BUSY -> "다른 기기가 이 코드로 연결 중이거나 호스트가 다른 페어링을 처리하는 중입니다. 잠시 후 다시 시도하세요."
+    CodeFailure.BAD_PAKE -> "호스트와 프로토콜이 맞지 않습니다. 앱과 브리지를 업데이트하세요."
+    CodeFailure.PAKE_FAILED -> "호스트 확인에 실패했습니다. 코드를 다시 확인하세요."
+    CodeFailure.HELLO_FAILED -> "인증은 끝났지만 연결하지 못했습니다. 다시 시도를 누르세요."
+    CodeFailure.HELLO_EXPIRED -> "코드가 만료됐습니다. 호스트에서 `pair`를 다시 실행하세요."
+}
+
+/** The offer a device-code exchange delivered and the address that answered it (the pairing hello tries it first). */
+class CodeOffer(val offer: PairingOffer, val endpoint: String)
+
+/**
+ * A transport failure before the bridge answered. Only a refusal (ECONNREFUSED in the message or a cause) says the
+ * bridge is not listening; any other connect failure, like a timeout, means the address did not answer.
+ */
+fun connectionFailure(e: Exception, address: CodeAddress?): BridgeException.CodePairing = when {
+    e is java.net.SocketTimeoutException -> BridgeException.CodePairing(CodeFailure.CONNECT_TIMEOUT, address = address)
+    e is java.net.ConnectException ->
+        if (generateSequence<Throwable>(e) { it.cause }.take(8).any { it.message?.contains("ECONNREFUSED") == true }) {
+            BridgeException.CodePairing(CodeFailure.CONNECT_REFUSED, address = address)
+        } else {
+            BridgeException.CodePairing(CodeFailure.CONNECT_TIMEOUT, address = address)
+        }
+    e is BridgeException.Closed || e is BridgeException.Disconnected -> BridgeException.CodePairing(CodeFailure.DISCONNECTED)
+    else -> BridgeException.CodePairing(CodeFailure.UNREACHABLE)
+}
+
+/**
+ * Runs the CPace exchange of a device code over [transport] and returns the offer out of `pake.ok`.
+ * [onConfirming] fires once the bridge's first answer is in and the key confirmation goes out, with that answer's
+ * `left` (the attempts remaining after this one; null when the bridge did not send it). From then on a dropped or
+ * timed-out connection is [CodeFailure.RESPONSE_LOST]: the bridge already counted the attempt.
+ * The transport is always closed. [address] only shapes the connection-failure messages.
+ */
+suspend fun fetchOfferWithCode(
+    transport: FrameTransport,
+    code: String,
+    address: CodeAddress? = null,
+    onConfirming: (left: Int?) -> Unit = {},
+): PairingOffer {
+    var replied = false
+
+    fun failure(e: Exception): Exception = when {
+        e is CancellationException || e is BridgeException.CodePairing -> e
+        replied -> BridgeException.CodePairing(CodeFailure.RESPONSE_LOST)
+        else -> connectionFailure(e, address)
+    }
+
+    suspend fun expect(type: String): JsonElement {
+        val text = try {
+            (transport.receive() as? TransportMessage.Text)?.text
+        } catch (e: Exception) {
+            throw failure(e)
+        } ?: throw BridgeException.CodePairing(CodeFailure.BAD_PAKE)
+        val message = runCatching { parseJson(text) }.getOrNull() ?: throw BridgeException.CodePairing(CodeFailure.BAD_PAKE)
+        if (message["t"].str == type) return message
+        if (message["t"].str == "error") {
+            val remote = message["code"].str ?: ""
+            throw when (remote) {
+                "bad_hello" -> BridgeException.CodePairing(CodeFailure.BRIDGE_OUTDATED)
+                "code_expired" -> BridgeException.CodePairing(CodeFailure.CODE_EXPIRED)
+                "code_wrong" -> BridgeException.CodePairing(CodeFailure.CODE_WRONG, left = message["left"].int)
+                "code_locked" -> BridgeException.CodePairing(CodeFailure.CODE_LOCKED)
+                "code_busy" -> BridgeException.CodePairing(CodeFailure.CODE_BUSY)
+                "bad_pake" -> BridgeException.CodePairing(CodeFailure.BAD_PAKE)
+                else -> BridgeException.Rejected(remote.ifEmpty { "error" }, message["message"].str ?: "")
+            }
+        }
+        throw BridgeException.CodePairing(CodeFailure.BAD_PAKE)
+    }
+
+    fun send(json: JsonElement) {
+        try {
+            transport.send(TransportMessage.Text(json.encode()))
+        } catch (e: Exception) {
+            throw failure(e)
+        }
+    }
+
+    try {
+        val initiator = try {
+            CPaceInitiator(code.toByteArray(Charsets.UTF_8))
+        } catch (e: IllegalStateException) {
+            throw BridgeException.CodePairing(CodeFailure.PAKE_FAILED)
+        }
+        send(buildJsonObject {
+            put("t", "pake")
+            put("v", 1)
+            put("sid", B64Url.encode(initiator.sid))
+            put("ya", B64Url.encode(initiator.ya))
+        })
+        val reply = expect("pake.reply")
+        // The bridge spent an attempt when it sent this; whatever happens next is counted against the code.
+        replied = true
+        val yb = reply["yb"].str?.let(B64Url::decode)
+        val session = yb?.let { initiator.finish(it) } ?: throw BridgeException.CodePairing(CodeFailure.PAKE_FAILED)
+        onConfirming(reply["left"].int)
+        send(buildJsonObject {
+            put("t", "pake.confirm")
+            put("ta", B64Url.encode(session.ta))
+        })
+        val ok = expect("pake.ok")
+        val tb = ok["tb"].str?.let(B64Url::decode)
+        if (tb == null || !session.verifyTb(tb)) throw BridgeException.CodePairing(CodeFailure.PAKE_FAILED)
+        val plain = ok["box"].str?.let(B64Url::decode)?.let(session::open) ?: throw BridgeException.CodePairing(CodeFailure.PAKE_FAILED)
+        return try {
+            PairingOffer.fromJson(parseJson(String(plain, Charsets.UTF_8)))
+        } catch (e: Exception) {
+            throw BridgeException.CodePairing(CodeFailure.PAKE_FAILED)
+        }
+    } finally {
+        transport.close()
+    }
 }
 
 /** Phone side of the bridge protocol: handshake, encrypted request/response, event stream. */
@@ -307,6 +466,42 @@ class BridgeClient private constructor(private val transport: FrameTransport) {
                 throw e
             }
             return client
+        }
+
+        /**
+         * Device-code pairing, first half (gjcm-code-v1, #128): decodes [code], runs the CPace exchange on the address the
+         * code names and returns the verified offer. The pairing hello (the second half) is `CodePairingFlow`.
+         * [dial] overrides the address only (tests dial 127.0.0.1); the password is still the code. Failures are
+         * [BridgeException.CodePairing]: `code_format`, `code_unsupported`, `bridge_outdated` (a bridge older than the codes
+         * answers `bad_hello`), `pake_failed`, and the bridge's `code_wrong` (with `left`) and friends.
+         */
+        suspend fun pairWithCode(
+            code: String,
+            dial: String? = null,
+            timeoutMs: Long = 20_000,
+            onConfirming: (left: Int?) -> Unit = {},
+            openTransport: (String) -> FrameTransport = { OkHttpFrameTransport(it) },
+        ): CodeOffer {
+            val decoded = when (val result = DeviceCode.decode(code)) {
+                is DecodeResult.Ok -> result
+                is DecodeResult.Format -> throw BridgeException.CodePairing(CodeFailure.CODE_FORMAT, position = result.position)
+                DecodeResult.Unsupported -> throw BridgeException.CodePairing(CodeFailure.CODE_UNSUPPORTED)
+            }
+            val endpoint = dial ?: decoded.endpoint
+            val transport = try {
+                openTransport(endpoint)
+            } catch (e: IllegalArgumentException) {
+                throw BridgeException.CodePairing(CodeFailure.UNREACHABLE)
+            }
+            var replied = false
+            val offer = try {
+                withTimeout(timeoutMs) {
+                    fetchOfferWithCode(transport, decoded.code, decoded.address) { left -> replied = true; onConfirming(left) }
+                }
+            } catch (e: TimeoutCancellationException) {
+                throw if (replied) BridgeException.CodePairing(CodeFailure.RESPONSE_LOST) else BridgeException.CodePairing(CodeFailure.CONNECT_TIMEOUT, address = decoded.address)
+            }
+            return CodeOffer(offer, endpoint)
         }
 
         /** Tries a paired host's endpoints in order. A rejection ends the search: this device is no longer paired. */

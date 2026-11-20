@@ -45,13 +45,22 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.input.KeyboardCapitalization
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.OffsetMapping
+import androidx.compose.ui.text.input.TextFieldValue
+import androidx.compose.ui.text.input.TransformedText
+import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.window.DialogProperties
 import com.journeyapps.barcodescanner.ScanContract
 import com.journeyapps.barcodescanner.ScanOptions
 import dev.gajae.gjcmobile.R
+import dev.gajae.gjcmobile.core.CodeInputFormatter
 import dev.gajae.gjcmobile.core.PairingConfirmation
 import dev.gajae.gjcmobile.core.PairingOffer
 import dev.gajae.gjcmobile.core.pairingConfirmation
@@ -61,34 +70,25 @@ import kotlinx.coroutines.launch
 @Composable
 fun PairingScreen(model: AppModel, onClose: (() -> Unit)?) {
     var manual by remember { mutableStateOf("") }
-    var working by remember { mutableStateOf(false) }
-    var error by remember { mutableStateOf<String?>(null) }
+    var showLink by remember { mutableStateOf(false) }
+    // The device code's characters: uppercase, no separators. The hyphens are only drawn (CodeVisualTransformation).
+    var codeField by rememberSaveable(stateSaver = TextFieldValue.Saver) { mutableStateOf(TextFieldValue("")) }
+    val code = codeField.text
+    // Input past the longest code was refused (the field kept its value); said once, until the next accepted edit.
+    var codeTooLong by remember { mutableStateOf(false) }
     // A link waiting for the user's confirmation; saved so rotating the screen does not lose it.
     var pending by rememberSaveable { mutableStateOf<String?>(null) }
+    // Only the demo link download runs here; every pairing runs in the model so a rotation does not cancel it.
     val scope = rememberCoroutineScope()
+    // The pairing's progress and result are the model's: "연결 중" until the host answers, then "확인 중 · 남은 시도 n회".
+    val working = model.pairWorking
+    val stage = model.pairStage
+    val error = model.pairError
 
-    fun parseErrorMessage(e: PairingOffer.ParseException) = when (e.error) {
-        PairingOffer.ParseError.EXPIRED -> "QR 코드가 만료됐습니다. 호스트에서 다시 `gjcm-bridge pair`를 실행하세요."
-        PairingOffer.ParseError.UNSUPPORTED_VERSION -> "이 앱보다 새 버전의 브리지입니다. 앱을 업데이트하세요."
-        else -> "가재코드 페어링 QR이 아닙니다."
-    }
-
-    fun submit(text: String, replaceChangedKey: Boolean = false) {
-        if (working) return
-        working = true
-        error = null
-        scope.launch {
-            try {
-                model.pair(text.trim(), replaceChangedKey)
-                model.showPairing = false
-            } catch (e: PairingOffer.ParseException) {
-                error = parseErrorMessage(e)
-            } catch (e: Exception) {
-                error = e.userMessage()
-            } finally {
-                working = false
-            }
-        }
+    fun submitCode() {
+        val entered = CodeInputFormatter.format(code)
+        if (working || entered.chars.isEmpty() || entered.invalid != null) return
+        model.pairWithCode(entered.chars)
     }
 
     /**
@@ -100,14 +100,14 @@ fun PairingScreen(model: AppModel, onClose: (() -> Unit)?) {
         val offer = try {
             PairingOffer.parse(text)
         } catch (e: PairingOffer.ParseException) {
-            error = parseErrorMessage(e)
+            model.pairError = pairingParseMessage(e)
             return
         }
         if (pairingConfirmation(offer, model.hosts, fromLink) != PairingConfirmation.NONE) {
-            error = null
+            model.pairError = null
             pending = text.trim()
         } else {
-            submit(text)
+            model.pairWithLink(text)
         }
     }
 
@@ -115,10 +115,14 @@ fun PairingScreen(model: AppModel, onClose: (() -> Unit)?) {
         result.contents?.let { request(it, fromLink = false) }
     }
 
-    LaunchedEffect(model.pairingUrl) {
-        model.pairingUrl?.let {
-            model.pairingUrl = null
-            request(it, fromLink = true)
+    // A link that arrives while a pairing runs, or while a code's key change waits for an answer, stays in the model
+    // and is handled once that is over, so two confirmations never stack.
+    LaunchedEffect(model.pairingUrl, working, model.awaitingKeyApproval) {
+        if (!working && !model.awaitingKeyApproval) {
+            model.pairingUrl?.let {
+                model.pairingUrl = null
+                request(it, fromLink = true)
+            }
         }
     }
 
@@ -146,13 +150,44 @@ fun PairingScreen(model: AppModel, onClose: (() -> Unit)?) {
                 }
             },
             confirmButton = {
-                TextButton(onClick = { pending = null; submit(text, replaceChangedKey = keyChanged) }) {
+                TextButton(onClick = { pending = null; model.pairWithLink(text, replaceChangedKey = keyChanged) }) {
                     Text(if (keyChanged) "교체" else "연결")
                 }
             },
             dismissButton = { TextButton(onClick = { pending = null }) { Text("취소") } },
         )
     }
+
+    // Approving a replaced host key is a decision: only the buttons answer it, not a tap outside or the back key.
+    val keptOffer = model.codeOffer?.offer
+    // The code that produced a kept offer is spent; the field starts empty once the offer is cancelled.
+    LaunchedEffect(keptOffer != null) {
+        if (keptOffer != null) {
+            codeField = TextFieldValue("")
+            codeTooLong = false
+        }
+    }
+    if (model.awaitingKeyApproval && keptOffer != null) {
+        AlertDialog(
+            onDismissRequest = {},
+            properties = DialogProperties(dismissOnBackPress = false, dismissOnClickOutside = false),
+            title = { Text("호스트 교체") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("이미 등록된 호스트의 키가 바뀌었습니다", color = Palette.gajaeRed, style = MaterialTheme.typography.bodyMedium)
+                    Text("믿을 수 있는 호스트가 아니라면 교체하지 마세요. 교체하면 이후 지시문과 첨부 파일이 이 호스트로 갑니다.", style = MaterialTheme.typography.bodySmall)
+                    Text(keptOffer.name.ifBlank { keptOffer.hostId }, style = MaterialTheme.typography.titleSmall)
+                    keptOffer.endpoints.forEach {
+                        Text(it, style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace))
+                    }
+                }
+            },
+            confirmButton = { TextButton(onClick = { model.approveCodeKeyChange() }) { Text("교체") } },
+            dismissButton = { TextButton(onClick = { model.cancelCodePairing() }) { Text("취소") } },
+        )
+    }
+
+    val entered = CodeInputFormatter.format(code)
 
     Scaffold(
         containerColor = Palette.ink,
@@ -172,29 +207,83 @@ fun PairingScreen(model: AppModel, onClose: (() -> Unit)?) {
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
             Image(painterResource(R.drawable.mascot), contentDescription = null, modifier = Modifier.size(120.dp))
-            Button(
+            if (keptOffer == null) {
+                Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("호스트에 나온 코드 입력", style = MaterialTheme.typography.labelMedium, color = Palette.muted)
+                    OutlinedTextField(
+                        value = codeField,
+                        onValueChange = { input ->
+                            // Input that would pass the longest code is refused, keeping the previous value.
+                            val edited = CodeInputFormatter.edit(input.text, input.selection.start, input.selection.end)
+                            codeTooLong = edited == null
+                            if (edited != null) {
+                                // Already normal: keep the IME's composition, or the keyboard restarts on every key.
+                                codeField = if (edited.chars == input.text) {
+                                    input
+                                } else {
+                                    TextFieldValue(edited.chars, TextRange(edited.selStart, edited.selEnd))
+                                }
+                            }
+                        },
+                        visualTransformation = CodeVisualTransformation,
+                        placeholder = { Text("K7M2-9QXD-HP") },
+                        singleLine = true,
+                        isError = entered.invalid != null || codeTooLong,
+                        supportingText = CodeInputFormatter.message(entered.invalid, codeTooLong)?.let { message -> { Text(message) } },
+                        textStyle = MaterialTheme.typography.titleMedium.copy(fontFamily = FontFamily.Monospace),
+                        keyboardOptions = KeyboardOptions(
+                            capitalization = KeyboardCapitalization.Characters,
+                            keyboardType = KeyboardType.Ascii,
+                            autoCorrectEnabled = false,
+                        ),
+                        enabled = !working,
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                    Button(
+                        onClick = { submitCode() },
+                        enabled = entered.chars.isNotEmpty() && entered.invalid == null && !working,
+                        modifier = Modifier.fillMaxWidth(),
+                    ) { Text("연결") }
+                }
+                Text(
+                    "호스트 터미널에서 `gjcm-bridge pair`를 실행하면 15분 동안 한 번 쓸 수 있는 코드와 QR이 나옵니다.",
+                    style = MaterialTheme.typography.bodySmall, color = Palette.muted,
+                )
+            } else if (!model.awaitingKeyApproval) {
+                // The code was accepted and only the connection is left: retry it or give it up. A new code is
+                // entered after cancelling, so "연결" never means two things.
+                Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(
+                        "${keptOffer.name.ifBlank { keptOffer.hostId }} 인증은 끝났고 연결만 남았습니다.",
+                        style = MaterialTheme.typography.bodyMedium, color = Palette.cream,
+                    )
+                    Button(onClick = { model.retryCodePairing() }, enabled = !working, modifier = Modifier.fillMaxWidth()) { Text("다시 시도") }
+                    OutlinedButton(onClick = { model.cancelCodePairing() }, enabled = !working, modifier = Modifier.fillMaxWidth()) { Text("취소") }
+                }
+            }
+            HorizontalDivider(color = Palette.shellLine)
+            OutlinedButton(
                 onClick = {
                     scanner.launch(ScanOptions().setDesiredBarcodeFormats(ScanOptions.QR_CODE).setPrompt("호스트의 QR 코드를 비추세요").setBeepEnabled(false).setOrientationLocked(false))
                 },
                 enabled = !working,
                 modifier = Modifier.fillMaxWidth(),
             ) { Text("QR 코드 스캔") }
-            Text(
-                "호스트 터미널에서 `gjcm-bridge pair`를 실행하면 10분 동안 한 번 쓸 수 있는 QR 코드가 나옵니다.",
-                style = MaterialTheme.typography.bodySmall, color = Palette.muted,
-            )
-            Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                Text("또는 링크 붙여 넣기", style = MaterialTheme.typography.labelMedium, color = Palette.muted)
-                OutlinedTextField(
-                    value = manual,
-                    onValueChange = { manual = it },
-                    placeholder = { Text("gjcm://pair?o=…") },
-                    textStyle = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri, autoCorrectEnabled = false),
-                    modifier = Modifier.fillMaxWidth(),
-                )
-                Button(onClick = { request(manual, fromLink = false) }, enabled = manual.isNotEmpty() && !working) { Text("연결") }
+            OutlinedButton(onClick = { showLink = !showLink }, enabled = !working, modifier = Modifier.fillMaxWidth()) { Text("링크 붙여 넣기") }
+            if (showLink) {
+                Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedTextField(
+                        value = manual,
+                        onValueChange = { manual = it },
+                        placeholder = { Text("gjcm://pair?o=…") },
+                        textStyle = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri, autoCorrectEnabled = false),
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                    Button(onClick = { request(manual, fromLink = false) }, enabled = manual.isNotEmpty() && !working) { Text("연결") }
+                }
             }
+            stage?.let { Text(it, style = MaterialTheme.typography.bodyMedium, color = Palette.cream) }
             if (working) CircularProgressIndicator(color = Palette.cream)
             error?.let { Text(it, color = Palette.gajaeRed, style = MaterialTheme.typography.bodySmall) }
             // Builds without a demo host (GJCM_DEMO_OFFER_URL unset) have no demo button.
@@ -203,12 +292,12 @@ fun PairingScreen(model: AppModel, onClose: (() -> Unit)?) {
             OutlinedButton(
                 onClick = {
                     if (working) return@OutlinedButton
-                    error = null
+                    model.pairError = null
                     scope.launch {
                         val link = try {
                             model.demoPairingLink()
                         } catch (e: Exception) {
-                            error = DEMO_FAILURE
+                            model.pairError = DEMO_FAILURE
                             return@launch
                         }
                         request(link, fromLink = false)
@@ -229,5 +318,22 @@ fun PairingScreen(model: AppModel, onClose: (() -> Unit)?) {
             }
             Spacer(Modifier.height(24.dp))
         }
+    }
+}
+
+/**
+ * Draws the hyphen after every four characters of the raw code, so the field's text (and the cursor in it) never
+ * contains a hyphen; the offset mapping is [CodeInputFormatter]'s pure functions.
+ */
+private object CodeVisualTransformation : VisualTransformation {
+    override fun filter(text: AnnotatedString): TransformedText {
+        val raw = text.text
+        return TransformedText(
+            AnnotatedString(CodeInputFormatter.displayText(raw)),
+            object : OffsetMapping {
+                override fun originalToTransformed(offset: Int): Int = CodeInputFormatter.originalToTransformed(offset)
+                override fun transformedToOriginal(offset: Int): Int = CodeInputFormatter.transformedToOriginal(offset, raw.length)
+            },
+        )
     }
 }

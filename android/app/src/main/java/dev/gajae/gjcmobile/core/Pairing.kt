@@ -43,6 +43,17 @@ data class PairingOffer(
             } catch (e: Exception) {
                 throw ParseException(ParseError.MALFORMED)
             }
+            val offer = fromJson(json)
+            val expiry = parseInstant(offer.exp)
+            if (expiry != null && expiry.isBefore(now)) throw ParseException(ParseError.EXPIRED)
+            return offer
+        }
+
+        /**
+         * The fields every offer needs, whether it came from a QR/link or out of a code's `pake.ok` box (the bridge's
+         * `checkOffer`). The expiry is not compared with the phone's clock here: the bridge decides it when the pairing is used.
+         */
+        fun fromJson(json: JsonElement): PairingOffer {
             val offer = try {
                 PairingOffer(
                     v = json["v"].int!!,
@@ -58,11 +69,11 @@ data class PairingOffer(
                 throw ParseException(ParseError.MALFORMED)
             }
             if (offer.v != 1) throw ParseException(ParseError.UNSUPPORTED_VERSION)
-            if (B64Url.decode(offer.hostKey)?.size != 32 || B64Url.decode(offer.secret)?.size != 32 || offer.endpoints.isEmpty()) {
+            if (offer.hostId.isEmpty() || offer.pairingId.isEmpty() || offer.exp.isEmpty() || offer.endpoints.any { it.isEmpty() } ||
+                B64Url.decode(offer.hostKey)?.size != 32 || B64Url.decode(offer.secret)?.size != 32 || offer.endpoints.isEmpty()
+            ) {
                 throw ParseException(ParseError.MALFORMED)
             }
-            val expiry = parseInstant(offer.exp)
-            if (expiry != null && expiry.isBefore(now)) throw ParseException(ParseError.EXPIRED)
             return offer
         }
     }

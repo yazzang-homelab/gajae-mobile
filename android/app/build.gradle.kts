@@ -5,7 +5,7 @@ plugins {
 }
 
 val appVersionCode = (project.findProperty("versionCode") as String?)?.toInt() ?: 1
-val appVersionName = (project.findProperty("versionName") as String?) ?: "1.0.6"
+val appVersionName = (project.findProperty("versionName") as String?) ?: "1.0.7"
 
 android {
     namespace = "dev.gajae.gjcmobile"
@@ -45,6 +45,15 @@ android {
     testOptions {
         unitTests.all {
             it.systemProperty("gjcm.fixtures", rootProject.file("../fixtures").absolutePath)
+            // One line per test class in the CI log, so a run shows which suites actually ran.
+            it.testLogging { events("failed", "skipped") }
+            it.afterSuite(
+                KotlinClosure2<TestDescriptor, TestResult, Unit>({ suite, result ->
+                    if (suite.className != null) {
+                        println("${suite.className}: ${result.resultType} (${result.testCount} tests, ${result.failedTestCount} failed, ${result.skippedTestCount} skipped)")
+                    }
+                }),
+            )
         }
     }
 }

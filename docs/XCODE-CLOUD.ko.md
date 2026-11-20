@@ -74,7 +74,7 @@ Xcode → Settings(⌘,) → Accounts → `+` → Apple ID. 로그인 후 팀 �
 | Actions | **Build – iOS**, Scheme `GjcMobile`, Platform: Any iOS Simulator Device |
 | Post-Actions | 없음 |
 
-`ios/Core`의 단위 테스트(`swift test`)는 앱 스킴에 들어 있지 않아 Xcode Cloud에서 돌지 않습니다. Linux에서 `cd ios/Core && swift test`로 확인합니다.
+`ios/Core`의 단위 테스트(`swift test`)는 앱 스킴에 들어 있지 않아 Xcode Cloud에서 돌지 않습니다. macOS에서 `cd ios/Core && swift test`로 확인하며, CI(macos-15)가 같은 명령을 돌립니다. 코드 페어링(CPace) 시험 벡터도 macOS CI에서 돌고, Linux에서는 확인하지 않았습니다.
 
 ## 5. 첫 빌드
 

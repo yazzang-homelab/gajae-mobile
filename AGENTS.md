@@ -47,4 +47,4 @@
 
 - 브리지: `cd bridge && bun test && bun x tsc --noEmit -p .`
 - Android: `cd android && ./gradlew :app:testDebugUnitTest :app:assembleDebug`
-- iOS: `cd ios/Core && swift test`(Swift 6 툴체인이 있으면 Linux에서도 실행됩니다). 앱은 CI(`ci` 워크플로, macOS)나 Xcode Cloud로 확인합니다.
+- iOS: `cd ios/Core && swift test`(Swift 6. CI는 macOS에서 돌리며 Linux에서는 확인하지 않았습니다). 앱은 CI(`ci` 워크플로, macOS)나 Xcode Cloud로 확인합니다.

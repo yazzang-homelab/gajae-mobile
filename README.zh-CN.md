@@ -91,7 +91,7 @@ bunx gjcm-bridge pair
 ```bash
 cd bridge && bun test && bun x tsc --noEmit -p .            # 桥接器
 cd android && ./gradlew :app:testDebugUnitTest :app:assembleDebug   # Android
-cd ios/Core && swift test                                    # iOS 核心（macOS 或 Linux，Swift 6）
+cd ios/Core && swift test                                    # iOS 核心（Swift 6；CI 在 macOS 上运行，未在 Linux 上验证）
 ```
 
 iOS 应用由 CI（macOS）构建验证。欢迎先提 issue，再向 `dev` 发起 PR，准入与提交规则见 [CONTRIBUTING.md](CONTRIBUTING.md)。

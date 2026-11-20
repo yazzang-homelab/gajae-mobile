@@ -29,16 +29,31 @@ public struct PairingOffer: Codable, Equatable, Sendable {
             let data = Data(base64URL: encoded)
         else { throw ParseError.missingOffer }
         guard let offer = try? JSONDecoder().decode(PairingOffer.self, from: data) else { throw ParseError.malformed }
-        guard offer.v == 1 else { throw ParseError.unsupportedVersion }
-        guard let hostKey = Data(base64URL: offer.hostKey), hostKey.count == 32,
-              let secret = Data(base64URL: offer.secret), secret.count == 32,
-              !offer.endpoints.isEmpty
+        return try offer.validated(checkingExpiryAt: now)
+    }
+
+    /// Decodes an offer that came out of a device code's sealed box (`pake.ok`) and validates it. The expiry is not
+    /// compared with the phone's clock: the bridge decides it when the pairing is used.
+    public static func parse(json: Data) throws -> PairingOffer {
+        guard let offer = try? JSONDecoder().decode(PairingOffer.self, from: json) else { throw ParseError.malformed }
+        return try offer.validated(checkingExpiryAt: nil)
+    }
+
+    /// The checks every offer needs, whether it came from a QR/link or from a code: version, required fields,
+    /// 32-byte keys, at least one endpoint. `now` compares the expiry with a clock; nil skips that check.
+    public func validated(checkingExpiryAt now: Date?) throws -> PairingOffer {
+        guard v == 1 else { throw ParseError.unsupportedVersion }
+        guard !hostId.isEmpty, !pairingId.isEmpty, !exp.isEmpty,
+              let hostKeyBytes = Data(base64URL: hostKey), hostKeyBytes.count == 32,
+              let secretBytes = Data(base64URL: secret), secretBytes.count == 32,
+              !endpoints.isEmpty, endpoints.allSatisfy({ !$0.isEmpty })
         else { throw ParseError.malformed }
-        if let expiry = ISO8601DateFormatter.withFractions.date(from: offer.exp) ?? ISO8601DateFormatter().date(from: offer.exp),
+        if let now,
+           let expiry = ISO8601DateFormatter.withFractions.date(from: exp) ?? ISO8601DateFormatter().date(from: exp),
            expiry < now {
             throw ParseError.expired
         }
-        return offer
+        return self
     }
 }
 
@@ -76,6 +91,23 @@ extension PairingOffer {
     }
 }
 
+/// Endpoint identity for de-duplication: scheme and host in lower case, the port (defaulting to the scheme's own) and
+/// the path, so `ws://h/ws` and `ws://H:80/ws` are one address. Text that is not a URL compares as itself.
+public func endpointKey(_ endpoint: String) -> String {
+    guard let parts = URLComponents(string: endpoint), let scheme = parts.scheme?.lowercased(), let host = parts.host?.lowercased() else {
+        return endpoint
+    }
+    let defaultPort = ["ws": 80, "http": 80, "wss": 443, "https": 443][scheme]
+    let port = parts.port ?? defaultPort
+    return "\(scheme)://\(host):\(port.map(String.init) ?? "")\(parts.path.isEmpty ? "/" : parts.path)"
+}
+
+/// Each address once, in order; the first spelling wins.
+public func endpointsDeduplicated(_ endpoints: [String]) -> [String] {
+    var seen = Set<String>()
+    return endpoints.filter { seen.insert(endpointKey($0)).inserted }
+}
+
 /// A host this phone has paired with. Persisted in the Keychain by the app.
 public struct PairedHost: Codable, Hashable, Identifiable, Sendable {
     public var id: String { hostId }
@@ -105,8 +137,8 @@ public struct PairedHost: Codable, Hashable, Identifiable, Sendable {
 
     /// Endpoint that last worked first, then the advertised order.
     public var endpointsToTry: [String] {
-        guard let lastEndpoint else { return endpoints }
-        return [lastEndpoint] + endpoints.filter { $0 != lastEndpoint }
+        guard let lastEndpoint else { return endpointsDeduplicated(endpoints) }
+        return endpointsDeduplicated([lastEndpoint] + endpoints)
     }
 
     /// Directory a new chat starts in: a path picked for this chat, else this host's saved default, else the

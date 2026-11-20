@@ -17,7 +17,7 @@ final class BridgeLiveTests: XCTestCase {
         if let home { try? FileManager.default.removeItem(at: home) }
     }
 
-    private func startBridge(bridgeDir: String) throws -> (endpoint: URL, hostKey: Data, pairing: (id: String, secret: Data)) {
+    private func startBridge(bridgeDir: String) throws -> (endpoint: URL, hostId: String, hostKey: Data, pairing: (id: String, secret: Data)) {
         let home = FileManager.default.temporaryDirectory.appendingPathComponent("gjcm-swift-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
         self.home = home
@@ -48,11 +48,12 @@ final class BridgeLiveTests: XCTestCase {
         let port = try XCTUnwrap(try JSONDecoder().decode(JSONValue.self, from: line)["port"]?.int)
         let hostJSON = try JSONDecoder().decode(JSONValue.self, from: Data(contentsOf: home.appendingPathComponent("host.json")))
         let hostKey = try XCTUnwrap(hostJSON["publicKey"]?.string.flatMap(Data.init(base64URL:)))
+        let hostId = try XCTUnwrap(hostJSON["hostId"]?.string)
         // Same record `gjcm-bridge pair` writes.
         let secret = Data((0 ..< 32).map { _ in UInt8.random(in: 0 ... 255) })
         let pairing: JSONValue = [["id": "swift", "secret": .string(secret.base64URL), "expiresAt": "2999-01-01T00:00:00.000Z"]]
         try JSONEncoder().encode(pairing).write(to: home.appendingPathComponent("pairings.json"))
-        return (URL(string: "ws://127.0.0.1:\(port)/ws")!, hostKey, ("swift", secret))
+        return (URL(string: "ws://127.0.0.1:\(port)/ws")!, hostId, hostKey, ("swift", secret))
     }
 
     func testPairPromptPermissionAttachmentsOverRealBridge() async throws {
@@ -119,5 +120,57 @@ final class BridgeLiveTests: XCTestCase {
             XCTAssertTrue(message.contains("256KiB"), message)
         }
         await client.close()
+    }
+
+    /// Device-code pairing (gjcm-code-v1, #128) against the real bridge: the row is what `gjcm-bridge pair` writes with
+    /// a code, the address in the code is only decoded (the test dials 127.0.0.1), and the password is the code.
+    func testCodePairingOverRealBridge() async throws {
+        guard let bridgeDir = ProcessInfo.processInfo.environment["GJCM_BRIDGE_DIR"] else {
+            throw XCTSkip("set GJCM_BRIDGE_DIR to run the live bridge test")
+        }
+        let bridge = try startBridge(bridgeDir: bridgeDir)
+        let code = try DeviceCode.encode(ip: "100.100.1.2", port: 7787, secret: 0x5A5A5)
+        let secret = Data((0 ..< 32).map { _ in UInt8.random(in: 0 ... 255) })
+        let offer: JSONValue = [
+            "v": 1, "hostId": .string(bridge.hostId), "name": "swift-host", "hostKey": .string(bridge.hostKey.base64URL),
+            "endpoints": ["ws://100.100.1.2:7787/ws"], "pairingId": "swiftcode",
+            "secret": .string(secret.base64URL), "exp": "2999-01-01T00:00:00.000Z",
+        ]
+        let row: JSONValue = [[
+            "id": "swiftcode", "secret": .string(secret.base64URL), "expiresAt": "2999-01-01T00:00:00.000Z",
+            "code": ["prs": .string(code), "attemptsLeft": 5, "offer": offer],
+        ]]
+        try JSONEncoder().encode(row).write(to: try XCTUnwrap(home).appendingPathComponent("pairings.json"))
+
+        // A wrong code is told apart and counts down.
+        let wrong = try DeviceCode.encode(ip: "100.100.1.2", port: 7787, secret: 0x11111)
+        do {
+            _ = try await BridgeClient.pairWithCode(wrong, dial: bridge.endpoint, device: DeviceIdentity(), deviceName: "swift-test")
+            XCTFail("expected code_wrong")
+        } catch let error as CodePairingError {
+            XCTAssertEqual(error, .remote(code: "code_wrong", left: 4))
+        }
+
+        let device = DeviceIdentity()
+        let paired = try await BridgeClient.pairWithCode(code, dial: bridge.endpoint, device: device, deviceName: "swift-test")
+        XCTAssertEqual(paired.offer.hostId, bridge.hostId)
+        XCTAssertEqual(paired.offer.name, "swift-host")
+        XCTAssertEqual(paired.offer.endpoints, ["ws://100.100.1.2:7787/ws"])
+        XCTAssertNotEqual(paired.offer.secret, secret.base64URL, "the secret is rotated when the code is used")
+        let info = try await paired.client.hostInfo()
+        XCTAssertEqual(info.agentInfo?.name, "fake-gjc")
+        await paired.client.close()
+
+        // The code is single use.
+        do {
+            _ = try await BridgeClient.pairWithCode(code, dial: bridge.endpoint, device: DeviceIdentity(), deviceName: "swift-test")
+            XCTFail("expected code_expired")
+        } catch let error as CodePairingError {
+            XCTAssertEqual(error, .remote(code: "code_expired", left: nil))
+        }
+        // The paired device reconnects without a pairing proof.
+        let again = try await BridgeClient.connect(url: bridge.endpoint, device: device, hostKey: bridge.hostKey, deviceName: "swift-test")
+        _ = try await again.hostInfo()
+        await again.close()
     }
 }

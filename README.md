@@ -91,7 +91,7 @@ Design documents are in Korean: [architecture and protocol](docs/ARCHITECTURE.ko
 ```bash
 cd bridge && bun test && bun x tsc --noEmit -p .            # bridge
 cd android && ./gradlew :app:testDebugUnitTest :app:assembleDebug   # Android
-cd ios/Core && swift test                                    # iOS core (macOS or Linux, Swift 6)
+cd ios/Core && swift test                                    # iOS core (Swift 6; CI runs it on macOS, Linux is not verified)
 ```
 
 CI builds the iOS app on macOS. Contributions go through an issue and a pull request against `dev`; see [CONTRIBUTING.md](CONTRIBUTING.md) for the intake and submission gates.

@@ -3,14 +3,13 @@ name: play-submit
 # Uploads the signed AAB from an `android` workflow run to Google Play and releases it on a track with the
 # service account in PLAY_SERVICE_ACCOUNT_JSON (tools/play_submit.py). Build the AAB first with
 # `gh workflow run android.yml --ref main`. submit=false only prints the tracks and the plan.
+# The release is named "<version code> (<versionName>)" like Play Console's default; versionName is read from
+# android/app/build.gradle.kts at the commit the android run built (android.yml does not override it).
 on:
   workflow_dispatch:
     inputs:
       run_id:
         description: Run ID of the `android` workflow whose gjc-mobile-release artifact to upload
-        required: true
-      version_name:
-        description: versionName of the build, e.g. 1.0.7 (the release is named "<version code> (<versionName>)" like Play Console does)
         required: true
       notes_ko:
         description: Release notes (Korean, up to 500 characters)
@@ -61,13 +60,22 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           RUN_ID: ${{ inputs.run_id }}
+          TRACK: ${{ inputs.track }}
         run: |
-          read -r name conclusion number branch sha <<<"$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID" \
-            --jq '[.name, .conclusion, .run_number, .head_branch, .head_sha] | @tsv')"
-          echo "android run $RUN_ID: $name #$number $conclusion on $branch $sha"
-          [ "$name" = android ] || { echo "run $RUN_ID is not the android workflow"; exit 1; }
+          read -r workflow conclusion number branch sha <<<"$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID" \
+            --jq '[.path, .conclusion, .run_number, .head_branch, .head_sha] | @tsv')"
+          echo "run $RUN_ID: $workflow #$number $conclusion on $branch $sha"
+          [ "$workflow" = .github/workflows/android.yml ] || { echo "run $RUN_ID is not the android workflow"; exit 1; }
           [ "$conclusion" = success ] || { echo "run $RUN_ID did not succeed"; exit 1; }
+          if [ "$TRACK" = production ] && [ "$branch" != main ]; then
+            echo "production releases are built from main; run $RUN_ID built $branch"; exit 1
+          fi
+          version_name=$(gh api "repos/$GITHUB_REPOSITORY/contents/android/app/build.gradle.kts?ref=$sha" --jq .content \
+            | base64 -d | sed -n 's/^val appVersionName = .* ?: "\([^"]*\)"$/\1/p')
+          [ -n "$version_name" ] || { echo "could not read appVersionName at $sha"; exit 1; }
+          echo "versionName $version_name, version code ${number}000"
           echo "version_code=${number}000" >> "$GITHUB_OUTPUT"
+          echo "release_name=${number}000 ($version_name)" >> "$GITHUB_OUTPUT"
 
       - uses: actions/download-artifact@v4
         with:
@@ -89,7 +97,7 @@ jobs:
           VERSION_CODE: ${{ steps.run.outputs.version_code }}
           TRACK: ${{ inputs.track }}
           STATUS: ${{ inputs.status }}
-          RELEASE_NAME: ${{ steps.run.outputs.version_code }} (${{ inputs.version_name }})
+          RELEASE_NAME: ${{ steps.run.outputs.release_name }}
           NOTES_KO: ${{ inputs.notes_ko }}
           NOTES_EN: ${{ inputs.notes_en }}
           NOTES_ZH: ${{ inputs.notes_zh }}

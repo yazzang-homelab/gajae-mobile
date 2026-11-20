@@ -3,16 +3,17 @@
 
 Steps, all inside one edit so nothing is visible until the final commit:
   1. open an edit and print every track's current releases
-  2. stop unless the AAB's expected version code is above every version code already on a track
+  2. stop unless the AAB's expected version code is above every version code already uploaded or on a track
   3. upload the AAB and check that Play read the expected version code and the same SHA-256
   4. put a release (name, status, release notes ko-KR / en-US / zh-CN) on `--track`
-  5. validate and commit the edit (a `completed` release on production goes to Google review)
+  5. validate and commit the edit (a `completed` release on production goes to Google review). If earlier
+     changes are still in Google review the commit fails instead of cancelling and resubmitting them.
 
 Without --submit it stops after step 2 and deletes the edit; nothing is changed. Any failure after
 the edit is opened deletes the edit, so a failed run leaves Play as it was.
 
 Usage: play_submit.py --key-file service-account.json --package dev.gajae.gjcmobile --aab app-release.aab \
-                      --version-code 141000 --track production --status completed --release-name 1.0.7 \
+                      --version-code 141000 --track production --status completed --release-name '141000 (1.0.7)' \
                       --notes-ko TEXT --notes-en TEXT [--notes-zh TEXT] [--submit]
 """
 import argparse
@@ -119,7 +120,8 @@ def main() -> None:
                         help="version code the AAB was built with (android.yml run_number + 000)")
     parser.add_argument("--track", required=True, choices=TRACKS)
     parser.add_argument("--status", required=True, choices=("completed", "draft"))
-    parser.add_argument("--release-name", required=True, help="release name shown in Play Console, e.g. 1.0.7")
+    parser.add_argument("--release-name", required=True,
+                        help="release name shown in Play Console, e.g. '141000 (1.0.7)' like Play's own default")
     parser.add_argument("--notes-ko", required=True)
     parser.add_argument("--notes-en", required=True)
     parser.add_argument("--notes-zh", default="")
@@ -139,9 +141,11 @@ def main() -> None:
     committed = False
     try:
         highest = print_tracks(play.call("GET", f"/edits/{edit}/tracks").get("tracks", []))
+        bundles = play.call("GET", f"/edits/{edit}/bundles").get("bundles", [])
+        highest = max([highest] + [int(b["versionCode"]) for b in bundles])
         if args.version_code <= highest:
-            raise PlayError(f"version code {args.version_code} is not above {highest}, already on a track")
-        print(f"plan: {args.track} <- {args.release_name} ({args.version_code}) {args.status}, "
+            raise PlayError(f"version code {args.version_code} is not above {highest}, already uploaded")
+        print(f"plan: {args.track} <- {args.release_name} {args.status}, version code {args.version_code}, "
               f"notes {', '.join(n['language'] for n in notes)}")
         if not args.submit:
             print("dry run: nothing uploaded (submit=false)")
@@ -159,12 +163,9 @@ def main() -> None:
                    "status": args.status, "releaseNotes": notes}
         play.call("PUT", f"/edits/{edit}/tracks/{args.track}", {"track": args.track, "releases": [release]})
         play.call("POST", f"/edits/{edit}:validate")
-        play.call("POST", f"/edits/{edit}:commit")
+        play.call("POST", f"/edits/{edit}:commit?changesInReviewBehavior=ERROR_IF_IN_REVIEW")
         committed = True
-        print(f"committed: {args.track} {args.release_name} ({args.version_code}) {args.status}")
-        check = play.call("POST", "/edits", {})["id"]
-        print_tracks(play.call("GET", f"/edits/{check}/tracks").get("tracks", []))
-        play.call("DELETE", f"/edits/{check}")
+        print(f"committed: {args.track} {args.release_name} {args.status}")
     except PlayError as exc:
         sys.exit(str(exc))
     finally:
@@ -174,6 +175,13 @@ def main() -> None:
                 print("edit deleted; Play is unchanged")
             except PlayError as exc:
                 print(f"could not delete edit {edit}: {exc}", file=sys.stderr)
+    # The release is already committed; a failure here only loses the printout.
+    try:
+        check = play.call("POST", "/edits", {})["id"]
+        print_tracks(play.call("GET", f"/edits/{check}/tracks").get("tracks", []))
+        play.call("DELETE", f"/edits/{check}")
+    except PlayError as exc:
+        print(f"warning: committed, but reading the tracks back failed: {exc}", file=sys.stderr)
 
 
 if __name__ == "__main__":

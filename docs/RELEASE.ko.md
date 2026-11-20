@@ -95,12 +95,15 @@ gh workflow run android.yml --ref <브랜치>
 ### Google Play 출시
 
 ```bash
-gh workflow run android.yml --ref main            # 서명된 AAB, 실행 번호를 기억합니다
-gh workflow run play-submit.yml -f run_id=<android 실행 ID> -f version_name=1.0.7 \
+gh workflow run android.yml --ref main            # 서명된 AAB
+gh run list -w android --branch main -L 1         # 끝난 실행의 ID(databaseId, 실행 번호와 다름)
+gh workflow run play-submit.yml -f run_id=<실행 ID> \
   -f notes_ko=… -f notes_en=… [-f notes_zh=…] [-f track=production] [-f status=completed] -f submit=true
 ```
 
-`tools/play_submit.py`가 Android Publisher API v3 edit 하나 안에서 차례로 합니다. 트랙 현황을 출력하고, 버전 코드(`android` 실행 번호 + `000`)가 모든 트랙의 버전 코드보다 큰지 확인하고, AAB를 올려 Play가 읽은 버전 코드와 SHA-256을 맞춰 보고, 트랙에 출시(이름 `<버전 코드> (<versionName>)`, 출시 노트 ko-KR·en-US·zh-CN)를 넣은 뒤 검증·commit합니다. `submit=false`는 트랙 현황과 계획만 출력합니다. 중간에 실패하면 edit를 지우므로 Play는 그대로입니다. `status=completed`로 프로덕션에 올리면 Google 검토를 거쳐 공개되고, `draft`는 Play Console에서 직접 출시할 때까지 기다립니다. 출시 노트는 언어별 500자까지입니다.
+워크플로는 그 실행이 `android.yml`이고 성공했는지, 프로덕션이면 `main`에서 빌드했는지 확인합니다. 버전 코드는 실행 번호 + `000`, versionName은 그 커밋의 `android/app/build.gradle.kts` 기본값에서 읽어 출시 이름을 `<버전 코드> (<versionName>)`로 붙입니다(Play Console 기본 이름과 같은 형식).
+
+`tools/play_submit.py`가 Android Publisher API v3 edit 하나 안에서 차례로 합니다. 트랙 현황을 출력하고, 버전 코드가 이미 올린 번들·모든 트랙의 버전 코드보다 큰지 확인하고, AAB를 올려 Play가 읽은 버전 코드와 SHA-256을 맞춰 보고, 트랙에 출시(출시 노트 ko-KR·en-US·zh-CN)를 넣은 뒤 검증·commit합니다. 앞서 낸 변경이 아직 Google 검토 중이면 commit이 실패합니다(검토를 취소하고 다시 내지 않습니다). `submit=false`는 트랙 현황과 계획만 출력합니다. 중간에 실패하면 edit를 지우므로 Play는 그대로입니다. `status=completed`로 프로덕션에 올리면 Google 검토를 거쳐 공개되고, `draft`는 Play Console에서 직접 출시할 때까지 기다립니다. 출시 노트는 언어별 500자까지입니다.
 
 | 시크릿 | 내용 |
 |---|---|

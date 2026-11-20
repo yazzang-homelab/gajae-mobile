@@ -1,0 +1,121 @@
+name: play-submit
+
+# Uploads the signed AAB from an `android` workflow run to Google Play and releases it on a track with the
+# service account in PLAY_SERVICE_ACCOUNT_JSON (tools/play_submit.py). Build the AAB first with
+# `gh workflow run android.yml --ref main`. submit=false only prints the tracks and the plan.
+# The release is named "<version code> (<versionName>)" like Play Console's default; versionName is read from
+# android/app/build.gradle.kts at the commit the android run built (android.yml does not override it).
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: Run ID of the `android` workflow whose gjc-mobile-release artifact to upload
+        required: true
+      notes_ko:
+        description: Release notes (Korean, up to 500 characters)
+        required: true
+      notes_en:
+        description: Release notes (English, up to 500 characters)
+        required: true
+      notes_zh:
+        description: Release notes (Simplified Chinese, up to 500 characters)
+        required: false
+        default: ""
+      track:
+        description: Play track
+        type: choice
+        options: [production, beta, alpha, internal]
+        default: production
+      status:
+        description: completed sends the release to Google review; draft waits in Play Console
+        type: choice
+        options: [completed, draft]
+        default: completed
+      submit:
+        description: Upload, release and commit (false = print tracks and plan only)
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: play-submit
+  cancel-in-progress: false
+
+jobs:
+  submit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install cryptography
+
+      - name: Check the android run
+        id: run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ inputs.run_id }}
+          TRACK: ${{ inputs.track }}
+        run: |
+          read -r workflow conclusion number branch sha event <<<"$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID" \
+            --jq '[.path, .conclusion, .run_number, .head_branch, .head_sha, .event] | @tsv')"
+          echo "run $RUN_ID: $workflow #$number $conclusion on $branch $sha"
+          [ "$workflow" = .github/workflows/android.yml ] || { echo "run $RUN_ID is not the android workflow"; exit 1; }
+          [ "$conclusion" = success ] || { echo "run $RUN_ID did not succeed"; exit 1; }
+          # android.yml signs a release only for a manual run or a push to `playstore`.
+          if [ "$event" != workflow_dispatch ] && [ "$branch" != playstore ]; then
+            echo "run $RUN_ID ($event on $branch) has no signed release; run android.yml manually"; exit 1
+          fi
+          if [ "$TRACK" = production ] && [ "$branch" != main ]; then
+            echo "production releases are built from main; run $RUN_ID built $branch"; exit 1
+          fi
+          version_name=$(gh api "repos/$GITHUB_REPOSITORY/contents/android/app/build.gradle.kts?ref=$sha" --jq .content \
+            | base64 -d | sed -n 's/^val appVersionName = .* ?: "\([^"]*\)"$/\1/p')
+          [ -n "$version_name" ] || { echo "could not read appVersionName at $sha"; exit 1; }
+          echo "versionName $version_name, version code ${number}000"
+          echo "version_code=${number}000" >> "$GITHUB_OUTPUT"
+          echo "release_name=${number}000 ($version_name)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: gjc-mobile-release
+          run-id: ${{ inputs.run_id }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/release
+
+      - name: Service account
+        env:
+          PLAY_SERVICE_ACCOUNT_JSON: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON }}
+        run: |
+          umask 077
+          printf '%s' "$PLAY_SERVICE_ACCOUNT_JSON" > "$RUNNER_TEMP/play-service-account.json"
+
+      - name: Submit
+        working-directory: tools
+        env:
+          VERSION_CODE: ${{ steps.run.outputs.version_code }}
+          TRACK: ${{ inputs.track }}
+          STATUS: ${{ inputs.status }}
+          RELEASE_NAME: ${{ steps.run.outputs.release_name }}
+          NOTES_KO: ${{ inputs.notes_ko }}
+          NOTES_EN: ${{ inputs.notes_en }}
+          NOTES_ZH: ${{ inputs.notes_zh }}
+          SUBMIT: ${{ inputs.submit }}
+        run: |
+          aab=$(find "$RUNNER_TEMP/release" -name '*.aab')
+          [ "$(printf '%s\n' "$aab" | grep -c .)" = 1 ] || { echo "expected one AAB, found: $aab"; exit 1; }
+          submit_flag=()
+          [ "$SUBMIT" = true ] && submit_flag=(--submit)
+          python3 play_submit.py --key-file "$RUNNER_TEMP/play-service-account.json" \
+            --package dev.gajae.gjcmobile --aab "$aab" --version-code "$VERSION_CODE" \
+            --track "$TRACK" --status "$STATUS" --release-name "$RELEASE_NAME" \
+            --notes-ko "$NOTES_KO" --notes-en "$NOTES_EN" --notes-zh "$NOTES_ZH" "${submit_flag[@]}"
+
+      - name: Remove service account
+        if: always()
+        run: rm -f "$RUNNER_TEMP/play-service-account.json"

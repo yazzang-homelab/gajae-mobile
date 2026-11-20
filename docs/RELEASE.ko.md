@@ -8,6 +8,8 @@
 | `android.yml` | 모든 브랜치 푸시 | 단위 테스트, 디버그 APK | `gjc-mobile-debug-apk` |
 | `android.yml` (릴리스 단계) | `playstore` 브랜치 푸시 또는 수동 실행 | 업로드 키로 서명된 AAB·APK, 서명 지문 출력 | `gjc-mobile-release` |
 | `appstore.yml` | `appstore` 브랜치 푸시 또는 수동 실행 | App Store 서명 아카이브·내보내기, `upload=true`면 App Store Connect 업로드 | ipa, xcodebuild 로그 |
+| `asc-submit.yml` | 수동 실행 | App Store 버전 준비·심사 제출(`submit=false`면 상태만 출력) | - |
+| `play-submit.yml` | 수동 실행 | `android.yml` 실행의 AAB를 Google Play에 올리고 트랙에 출시(`submit=false`면 상태만 출력) | - |
 | Xcode Cloud | App Store Connect에서 설정(3절) | iOS 빌드·아카이브, TestFlight 업로드 | TestFlight 빌드 |
 
 ## 2. 버전 번호
@@ -89,6 +91,20 @@ gh workflow run android.yml --ref <브랜치>
 산출물 `gjc-mobile-release`에 `app-release.aab`(Play 업로드용)와 `app-release.apk`(직접 설치용), `mapping.txt`가 들어 있습니다.
 
 릴리스 빌드는 R8로 축소·난독화합니다(`isMinifyEnabled`, `isShrinkResources`). 유지 규칙은 `android/app/proguard-rules.pro`에 둡니다. AAB에 매핑이 들어 있어 Play Console이 크래시 스택을 자동으로 풀고, APK로 받은 스택은 `mapping.txt`로 풉니다. 리플렉션을 쓰는 라이브러리를 추가하면 릴리스 빌드를 기기에서 실행해 확인합니다.
+
+### Google Play 출시
+
+```bash
+gh workflow run android.yml --ref main            # 서명된 AAB, 실행 번호를 기억합니다
+gh workflow run play-submit.yml -f run_id=<android 실행 ID> -f version_name=1.0.7 \
+  -f notes_ko=… -f notes_en=… [-f notes_zh=…] [-f track=production] [-f status=completed] -f submit=true
+```
+
+`tools/play_submit.py`가 Android Publisher API v3 edit 하나 안에서 차례로 합니다. 트랙 현황을 출력하고, 버전 코드(`android` 실행 번호 + `000`)가 모든 트랙의 버전 코드보다 큰지 확인하고, AAB를 올려 Play가 읽은 버전 코드와 SHA-256을 맞춰 보고, 트랙에 출시(이름 `<버전 코드> (<versionName>)`, 출시 노트 ko-KR·en-US·zh-CN)를 넣은 뒤 검증·commit합니다. `submit=false`는 트랙 현황과 계획만 출력합니다. 중간에 실패하면 edit를 지우므로 Play는 그대로입니다. `status=completed`로 프로덕션에 올리면 Google 검토를 거쳐 공개되고, `draft`는 Play Console에서 직접 출시할 때까지 기다립니다. 출시 노트는 언어별 500자까지입니다.
+
+| 시크릿 | 내용 |
+|---|---|
+| `PLAY_SERVICE_ACCOUNT_JSON` | Play Console에서 이 앱 관리 권한을 받은 서비스 계정 키(JSON 원문) |
 
 ### 업로드 키
 

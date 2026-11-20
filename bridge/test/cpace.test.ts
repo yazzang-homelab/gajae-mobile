@@ -4,6 +4,7 @@ import vector from "../../fixtures/cpace-vector.json";
 import {
 	CODE_CI,
 	calculateGenerator,
+	confirmationTag,
 	CPaceInitiator,
 	cpaceRespond,
 	decodeUCoordinate,
@@ -15,6 +16,7 @@ import {
 	lvCat,
 	openBox,
 	prependLen,
+	sealBox,
 	sealKey,
 	x25519,
 } from "../src/cpace";
@@ -97,13 +99,13 @@ describe("CPace vectors (draft-irtf-cfrg-cpace-21, fixtures/cpace-vector.json)",
 		const b = cpaceRespond(Buffer.from(t.code), unhex(t.sid), a.ya, { scalar: unhex(t.yb) })!;
 		expect(hex(b.yb)).toBe(t.Yb);
 		expect(hex(b.isk)).toBe(t.ISK);
-		expect(hex(b.tb)).toBe(t.Tb);
 		expect(hex(sealKey(b.isk))).toBe(t.kSeal);
 		const session = a.finish(b.yb)!;
 		expect(hex(session.ta)).toBe(t.Ta);
-		expect(b.verifyTa(session.ta)).toBe(true);
-		expect(session.verifyTb(b.tb)).toBe(true);
-		expect(hex(b.seal(Buffer.from(t.offer)))).toBe(t.box);
+		const confirmed = b.confirm(session.ta)!;
+		expect(hex(confirmed.tb)).toBe(t.Tb);
+		expect(session.verifyTb(confirmed.tb)).toBe(true);
+		expect(hex(confirmed.seal(Buffer.from(t.offer)))).toBe(t.box);
 		expect(session.open(unhex(t.box))?.toString("utf8")).toBe(t.offer);
 	});
 });
@@ -113,9 +115,12 @@ describe("CPace protocol properties", () => {
 		const a = new CPaceInitiator(Buffer.from("4PUXU36F4W"));
 		const b = cpaceRespond(Buffer.from("4PUXU36F4X"), a.sid, a.ya)!;
 		const session = a.finish(b.yb)!;
-		expect(b.verifyTa(session.ta)).toBe(false);
-		expect(session.verifyTb(b.tb)).toBe(false);
-		expect(session.open(b.seal(Buffer.from("offer")))).toBeUndefined();
+		// The bridge hands out neither Tb nor a seal for a wrong Ta.
+		expect(b.confirm(session.ta)).toBeUndefined();
+		expect(b.confirm(Buffer.alloc(64))).toBeUndefined();
+		// And what it would have sent under its own code proves nothing to the phone.
+		expect(session.verifyTb(confirmationTag(a.sid, b.isk, b.yb, Buffer.alloc(0)))).toBe(false);
+		expect(session.open(sealBox(b.isk, Buffer.from("offer")))).toBeUndefined();
 	});
 
 	test("a replayed sid and Ya get a fresh Yb and ISK every time (seal nonce invariant 1)", () => {
@@ -130,14 +135,16 @@ describe("CPace protocol properties", () => {
 	test("one session seals exactly once (invariant 2)", () => {
 		const a = new CPaceInitiator(Buffer.from("CODE"));
 		const b = cpaceRespond(Buffer.from("CODE"), a.sid, a.ya)!;
-		b.seal(Buffer.from("x"));
-		expect(() => b.seal(Buffer.from("y"))).toThrow();
+		const ta = a.finish(b.yb)!.ta;
+		b.confirm(ta)!.seal(Buffer.from("x"));
+		// A second confirm is the same session: still one seal.
+		expect(() => b.confirm(ta)!.seal(Buffer.from("y"))).toThrow();
 	});
 
 	test("a tampered box does not open", () => {
 		const a = new CPaceInitiator(Buffer.from("CODE"));
 		const b = cpaceRespond(Buffer.from("CODE"), a.sid, a.ya)!;
-		const box = b.seal(Buffer.from("offer"));
+		const box = b.confirm(a.finish(b.yb)!.ta)!.seal(Buffer.from("offer"));
 		box[0]! ^= 1;
 		expect(openBox(b.isk, box)).toBeUndefined();
 		expect(openBox(b.isk, Buffer.alloc(3))).toBeUndefined();

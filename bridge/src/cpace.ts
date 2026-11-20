@@ -13,7 +13,7 @@
  *   1. The responder draws a fresh scalar yb for every session, so ISK and kSeal never repeat.
  *   2. One kSeal seals exactly one message (the offer in `pake.ok`).
  *
- * X25519 is the platform's (node:crypto, i.e. OpenSSL): it clamps the raw 32-byte scalar itself. The generator
+ * X25519 is the platform's (node:crypto; BoringSSL under Bun, OpenSSL under Node): it clamps the raw 32-byte scalar itself. The generator
  * comes from Elligator2 over GF(2^255-19), computed here with BigInt; it depends only on public values and the
  * code, and the bridge runs it at most five times per code.
  */
@@ -120,7 +120,7 @@ const PKCS8_X25519 = Buffer.from("302e020100300506032b656e04220420", "hex");
 const SPKI_X25519 = Buffer.from("302a300506032b656e032100", "hex");
 
 /**
- * scalar_mult_vfy: X25519(scalar, u), or undefined when the key agreement fails (OpenSSL rejects a low-order
+ * scalar_mult_vfy: X25519(scalar, u), or undefined when the key agreement fails (the platform library rejects a low-order
  * input by refusing an all-zero result) or yields the neutral element. Callers abort on undefined.
  */
 export function x25519(scalar: Uint8Array, u: Uint8Array): Buffer | undefined {
@@ -231,8 +231,15 @@ export interface CPaceInitiatorSession {
 export interface CPaceResponderSession {
 	yb: Buffer;
 	isk: Buffer;
-	verifyTa(ta: Uint8Array): boolean;
-	/** Only after `verifyTa` (Tb proves the bridge knew the code too). */
+	/**
+	 * Tb and the one-shot seal, handed out only for the right Ta: nothing that proves the code to the phone
+	 * exists before the phone has proved it to the bridge. Undefined for a wrong Ta.
+	 */
+	confirm(ta: Uint8Array): CPaceConfirmed | undefined;
+}
+
+export interface CPaceConfirmed {
+	/** Tb proves the bridge knew the code too. */
 	tb: Buffer;
 	seal(plaintext: Uint8Array): Buffer;
 }
@@ -255,15 +262,17 @@ export function cpaceRespond(
 	if (!k) return undefined;
 	const isk = deriveIsk(sid, k, ya, peerAd, yb, ad);
 	let sealed = false;
-	return {
-		yb,
-		isk,
-		verifyTa: ta => tagsEqual(ta, confirmationTag(sid, isk, ya, peerAd)),
+	const confirmed: CPaceConfirmed = {
 		tb: confirmationTag(sid, isk, yb, ad),
 		seal: plaintext => {
 			if (sealed) throw new Error("cpace: kSeal seals exactly one message");
 			sealed = true;
 			return sealBox(isk, plaintext);
 		},
+	};
+	return {
+		yb,
+		isk,
+		confirm: ta => (tagsEqual(ta, confirmationTag(sid, isk, ya, peerAd)) ? confirmed : undefined),
 	};
 }

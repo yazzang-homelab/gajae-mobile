@@ -115,9 +115,18 @@ export function startBridgeServer(options: BridgeServerOptions): Server<Conn> {
 		log(`skipped ${what}: ${body.length} bytes over the ${MAX_FRAME_BYTES}-byte frame limit`);
 	};
 
+	/** The connection running a device-code session: one per bridge, as there is one active code (#128). */
+	let pakeInFlight: string | undefined;
+	/** A finished code session frees the slot at once, so a retyped code does not race the close into `code_busy`. */
+	const endPake = (conn: Conn) => {
+		conn.pake = undefined;
+		if (pakeInFlight === conn.id) pakeInFlight = undefined;
+	};
+
 	const fail = (ws: ServerWebSocket<Conn>, code: string, message: string, extra: Record<string, unknown> = {}) => {
 		ws.send(JSON.stringify({ t: "error", code, message, ...extra }));
 		ws.data.phase = "closed";
+		endPake(ws.data);
 		ws.close(4401, code);
 	};
 
@@ -251,9 +260,6 @@ export function startBridgeServer(options: BridgeServerOptions): Server<Conn> {
 		);
 	};
 
-	/** The connection running a device-code session: one per bridge, as there is one active code (#128). */
-	let pakeInFlight: string | undefined;
-
 	const onPake = async (ws: ServerWebSocket<Conn>, message: any) => {
 		const conn = ws.data;
 		let sid: Buffer;
@@ -309,7 +315,8 @@ export function startBridgeServer(options: BridgeServerOptions): Server<Conn> {
 		} catch {
 			return fail(ws, "bad_pake", "malformed pake.confirm");
 		}
-		const tagOk = pake.session.verifyTa(ta);
+		const confirmed = pake.session.confirm(ta);
+		const tagOk = confirmed !== undefined;
 		let decision: Awaited<ReturnType<typeof decideConfirm>>["result"];
 		try {
 			decision = await state.mutatePairings(rows => decideConfirm(rows, pake, tagOk));
@@ -330,11 +337,13 @@ export function startBridgeServer(options: BridgeServerOptions): Server<Conn> {
 				log(`pake wrong left=${decision.left}`);
 				return fail(ws, "code_wrong", "wrong code", { left: decision.left });
 			case "ok": {
-				// Tb and the box go out only now that Ta proved the phone knows the code.
-				const box = pake.session.seal(Buffer.from(JSON.stringify(decision.offer)));
+				// Tb and the box exist only because Ta proved the phone knows the code (decideConfirm is ok only then).
+				if (!confirmed) throw new Error("pake: ok without a confirmed Ta");
+				const box = confirmed.seal(Buffer.from(JSON.stringify(decision.offer)));
 				log("pake ok");
-				ws.send(JSON.stringify({ t: "pake.ok", tb: b64urlEncode(pake.session.tb), box: b64urlEncode(box) }));
+				ws.send(JSON.stringify({ t: "pake.ok", tb: b64urlEncode(confirmed.tb), box: b64urlEncode(box) }));
 				conn.phase = "closed";
+				endPake(conn);
 				ws.close(1000, "pake_ok");
 				return;
 			}
@@ -472,8 +481,7 @@ export function startBridgeServer(options: BridgeServerOptions): Server<Conn> {
 				if (ws.data.deviceKey) log(`disconnected device=${ws.data.deviceKey.slice(0, 8)} code=${code}${reason ? ` reason=${JSON.stringify(reason)}` : ""}`);
 				clearTimeout(ws.data.timer);
 				ws.data.phase = "closed";
-				ws.data.pake = undefined;
-				if (pakeInFlight === ws.data.id) pakeInFlight = undefined;
+				endPake(ws.data);
 				hub.detach(ws.data.id);
 				uploads.abortOwner(ws.data.id);
 			},

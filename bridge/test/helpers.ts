@@ -17,7 +17,8 @@ function isFakeAgent(command: string[]): boolean {
 
 /** Starts a bridge in a child process (see serve-fixture.ts) sharing a temp GJCM_HOME with the test. */
 export async function startTestBridge(command: string[] = FAKE_AGENT, cwd = os.tmpdir(), env: Record<string, string> = {}) {
-	const home = fs.mkdtempSync(path.join(os.tmpdir(), "gjcm-test-"));
+	// GJCM_HOME in `env` restarts a bridge on an existing home (after `halt`).
+	const home = env.GJCM_HOME ?? fs.mkdtempSync(path.join(os.tmpdir(), "gjcm-test-"));
 	const proc = Bun.spawn([process.execPath, path.join(import.meta.dir, "serve-fixture.ts")], {
 		env: {
 			...process.env,
@@ -75,12 +76,16 @@ export async function startTestBridge(command: string[] = FAKE_AGENT, cwd = os.t
 			return "";
 		}
 	};
-	const stop = async () => {
+	/** Stops serve and keeps the home, as a host restart would. */
+	const halt = async () => {
 		proc.kill("SIGTERM");
 		await proc.exited;
+	};
+	const stop = async () => {
+		await halt();
 		fs.rmSync(home, { recursive: true, force: true });
 	};
 	/** What a gjc updater sends after switching the gjc build. */
 	const hangup = () => proc.kill("SIGHUP");
-	return { home, state, endpoint, offer, codeOffer, logText, pairedClient, hangup, stop, pid: proc.pid };
+	return { home, state, endpoint, offer, codeOffer, logText, pairedClient, hangup, halt, stop, pid: proc.pid };
 }

@@ -67,6 +67,7 @@ describe("gjcm-code-v1 device codes", () => {
 			"ws://8.8.8.8:7787/ws",
 			"ws://100.128.0.1:7787/ws",
 			"ws://172.32.0.1:7787/ws",
+			"ws://192.168.0.5:0/ws",
 			"not a url",
 		]) {
 			const r = encodableEndpoint(endpoint);
@@ -75,5 +76,7 @@ describe("gjcm-code-v1 device codes", () => {
 		}
 		expect(() => encodeCode({ ip: "8.8.8.8", port: 7787 }, 1)).toThrow();
 		expect(() => encodeCode({ ip: "10.0.0.1", port: 7787 }, 2 ** 20)).toThrow();
+		// Port 0 would print a code that no decoder accepts.
+		expect(() => encodeCode({ ip: "10.0.0.1", port: 0 }, 1)).toThrow();
 	});
 });

@@ -114,6 +114,30 @@ describe("pairings.json lock", () => {
 		expect(fs.existsSync(lock)).toBe(false);
 	});
 
+	test("a stale lock seen by two processes at once is cleared once, and every writer still gets through", async () => {
+		const home = tempHome();
+		const lock = path.join(home, "pairings.lock");
+		fs.writeFileSync(lock, "999999\n");
+		const old = new Date(Date.now() - 11_000);
+		fs.utimesSync(lock, old, old);
+		// Separate BridgeState objects do not share the in-process queue: they meet only at the lock file.
+		const writers = Array.from({ length: 6 }, () => new BridgeState(home));
+		await Promise.all(writers.map(state => state.createPairing()));
+		expect(new BridgeState(home).pendingPairings()).toHaveLength(6);
+		expect(fs.readdirSync(home).filter(name => name.startsWith("pairings.lock"))).toEqual([]);
+	});
+
+	test("release removes only its own lock", async () => {
+		const home = tempHome();
+		const lock = path.join(home, "pairings.lock");
+		await new BridgeState(home).mutatePairings(() => {
+			// Someone judged our lock stale and took a new one while we were still inside.
+			fs.writeFileSync(lock, "other\n");
+			return { result: undefined };
+		});
+		expect(fs.readFileSync(lock, "utf8")).toBe("other\n");
+	});
+
 	test("writers in one process run one at a time", async () => {
 		const state = new BridgeState(tempHome());
 		await Promise.all(Array.from({ length: 10 }, () => state.createPairing()));

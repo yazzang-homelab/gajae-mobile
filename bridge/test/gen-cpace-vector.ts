@@ -6,7 +6,7 @@
  * V1  the draft is pinned by URL and sha256 (downloaded when no path is given).
  * V2  B.1.1–B.1.5 and B.1.10 are read out of the draft text (base64 JSON blocks where the draft has them, the body
  *     lines for transcript_ir, s and q0–qb), never copied by hand.
- * V3  200+ random generators and field boundary inputs, each computed twice: by src/cpace.ts and by the independent
+ * V3  200+ pseudo-random (fixed-stream) generators and field boundary inputs, each computed twice: by src/cpace.ts and by the independent
  *     test/cpace_ref.py (RFC 9380 §6.7.1 + RFC 7748 ladder). Any disagreement stops the generator.
  * Plus device codes (every range, with and without a port, rejects) and one full transaction from sid to box.
  */
@@ -29,7 +29,7 @@ import {
 	sealKey,
 	x25519,
 } from "../src/cpace";
-import { decodeCode, encodeCode, formatCode, newCode } from "../src/device-code";
+import { decodeCode, encodeCode, formatCode } from "../src/device-code";
 
 const DRAFT_URL = "https://www.ietf.org/archive/id/draft-irtf-cfrg-cpace-21.txt";
 const DRAFT_SHA256 = "ed2772c26c21d43a199d490c1ebe5c5d2431a7dbce50d2124d4fa40957fbf58f";
@@ -116,6 +116,18 @@ const lowOrder = Array.from({ length: 12 }, (_, i) => {
 for (const i of [0, 1, 2, 3, 4, 5, 7]) if (lowOrder[i]!.q !== null) throw new Error(`u${i} must abort`);
 
 // ---- V3: random and boundary inputs, src/cpace.ts vs test/cpace_ref.py
+// "Random" inputs come from a fixed SHA-256 counter stream, so rerunning the generator rewrites the same fixture.
+let streamCounter = 0;
+const randomBytes = (n: number): Buffer => {
+	const out: Buffer[] = [];
+	for (let have = 0; have < n; have += 32) {
+		const counter = Buffer.alloc(4);
+		counter.writeUInt32BE(streamCounter++);
+		out.push(crypto.createHash("sha256").update("gjcm-code-v1 vector stream").update(counter).digest());
+	}
+	return Buffer.concat(out).subarray(0, n);
+};
+const randomInt = (n: number): number => randomBytes(4).readUInt32BE() % n;
 const P = (1n << 255n) - 19n;
 const le = (x: bigint) => {
 	const out = Buffer.alloc(32);
@@ -131,28 +143,28 @@ const mapInputs = [
 	...boundary.map(le),
 	// bit 255 set: decodeUCoordinate drops it
 	...[0n, 1n, P - 1n, P + 18n].map(x => le(x | (1n << 255n))),
-	...Array.from({ length: 64 }, () => crypto.randomBytes(32)),
+	...Array.from({ length: 64 }, () => randomBytes(32)),
 ].map(hex);
 
 const randomCode = () => {
 	const ranges = [
-		() => `100.${64 + crypto.randomInt(64)}.${crypto.randomInt(256)}.${crypto.randomInt(256)}`,
-		() => `10.${crypto.randomInt(256)}.${crypto.randomInt(256)}.${crypto.randomInt(256)}`,
-		() => `172.${16 + crypto.randomInt(16)}.${crypto.randomInt(256)}.${crypto.randomInt(256)}`,
-		() => `192.168.${crypto.randomInt(256)}.${crypto.randomInt(256)}`,
+		() => `100.${64 + randomInt(64)}.${randomInt(256)}.${randomInt(256)}`,
+		() => `10.${randomInt(256)}.${randomInt(256)}.${randomInt(256)}`,
+		() => `172.${16 + randomInt(16)}.${randomInt(256)}.${randomInt(256)}`,
+		() => `192.168.${randomInt(256)}.${randomInt(256)}`,
 	];
-	const ip = ranges[crypto.randomInt(4)]!();
-	return newCode({ ip, port: crypto.randomInt(2) ? 7787 : 1 + crypto.randomInt(65535) });
+	const ip = ranges[randomInt(4)]!();
+	return encodeCode({ ip, port: randomInt(2) ? 7787 : 1 + randomInt(65535) }, randomInt(2 ** 20));
 };
 const generatorInputs = [
-	...Array.from({ length: 200 }, () => ({ prs: Buffer.from(randomCode()), sid: crypto.randomBytes(16) })),
+	...Array.from({ length: 200 }, () => ({ prs: Buffer.from(randomCode()), sid: randomBytes(16) })),
 	// long passwords cross the 128-byte block (ZPAD 0) and the LEB128 two-byte length
-	...[0, 1, 108, 109, 110, 127, 128, 200].map(n => ({ prs: crypto.randomBytes(n), sid: crypto.randomBytes(16) })),
+	...[0, 1, 108, 109, 110, 127, 128, 200].map(n => ({ prs: randomBytes(n), sid: randomBytes(16) })),
 ].map(g => ({ prs: hex(g.prs), ci: hex(CODE_CI), sid: hex(g.sid) }));
 
 const x25519Inputs = [
 	...lowOrder.map(l => ({ k: lowOrderS, u: l.u })),
-	...Array.from({ length: 16 }, () => ({ k: hex(crypto.randomBytes(32)), u: hex(crypto.randomBytes(32)) })),
+	...Array.from({ length: 16 }, () => ({ k: hex(randomBytes(32)), u: hex(randomBytes(32)) })),
 ];
 
 // ---- full transaction with fixed scalars
@@ -202,8 +214,9 @@ const x25519Vectors = x25519Inputs.map((input, i) => {
 const initiator = new CPaceInitiator(Buffer.from(code), { sid: unhex(tx.sid), scalar: unhex(tx.ya) });
 const responder = cpaceRespond(Buffer.from(code), unhex(tx.sid), initiator.ya, { scalar: unhex(tx.yb) })!;
 const session = initiator.finish(responder.yb)!;
-if (!responder.verifyTa(session.ta) || !session.verifyTb(responder.tb)) throw new Error("transaction does not confirm");
-const box = responder.seal(Buffer.from(tx.offer));
+const confirmed = responder.confirm(session.ta);
+if (!confirmed || !session.verifyTb(confirmed.tb)) throw new Error("transaction does not confirm");
+const box = confirmed.seal(Buffer.from(tx.offer));
 same("box opens", session.open(box)?.toString("utf8"), tx.offer);
 const K = x25519(unhex(tx.ya), responder.yb)!;
 same("tx g", hex(calculateGenerator(Buffer.from(code), CODE_CI, unhex(tx.sid))), ref.transaction.g);
@@ -212,7 +225,7 @@ same("tx Yb", hex(responder.yb), ref.transaction.Yb);
 same("tx K", hex(K), ref.transaction.K);
 same("tx ISK", hex(session.isk), ref.transaction.ISK);
 same("tx Ta", hex(session.ta), ref.transaction.Ta);
-same("tx Tb", hex(responder.tb), ref.transaction.Tb);
+same("tx Tb", hex(confirmed.tb), ref.transaction.Tb);
 same("tx Ta'", hex(confirmationTag(unhex(tx.sid), session.isk, initiator.ya, Buffer.alloc(0))), ref.transaction.Ta);
 
 // ---- device codes
@@ -241,6 +254,37 @@ const valid = codeCases.map(c => {
 	if (!decoded.ok || decoded.address.ip !== c.ip || decoded.address.port !== c.port) throw new Error(`code round trip ${c.ip}`);
 	return { ...c, range: decoded.address.range, code: encoded, formatted: formatCode(encoded) };
 });
+/**
+ * Codes no bridge prints, built bit by bit here (encodeCode refuses them): an explicit port of 0,
+ * and an explicit 7787, which has a shorter canonical code. Both must decode to code_format.
+ */
+function forgeExplicitPort(port: number): string {
+	const bits: number[] = [];
+	const push = (v: number, width: number) => {
+		for (let i = width - 1; i >= 0; i--) bits.push(Math.floor(v / 2 ** i) % 2);
+	};
+	push(0b1000 | 0b100, 4); // explicit port, 192.168.0.0/16
+	push(0x0007, 16); // 192.168.0.7
+	push(port, 16);
+	push(0x12345, 20);
+	const m = bits.length;
+	const chars = Math.ceil((m + 4) / 5);
+	const packed = Buffer.alloc(Math.ceil(m / 8));
+	bits.forEach((b, i) => {
+		if (b) packed[i >> 3]! |= 0x80 >> (i & 7);
+	});
+	const digest = crypto.createHash("sha256").update("gjcm-code-v1").update(Buffer.from([m])).update(packed).digest();
+	for (let i = 0; i < chars * 5 - m; i++) bits.push((digest[i >> 3]! >> (7 - (i & 7))) & 1);
+	let out = "";
+	for (let i = 0; i < chars; i++) {
+		let v = 0;
+		for (let j = 0; j < 5; j++) v = v * 2 + bits[i * 5 + j]!;
+		out += "23456789ABCDEFGHJKLMNPQRSTUVWXYZ"[v];
+	}
+	return out;
+}
+// The forger agrees with the encoder on a code it does print.
+if (forgeExplicitPort(8080) !== encodeCode({ ip: "192.168.0.7", port: 8080 }, 0x12345)) throw new Error("forged code drifted from encodeCode");
 const flip = (s: string, i: number) => s.slice(0, i) + (s[i] === "2" ? "3" : "2") + s.slice(i + 1);
 const sample = valid[2]!.code;
 const rejectInputs = [
@@ -259,6 +303,15 @@ const rejectInputs = [
 	`G${sample.slice(1)}`,
 	`J${sample.slice(1)}`,
 	`Z${sample.slice(1)}`,
+	`E${sample.slice(1)}`,
+	`U${sample.slice(1)}`,
+	`W${sample.slice(1)}`,
+	// explicit port 0 and explicit 7787 (non-canonical): well-formed bits with a valid check, still code_format
+	forgeExplicitPort(0),
+	forgeExplicitPort(7787),
+	// the reported position counts code characters only: hyphens and spaces before the bad character are not counted
+	`${sample.slice(0, 4)}-${sample.slice(4, 6)}O${sample.slice(7)}`,
+	` ${sample.slice(0, 2)} ${sample.slice(2, 4)}-1${sample.slice(5)}`,
 ];
 const reject = rejectInputs.map(input => {
 	const decoded = decodeCode(input);
@@ -323,7 +376,7 @@ const vector = {
 		K: hex(K),
 		ISK: hex(session.isk),
 		Ta: hex(session.ta),
-		Tb: hex(responder.tb),
+		Tb: hex(confirmed.tb),
 		kSeal: hex(sealKey(session.isk)),
 		box: hex(box),
 	},

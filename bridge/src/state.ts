@@ -146,7 +146,7 @@ export class BridgeState {
 		});
 	}
 
-	/** Unexpired pending pairings (read only; writers prune expired rows under the lock). */
+	/** Unexpired pending pairings, for diagnostics and tests (read only; writers prune expired rows under the lock). */
 	pendingPairings(now = Date.now()): PendingPairing[] {
 		const all: PendingPairing[] = readJson(path.join(this.home, "pairings.json"), []);
 		return all.filter(p => Date.parse(p.expiresAt) > now);
@@ -194,30 +194,74 @@ export class BridgeState {
 
 	async #lockPairings(): Promise<() => void> {
 		const lock = path.join(this.home, "pairings.lock");
+		// The token makes the lock ours: release and stale takeover only ever remove the lock they looked at.
+		const token = `${process.pid} ${randomBytes(8).toString("hex")}\n`;
 		const deadline = Date.now() + LOCK_WAIT_MS;
 		for (;;) {
+			let fd: number | undefined;
 			try {
-				const fd = fs.openSync(lock, "wx", 0o600);
-				fs.writeSync(fd, `${process.pid}\n`);
-				fs.closeSync(fd);
-				return () => fs.rmSync(lock, { force: true });
+				fd = fs.openSync(lock, "wx", 0o600);
 			} catch (error) {
 				if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
 			}
+			if (fd !== undefined) {
+				try {
+					fs.writeSync(fd, token);
+				} catch (error) {
+					fs.rmSync(lock, { force: true });
+					throw error;
+				} finally {
+					fs.closeSync(fd);
+				}
+				return () => {
+					if (readText(lock) === token) fs.rmSync(lock, { force: true });
+				};
+			}
+			const held = readText(lock);
 			let age: number;
 			try {
 				age = Date.now() - fs.statSync(lock).mtimeMs;
 			} catch {
 				continue; // released between open and stat
 			}
-			if (age > STALE_LOCK_MS) {
-				fs.rmSync(lock, { force: true });
+			if (held !== undefined && age > STALE_LOCK_MS) {
+				clearStaleLock(lock, held);
 				continue;
 			}
 			if (Date.now() >= deadline) throw new PairingsBusyError();
 			await Bun.sleep(LOCK_POLL_MS);
 		}
 	}
+}
+
+function readText(file: string): string | undefined {
+	try {
+		return fs.readFileSync(file, "utf8");
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * Clears a lock left by a crash, but only the one judged stale (`held`): the lock is moved aside atomically, and
+ * if what was moved is a newer lock another waiter took in the meantime, it is put back.
+ */
+function clearStaleLock(lock: string, held: string): void {
+	const aside = `${lock}.${process.pid}.${randomBytes(4).toString("hex")}.stale`;
+	try {
+		fs.renameSync(lock, aside);
+	} catch {
+		return; // another waiter cleared it first
+	}
+	if (readText(aside) !== held) {
+		try {
+			fs.linkSync(aside, lock);
+		} catch {
+			// a third waiter already holds a new lock; the one moved aside is lost to its holder, whose release
+			// then finds a different token and leaves the new lock alone
+		}
+	}
+	fs.rmSync(aside, { force: true });
 }
 
 /** A pending pairing row (not stored yet). */

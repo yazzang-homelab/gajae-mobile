@@ -160,12 +160,12 @@ describe("pairing and authentication", () => {
 describe("device-code pairing (gjcm-code-v1, #128)", () => {
 	/** A raw pake session that stops after `pake.reply` (holds the bridge's one in-flight slot until closed). */
 	const openPake = (endpoint: string, code: string, message?: Record<string, unknown>) =>
-		new Promise<{ ws: WebSocket; reply: any }>((resolve, reject) => {
+		new Promise<{ ws: WebSocket; reply: any; cpace: CPaceInitiator }>((resolve, reject) => {
 			const ws = new WebSocket(endpoint);
 			const cpace = new CPaceInitiator(Buffer.from(code));
 			ws.onopen = () =>
 				ws.send(JSON.stringify(message ?? { t: "pake", v: 1, sid: cpace.sid.toString("base64url"), ya: cpace.ya.toString("base64url") }));
-			ws.onmessage = e => resolve({ ws, reply: JSON.parse(String(e.data)) });
+			ws.onmessage = e => resolve({ ws, reply: JSON.parse(String(e.data)), cpace });
 			ws.onerror = () => reject(new Error("websocket error"));
 		});
 	const attemptsLeft = (home: string) =>
@@ -285,6 +285,10 @@ describe("device-code pairing (gjcm-code-v1, #128)", () => {
 		expect(attemptsLeft(bridge.home)).toBe(4);
 		held.ws.close();
 		await Bun.sleep(100);
+		// A wrong code frees the slot with its answer: retyping at once is not `code_busy`.
+		await expect(
+			BridgeClient.pairWithCode(encodeCode({ ip: "100.100.1.2", port: 7787 }, 1), { dial: bridge.endpoint }),
+		).rejects.toMatchObject({ code: "code_wrong" });
 		const { client } = await BridgeClient.pairWithCode(code, { dial: bridge.endpoint });
 		client.close();
 	});
@@ -310,6 +314,54 @@ describe("device-code pairing (gjcm-code-v1, #128)", () => {
 		});
 		held.ws.send(new Uint8Array([1, 2, 3]));
 		expect(await closed).toMatchObject({ t: "error", code: "bad_pake" });
+	});
+
+	test("a new pair while a code session is open leaves that session expired", async () => {
+		const bridge = await useBridge();
+		const { code } = await bridge.codeOffer(0x55555);
+		const held = await openPake(bridge.endpoint, code);
+		expect(held.reply).toMatchObject({ t: "pake.reply", left: 4 });
+		await bridge.codeOffer(0x66666);
+		const session = held.cpace.finish(Buffer.from(held.reply.yb, "base64url"))!;
+		const answer = new Promise<any>(resolve => {
+			held.ws.onmessage = e => resolve(JSON.parse(String(e.data)));
+		});
+		held.ws.send(JSON.stringify({ t: "pake.confirm", ta: session.ta.toString("base64url") }));
+		expect(await answer).toMatchObject({ t: "error", code: "code_expired" });
+		expect(bridge.state.devices()).toHaveLength(0);
+	});
+
+	test("a serve restart keeps the attempts left", async () => {
+		const first = await useBridge();
+		const { code } = await first.codeOffer(0x77777);
+		const wrong = encodeCode({ ip: "100.100.1.2", port: 7787 }, 7);
+		for (const left of [4, 3])
+			await expect(BridgeClient.pairWithCode(wrong, { dial: first.endpoint })).rejects.toMatchObject({ data: { left } });
+		await first.halt();
+		// The second bridge owns the home now (its stop removes it); the first must not remove it under it.
+		running.splice(running.indexOf(first), 1);
+		const second = await useBridge({ GJCM_HOME: first.home });
+		await expect(BridgeClient.pairWithCode(wrong, { dial: second.endpoint })).rejects.toMatchObject({ code: "code_wrong", data: { left: 2 } });
+		const { client } = await BridgeClient.pairWithCode(code, { dial: second.endpoint });
+		client.close();
+		expect(second.state.devices()).toHaveLength(1);
+	});
+
+	test("a pairings.lock held by another process makes serve answer busy, spending nothing", async () => {
+		const bridge = await useBridge();
+		const { code, offer: qr } = await bridge.codeOffer();
+		const lock = path.join(bridge.home, "pairings.lock");
+		fs.writeFileSync(lock, "another pair\n");
+		await expect(BridgeClient.pairWithCode(code, { dial: bridge.endpoint })).rejects.toMatchObject({ code: "code_busy" });
+		await expect(
+			BridgeClient.connect(bridge.endpoint, BridgeClient.identityFromOffer(qr), { pairing: { id: qr.pairingId, secret: qr.secret } }),
+		).rejects.toMatchObject({ code: "pairing_busy" });
+		expect(bridge.logText()).toContain("pake busy (pairings locked)");
+		fs.rmSync(lock);
+		expect(attemptsLeft(bridge.home)).toBe(5);
+		const { client } = await BridgeClient.pairWithCode(code, { dial: bridge.endpoint });
+		client.close();
+		expect(bridge.state.devices()).toHaveLength(1);
 	});
 
 	test("the hello path is unchanged for a pake-unaware app (hello v1)", async () => {

@@ -68,6 +68,7 @@ export function encodableEndpoint(endpoint: string): EncodableResult {
 	const spec = RANGES.find(r => n >>> (32 - r.prefixBits) === r.base >>> (32 - r.prefixBits));
 	if (!spec) return { ok: false, reason: `Tailscale(100.64/10)이나 사설 LAN 대역 주소만 코드에 담을 수 있습니다(${url.hostname})` };
 	const port = url.port ? Number(url.port) : 80;
+	if (port < 1) return { ok: false, reason: `포트 0은 코드에 담을 수 없습니다(${endpoint})` };
 	return { ok: true, address: { ip: ipText(n), port, range: spec.range } };
 }
 
@@ -184,6 +185,7 @@ export function decodeCode(input: string): DecodeResult {
 	const hostBits = 32 - spec.prefixBits;
 	const ip = ipText((spec.base + readBits(bits, 4, hostBits)) >>> 0);
 	const port = explicitPort ? readBits(bits, 4 + hostBits, 16) : CODE_DEFAULT_PORT;
-	if (port === 0) return { ok: false, error: "code_format" };
+	// Port 0 cannot be dialled, and an explicit 7787 has a shorter canonical code: neither is a code any bridge prints.
+	if (port === 0 || (explicitPort && port === CODE_DEFAULT_PORT)) return { ok: false, error: "code_format" };
 	return { ok: true, code, address: { ip, port, range: spec.range }, endpoint: `ws://${ip}:${port}/ws` };
 }
